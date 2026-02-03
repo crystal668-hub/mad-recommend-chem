@@ -1,27 +1,21 @@
 """
 ===================================
-OpenAI向量化模块
-功能：使用OpenAI兼容SDK调用OpenRouter/百炼API进行文本向量化
+Embedder Module
+Function: Use OpenAI-compatible SDK to call OpenRouter/Bailian API for text vectorization
 ===================================
 """
 
 import os
 import time
-from datetime import datetime
-from pathlib import Path
-from typing import List, Dict, Optional
-from tqdm import tqdm
-from openai import OpenAI
+from typing import Dict, List, Optional
+
 import voyageai
+from openai import OpenAI
+from tqdm import tqdm
+
 from utils.logger import Logger
 
-db_log_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-db_log_file = Path("./logs/db_log") / f"embedder_{db_log_timestamp}.log"
-logger = Logger.get_logger(
-    name=f"MAD.DB.Embedder.{db_log_timestamp}",
-    log_file=str(db_log_file),
-    level="INFO"
-)
+logger = Logger.create_module_logger("database.embedder")
 
 
 class MultiModelEmbedder:
@@ -44,22 +38,22 @@ class MultiModelEmbedder:
         self.api_key = model_config.get('api_key')
         self.base_url = model_config.get('emb_url', 'https://openrouter.ai/api/v1/embeddings')
         
-        # 存储agent配置，用于动态选择模型
+        # Save agent configurations for dynamic model selection
         self.agent_configs = agent_configs or {}
         
-        # 懒加载Voyage AI客户端和OpenAI客户端
+        # Lazy load Voyage AI clients and OpenAI clients
         self.voyage_clients: Dict[str, 'voyageai.Client'] = {}
         self.openai_clients: Dict[str, OpenAI] = {}
         
-        # 从环境变量获取API Key
+        # Get API Key from environment variable if needed
         if self.api_key and self.api_key.startswith('${') and self.api_key.endswith('}'):
             env_var = self.api_key[2:-1]
             self.api_key = os.environ.get(env_var)
 
-        # 预先读取并规范化所有agent嵌入配置
+        # Preload and normalize all agent embedding profiles
         self.agent_embedding_profiles = self._build_agent_embedding_profiles()
         
-        logger.info("[OK] 初始化向量化器")
+        logger.info("[OK] Initialized embedder")
         
         if self.agent_embedding_profiles:
             agent_models = {
@@ -70,7 +64,7 @@ class MultiModelEmbedder:
                 name: profile.get('embedding_provider')
                 for name, profile in self.agent_embedding_profiles.items()
             }
-            logger.info(f"  Agent向量模型提供方: {agent_providers}")
+            logger.info(f"Agent embedding model providers: {agent_providers}")
 
     def _resolve_env_var(self, value: Optional[str]) -> Optional[str]:
         if value and value.startswith('${') and value.endswith('}'):
@@ -123,10 +117,10 @@ class MultiModelEmbedder:
         获取指定agent使用的向量模型
         
         Args:
-            agent_name: agent名称 (如 'agent1', 'agent2', 'agent3', 'agent4')
+            agent_name: agent name 
         
         Returns:
-            str: 嵌入模型名称
+            str: embedding model name
         """
         if agent_name and agent_name in self.agent_configs:
             model = self.agent_configs[agent_name].get('embedding_model', self.default_model)
@@ -148,7 +142,7 @@ class MultiModelEmbedder:
             voyage_api_key = profile.get('voyage_api_key')
             if voyage_api_key:
                 self.voyage_clients[agent_name] = voyageai.Client(api_key=voyage_api_key)
-                logger.info(f"[INFO] 为 {agent_name} 创建Voyage AI客户端")
+                logger.info(f"Created Voyage AI client for {agent_name}")
             else:
                 return None
                 
@@ -164,10 +158,10 @@ class MultiModelEmbedder:
         判断指定agent是否使用Voyage向量模型
         
         Args:
-            agent_name: agent名称
+            agent_name: agent name
             
         Returns:
-            bool: 是否使用Voyage AI
+            bool: whether using Voyage AI
         """
         if not agent_name or agent_name not in self.agent_embedding_profiles:
             return False
@@ -180,10 +174,10 @@ class MultiModelEmbedder:
         判断指定agent是否使用百炼向量模型
         
         Args:
-            agent_name: agent名称
+            agent_name: agent name
             
         Returns:
-            bool: 是否使用阿里云百炼
+            bool: whether using Aliyun Bailian
         """
         if not agent_name or agent_name not in self.agent_embedding_profiles:
             return False
@@ -210,78 +204,126 @@ class MultiModelEmbedder:
         将单个文本转换为向量
         
         Args:
-            text: 输入文本
-            retry: 重试次数
-            agent_name: agent名称，用于选择对应的嵌入模型 (如 'agent1', 'agent2', 'agent3', 'agent4')
+            text: input text
+            retry: number of retries
+            agent_name: agent name, used to select the corresponding embedding model
         
         Returns:
-            List[float]: 向量
+            List[float]: embedding vector
         """
-        # 确定使用的agent
+        # Some providers return errors or empty responses for blank inputs; short-circuit to a
+        # deterministic zero vector to keep pipelines robust.
+        if text is None or not str(text).strip():
+            model = self.get_model_for_agent(agent_name) if agent_name else self.default_model
+            return [0.0] * self.get_embedding_dimension(model)
+
+        # Determine which agent to use
         use_agent = agent_name
         
-        # 检查是否使用百炼或Voyage AI
+        # Check if using Bailian or Voyage AI
         if use_agent and self._is_bailian_model(use_agent):
             return self._embed_text_bailian(text, retry, use_agent)
         if use_agent and self._is_voyage_model(use_agent):
             return self._embed_text_voyage(text, retry, use_agent)
         return self._embed_text_openrouter(text, retry, use_agent)
+
+    def embed_query(self, text: str, retry: int = 3, agent_name: str = None) -> List[float]:
+        """
+        Embed query text.
+
+        Voyage models support different query/document embedding modes. For Voyage we use
+        input_type="query"; for other providers we fall back to `embed_text`.
+        """
+        if text is None or not str(text).strip():
+            model = self.get_model_for_agent(agent_name) if agent_name else self.default_model
+            return [0.0] * self.get_embedding_dimension(model)
+
+        use_agent = agent_name
+
+        if use_agent and self._is_voyage_model(use_agent):
+            voyage_client = self._get_voyage_client(use_agent)
+            if not voyage_client:
+                raise ValueError(
+                    f"Failed to create Voyage AI client for {use_agent}, please check API key configuration"
+                )
+
+            model = self.get_model_for_agent(use_agent)
+            for attempt in range(retry):
+                try:
+                    result = voyage_client.embed(
+                        texts=[text],
+                        model=model,
+                        input_type="query",
+                    )
+
+                    if result and result.embeddings:
+                        return result.embeddings[0]
+                    raise Exception("Voyage AI returned empty result")
+
+                except Exception as e:
+                    logger.error(f"[ERROR] Query embedding failed (attempt {attempt + 1}/{retry}): {str(e)}")
+                    if attempt < retry - 1:
+                        time.sleep(2 ** attempt)
+
+            raise Exception(f"Query embedding failed, retried {retry} times")
+
+        return self.embed_text(text, retry=retry, agent_name=agent_name)
     
     def _embed_text_voyage(self, text: str, retry: int, agent_name: str) -> List[float]:
         """
         使用Voyage AI SDK进行文本向量化
         
         Args:
-            text: 输入文本
-            retry: 重试次数
-            agent_name: agent名称
+            text: input text
+            retry: number of retries
+            agent_name: agent name
             
         Returns:
-            List[float]: 向量
+            List[float]: embedding vector
         """
         voyage_client = self._get_voyage_client(agent_name)
         if not voyage_client:
-            raise ValueError(f"无法为 {agent_name} 创建Voyage AI客户端，请检查API密钥配置")
+            raise ValueError(f"Failed to create Voyage AI client for {agent_name}, please check API key configuration")
         
         model = self.get_model_for_agent(agent_name)
         
         for attempt in range(retry):
             try:
-                # 使用Voyage AI SDK
+                # Use Voyage AI SDK
                 result = voyage_client.embed(
                     texts=[text],
                     model=model,
-                    input_type="document"  # 可以是 "document" 或 "query"
+                    input_type="document"  # Can be "document" or "query"
                 )
                 
                 if result and result.embeddings:
                     return result.embeddings[0]
                 else:
-                    raise Exception("Voyage AI返回空结果")
+                    raise Exception("Voyage AI returned empty result")
                     
             except Exception as e:
-                logger.error(f"[ERROR] 向量化失败 (尝试 {attempt + 1}/{retry}): {str(e)}")
+                logger.error(f"[ERROR] Embedding failed (attempt {attempt + 1}/{retry}): {str(e)}")
                 if attempt < retry - 1:
                     time.sleep(2 ** attempt)
         
-        raise Exception(f"向量化失败，已重试{retry}次")
+        raise Exception(f"Embedding failed, retried {retry} times")
 
     def _embed_text_bailian(self, text: str, retry: int, agent_name: str) -> List[float]:
         """
-        使用阿里云百炼 OpenAI兼容SDK进行文本向量化
+        Use Aliyun Bailian OpenAI-compatible SDK for text embedding
         
         Args:
-            text: 输入文本
-            retry: 重试次数
-            agent_name: agent名称
+            text: input text
+            retry: number of retries
+            agent_name: agent name
             
         Returns:
-            List[float]: 向量
+            List[float]: embedding vector
         """
         profile = self._get_agent_profile(agent_name)
         api_key = profile.get('api_key')
         if not api_key:
-            raise ValueError("百炼 API Key 未配置")
+            raise ValueError("Bailian API Key not configured")
 
         base_url = self._normalize_openai_base_url(self._get_bailian_base_url(agent_name))
         model = profile.get('embedding_model', self.default_model)
@@ -292,32 +334,32 @@ class MultiModelEmbedder:
                 result = client.embeddings.create(model=model, input=text)
                 if result and result.data:
                     return result.data[0].embedding
-                raise Exception("百炼返回空结果")
+                raise Exception("Bailian returned empty result")
             except Exception as e:
-                logger.error(f"[ERROR] 向量化失败 (尝试 {attempt + 1}/{retry}): {str(e)}")
+                logger.error(f"[ERROR] Embedding failed (attempt {attempt + 1}/{retry}): {str(e)}")
                 if attempt < retry - 1:
                     time.sleep(2 ** attempt)
 
-        raise Exception(f"向量化失败，已重试{retry}次")
+        raise Exception(f"Embedding failed, retried {retry} times")
     
     def _embed_text_openrouter(self, text: str, retry: int, agent_name: str = None) -> List[float]:
         """
-        使用OpenRouter OpenAI兼容SDK进行文本向量化
+        Use OpenRouter OpenAI-compatible SDK for text embedding
         
         Args:
-            text: 输入文本
-            retry: 重试次数
-            agent_name: agent名称
+            text: input text
+            retry: number of retries
+            agent_name: agent name
             
         Returns:
-            List[float]: 向量
+            List[float]: embedding vector
         """
         profile = self._get_agent_profile(agent_name)
         model = profile.get('embedding_model', self.default_model)
         base_url = profile.get('openai_base_url') or self._normalize_openai_base_url(profile.get('emb_url', self.base_url))
         api_key = profile.get('api_key')
         if not api_key:
-            raise ValueError("OpenRouter API Key未配置")
+            raise ValueError("OpenRouter API Key not configured")
 
         for attempt in range(retry):
             try:
@@ -325,17 +367,17 @@ class MultiModelEmbedder:
                 result = client.embeddings.create(model=model, input=text)
                 if result and result.data:
                     return result.data[0].embedding
-                raise Exception("OpenRouter返回空结果")
+                raise Exception("OpenRouter returned empty result")
             except Exception as e:
-                logger.error(f"[ERROR] 向量化失败 (尝试 {attempt + 1}/{retry}): {str(e)}")
+                logger.error(f"[ERROR] Embedding failed (attempt {attempt + 1}/{retry}): {str(e)}")
                 if attempt < retry - 1:
                     time.sleep(2 ** attempt)
         
-        raise Exception(f"向量化失败,已重试{retry}次")
+        raise Exception(f"Embedding failed, retried {retry} times")
     
     def embed_batch(self, texts: List[str], batch_size: int = 10, show_progress: bool = True, agent_name: str = None) -> List[List[float]]:
         """
-        批量文本向量化
+        Batch text embedding
         
         Args:
             texts: 文本列表
@@ -344,9 +386,9 @@ class MultiModelEmbedder:
             agent_name: agent名称，用于选择对应的嵌入模型 
         
         Returns:
-            List[List[float]]: 向量列表
+            List[List[float]]: list of embedding vectors
         """
-        # 确定使用的模型用于显示和维度获取
+        # Determine the model used for display and dimension retrieval
         if agent_name:
             model = self.get_model_for_agent(agent_name)
         else:
@@ -357,7 +399,7 @@ class MultiModelEmbedder:
         
         iterator = range(0, total_texts, batch_size)
         if show_progress:
-            desc = f"向量化进度 [{model}]"
+            desc = f"Embedding progress [{model}]"
             iterator = tqdm(iterator, desc=desc, total=(total_texts + batch_size - 1) // batch_size)
         
         for i in iterator:
@@ -368,11 +410,11 @@ class MultiModelEmbedder:
                     embedding = self.embed_text(text, agent_name=agent_name)
                     embeddings.append(embedding)
                 except Exception as e:
-                    logger.error(f"\n[ERROR] 跳过文本 (索引 {len(embeddings)}): {str(e)}")
-                    # 添加零向量占位
+                    logger.error(f"\n[ERROR] Skipping text (index {len(embeddings)}): {str(e)}")
+                    # Append zero vector when failure
                     embeddings.append([0.0] * self.get_embedding_dimension(model))
             
-            # 避免API限流
+            # Avoid API rate limiting
             if i + batch_size < total_texts:
                 time.sleep(0.5)
         
@@ -380,33 +422,27 @@ class MultiModelEmbedder:
     
     def get_embedding_dimension(self, model: str = None) -> int:
         """
-        获取向量维度
+        Get embedding dimension
         
         Args:
-            model: 模型名称，如果为None则使用默认模型
+            model: model name (if None, use the default model)
         
         Returns:
-            int: 向量维度
+            int: embedding dimension
         """
         use_model = model if model else self.default_model
         
         if 'voyage-3' in use_model.lower():
             return 1024
-        elif 'voyage-2' in use_model.lower():
-            return 1024
-        elif 'voyage-large' in use_model.lower() or 'voyage-law' in use_model.lower() or 'voyage-code' in use_model.lower():
-            return 1536
         elif 'large' in use_model.lower() or '3-large' in use_model.lower():
             return 3072
         elif 'small' in use_model.lower() or '3-small' in use_model.lower():
             return 1536
-        elif 'ada' in use_model.lower():
-            return 1536
         elif 'gemini-embedding' in use_model.lower():
-            return 768
+            return 3072
         elif 'embedding-v4' in use_model.lower():
-            return 1536
+            return 1024
         else:
-            return 1536  # 默认维度
+            return 1536  
 
 

@@ -1,8 +1,7 @@
 """
 ======================================================
-向量数据库构建脚本
-功能：使用LlamaIndex解析Markdown文件，构建Chroma向量数据库
-支持九种电化学反应类型的文献数据存储
+Vector Database Construction Script
+Function: Parse Markdown files using LlamaIndex to build a Chroma vector database
 ======================================================
 """
 
@@ -11,10 +10,8 @@ from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 
-# 加载环境变量
 load_dotenv()
 
-# 添加项目根目录到路径
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
@@ -22,7 +19,7 @@ from agents.agent_config import AgentConfig
 from database.vector_store import VectorStore
 from database.text_processor import TextProcessor
 from database.embedder import MultiModelEmbedder
-from utils.logger import Logger
+from utils.logger import Logger, setup_logging
 
 REACTION_CONFIGS = {
     "CO2RR": {"path": "CO2RR", "type": "fulltext"},   # CO2 Reduction Reaction
@@ -46,48 +43,48 @@ def build_vector_database(
     chunk_overlap: int = 50
 ):
     """
-    构建向量数据库
-    使用LlamaIndex解析Markdown，创建Document对象并进行chunk和索引构建
-    使用Chromadb进行持久化数据存储
+    Build vector database
+    Parse Markdown with LlamaIndex, create Document objects, chunk and index
+    Use Chromadb for persistent storage
     
     Args:
         config_path: 配置文件路径
-        data_dir: 原始数据目录，包含各反应类型子目录
-        reaction_configs: 反应类型配置字典，None则使用默认配置
+        data_dir: 原始数据目录，包含各反应类型的子目录
+        reaction_configs: 反应类型配置字典
         agent_name: 使用的Agent配置名称
         chunk_size: 分块大小
         chunk_overlap: 分块重叠大小
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = Path("./logs") / f"build_vector_db_{timestamp}.log"
-    logger = Logger.get_logger(
-        name=f"MAD.BuildVectorDB.{timestamp}",
-        log_file=str(log_file),
-        level="INFO"
-    )
+    # Load config first so we can also use its logging section.
+    config = AgentConfig(config_path)
 
-    logger.info("=" * 60)
-    logger.info("开始构建Chroma向量数据库")
-    logger.info("=" * 60)
+    # Configure unified run logging (per-run logs under ./logs/runs/<run_id>/).
+    setup_logging(config.config, run_id=f"build_vector_db_{timestamp}")
+    logger = Logger.get_logger("MAD.build_vector_db")
+
+    logger.info("Starting Chroma vector database build", extra={"event": "vector_db.build.start"})
     
-    # 构建反应类型配置
+    # Build reaction type configuration
     if reaction_configs is None:
         reaction_configs = REACTION_CONFIGS
+
+    #--------------------------------------------------
+    # 1. Load configuration
+    #--------------------------------------------------
     
-    # 1. 加载配置
-    logger.info("\n[步骤 1/5] 加载配置...")
-    config = AgentConfig(config_path)
+    logger.info("[Step 1/5] Loading configuration...")
     
-    # 获取对应Agent配置
+    # Get corresponding Agent configuration
     llm_config = config.get_llm_config(agent_name)
     vector_config = config.get_vector_store_config()
     rag_config = config.get_rag_config()
     
-    # 使用配置文件中的chunk参数
+    # Use chunk parameters 
     chunk_size = rag_config.get('chunk_size', chunk_size)
     chunk_overlap = rag_config.get('chunk_overlap', chunk_overlap)
     
-    # 获取所有agent的配置字典（用于MultiModelEmbedder动态切换模型）
+    # Get all agent configuration dictionaries
     all_agent_configs = {
         'agent1': config.get_llm_config('agent1'),
         'agent2': config.get_llm_config('agent2'),
@@ -95,7 +92,7 @@ def build_vector_database(
         'agent4': config.get_llm_config('agent4')
     }
     
-    # 根据agent名称设置不同的collection_name
+    # Set different collection_name based on agent name
     base_collection_name = vector_config.get('collection_name', 'chemical_reactions_recommendation')
     collection_name = f"{base_collection_name}_{agent_name}"
     
@@ -105,89 +102,101 @@ def build_vector_database(
     logger.info(f"✓ collection_name: {collection_name}")
     logger.info(f"✓ chunk_size: {chunk_size}, chunk_overlap: {chunk_overlap}")
     
-    # 2. 使用LlamaIndex加载文档
-    logger.info("\n[步骤 2/5] 加载文献数据...")
+    #--------------------------------------------------
+    # 2. Use LlamaIndex to load documents
+    #--------------------------------------------------
+
+    logger.info("\n[Step 2/5] Loading literature data...")
     processor = TextProcessor(data_dir)
     
-    # 检查数据目录结构
+    # Check data directory structure
     data_path = Path(data_dir)
     if not data_path.exists():
-        logger.error(f"\n✗ 数据目录不存在: {data_dir}")
-        logger.error("  请确保数据目录结构如下:")
+        logger.error(f"\n✗ Data directory does not exist: {data_dir}")
+        logger.error("  Please ensure the data directory structure is as follows:")
         for _, cfg in reaction_configs.items():
             file_type = "*.md"
             logger.error(f"    {data_dir}/{cfg['path']}/{file_type}")
         return
     
-    # 加载所有反应类型的文档
+    # Load all documents based on reaction configurations
     documents = processor.load_reaction_documents(
         base_dir=data_dir,
         reaction_configs=reaction_configs
     )  
     
-    logger.info(f"\n✓ 共加载 {len(documents)} 个Document对象")
+    logger.info(f"\n✓ Loaded {len(documents)} Document objects")
     
     if len(documents) == 0:
-        logger.error("\n✗ 未找到任何文档，请检查数据目录")
-        logger.error("  支持的文件格式: .md")
-        logger.error(f" 数据目录: {data_dir}")
+        logger.error("\n✗ No documents found, please check the data directory")
+        logger.error("  Supported file format: .md")
+        logger.error(f" Data directory: {data_dir}")
         return
     
-    # 3. 对Document进行chunk分块
-    logger.info("\n[步骤 3/5] 对Document进行chunk切分...")
+    #--------------------------------------------------
+    # 3. Chunk documents
+    #--------------------------------------------------
+
+    logger.info("\n[Step 3/5] Chunking documents...")
     chunked_documents = processor.chunk_documents(
         documents=documents,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap
     )
 
-    logger.info(f"✓ 分块后文档数: {len(chunked_documents)}")
+    logger.info(f"✓ Number of chunked documents: {len(chunked_documents)}")
     
-    # 4. 初始化向量化器
-    logger.info("\n[步骤 4/5] 初始化向量化器并生成向量...")
+    #--------------------------------------------------
+    # 4. Initialize embedder
+    #--------------------------------------------------
+
+    logger.info("\n[Step 4/5] Initializing embedder and generating embeddings...")
     try:
         embedder = MultiModelEmbedder(llm_config, agent_configs=all_agent_configs)
     except ValueError as e:
-        logger.error(f"\n✗ 初始化失败: {str(e)}")
+        logger.error(f"\n✗ Initialization failed: {str(e)}")
         return
     
-    # 利用doc属性获取文本和元数据
+    # Use doc attributes to get text and metadata
     texts = [doc.text for doc in chunked_documents]
     metadatas = [doc.metadata for doc in chunked_documents]
     
-    logger.info(f"✓ 准备向量化 {len(texts)} 个文本")
+    logger.info(f"✓ Preparing to embed {len(texts)} texts")
     
-    # 生成向量
-    logger.info("\n开始向量化...")
+    # Generate embeddings
+    logger.info("\nStarting embedding...")
     try:
         embeddings = embedder.embed_batch(texts, batch_size=10, show_progress=True, agent_name=agent_name)
     except Exception as e:
-        logger.error(f"\n✗ 向量化失败: {str(e)}")
+        logger.error(f"\n✗ Embedding failed: {str(e)}")
         return
     
-    logger.info(f"\n✓ 成功生成 {len(embeddings)} 个向量")
-    logger.info(f"✓ 向量维度: {len(embeddings[0]) if embeddings else 0}")
+    logger.info(f"\n✓ Successfully generated {len(embeddings)} embeddings")
+    logger.info(f"✓ Embedding dimension: {len(embeddings[0]) if embeddings else 0}")
     
-    # 5. 存储到Chroma向量数据库
-    logger.info("\n[步骤 5/5] 存储到Chroma向量数据库...")
+    #--------------------------------------------------
+    # 5. Store to Chroma vector database
+    #--------------------------------------------------
+
+    logger.info("\n[Step 5/5] Storing to Chroma vector database...")
     
     vector_store = VectorStore(
         persist_directory=vector_config.get('persist_directory', './data/chroma_db'),
         collection_name=collection_name,  
-        embedding_function=None  # 使用预生成的向量 
+        embedding_function=None  # Use precomputed embeddings 
     )
     
-    # 清空已有数据（可选）
+    # Clear existing data (optional)
     current_count = vector_store.get_collection_count()
     if current_count > 0:
-        prompt = f"\n集合中已有 {current_count} 个文档，是否清空？(y/n): "
+        prompt = f"\nCollection already has {current_count} documents. Clear it? (y/n): "
         logger.info(prompt)
         user_input = input(prompt)
         if user_input.lower() == 'y':
             vector_store.reset_collection()
-            logger.info("✓ 已清空集合")
+            logger.info("✓ Collection cleared")
     
-    # 批量添加文档和向量
+    # Batch add documents and embeddings
     try:
         vector_store.add_documents(
             documents=texts,
@@ -195,15 +204,15 @@ def build_vector_database(
             metadatas=metadatas
         )
     except Exception as e:
-        logger.error(f"\n✗ 存储失败: {str(e)}")
+        logger.error(f"\n✗ Failed to store: {str(e)}")
         return
     
-    logger.info("✓ 成功存储到Chroma数据库")
-    logger.info(f"✓ 集合名称: {collection_name}")
-    logger.info(f"✓ 存储路径: {vector_config.get('persist_directory')}")
-    logger.info(f"✓ 文档总数: {vector_store.get_collection_count()}")
-    logger.info("\n" + "=" * 60)
-    logger.info("向量数据库构建完成!")
+    logger.info("✓ Successfully stored to Chroma database")
+    logger.info(f"✓ Collection name: {collection_name}")
+    logger.info(f"✓ Persist directory: {vector_config.get('persist_directory')}")
+    logger.info(f"✓ Document count: {vector_store.get_collection_count()}\n")
+    logger.info("=" * 60)
+    logger.info("Chroma DB build complete!")
     logger.info("=" * 60)
 
 

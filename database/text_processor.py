@@ -1,49 +1,58 @@
 """
 ===================================
-文本预处理模块
-功能：处理原始文本数据,准备向量化
-包含文本加载、分块等功能
-支持LlamaIndex解析Markdown文件
+Preprocessing Module 
+Function: Process raw text data and prepare for vectorization
+Includes text loading, chunking, and supports LlamaIndex parsing of Markdown files
 ===================================
 """
 
-import csv
-import re
-from difflib import SequenceMatcher
-from datetime import datetime
-from pathlib import Path
-from typing import List, Dict, Optional
+from __future__ import annotations
 
-from llama_index.core import Document, SimpleDirectoryReader
-from llama_index.core.node_parser import SentenceSplitter, MarkdownNodeParser
-from llama_index.core.ingestion import IngestionPipeline
+import hashlib
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, TYPE_CHECKING
+
 from utils.logger import Logger
 
-db_log_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-db_log_file = Path("./logs/db_log") / f"text_processor_{db_log_timestamp}.log"
-logger = Logger.get_logger(
-    name=f"MAD.DB.TextProcessor.{db_log_timestamp}",
-    log_file=str(db_log_file),
-    level="INFO"
+if TYPE_CHECKING:
+    # Optional: only required when calling `load_documents` / `chunk_documents`.
+    from llama_index.core import Document
+
+logger = Logger.create_module_logger("database.text_processor")
+
+
+# DOI extraction patterns (Markdown often wraps DOI in links/punctuation).
+# We keep the suffix permissive and normalize/validate after matching.
+_DOI_URL_RE = re.compile(
+    r"(?i)\b(?:https?://)?(?:dx\.)?doi\.org/(?P<doi>10\.\d{4,9}/[^\s<>\"]+)"
 )
+_DOI_LABEL_RE = re.compile(
+    r"(?i)\bdoi\s*[:：]?\s*(?P<doi>10\.\d{4,9}/[^\s<>\"]+)"
+)
+_DOI_BARE_RE = re.compile(r"(?i)\b(?P<doi>10\.\d{4,9}/[^\s<>\"]+)")
+
+_REACTION_TYPES = {"co2rr", "eor", "her", "hor", "hzor", "o5h", "oer", "orr", "uor"}
 
 
 class TextProcessor:
     """
-    文档预处理器
-    负责加载和处理原始文档数据
+    Responsible for loading and processing raw document data
     """
     
     def __init__(self, data_dir: str = "./data/raw"):
         """
-        初始化文档处理器
+        Initialize the text processor
         
         Args:
-            data_dir: 原始数据目录
+            data_dir: Directory containing raw data
         """
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self._metadata_index = None
+
+        # Lazy-loaded mapping: reaction_key -> {normalized_title: doi}
+        self._metadata_tsv_index: Dict[str, Dict[str, str]] = {}
+        self._metadata_tsv_paths: Optional[Dict[str, List[Path]]] = None
     
     def clean_text(self, text: str) -> str:
         """
@@ -52,7 +61,7 @@ class TextProcessor:
         清洗操作：
         - 删除Acknowledgement部分及其后的所有内容
         - 删除Reference/References部分及其后的所有内容
-        - 若无Reference标题，尝试移除末尾参考文献列表（启发式）
+        - 若无Reference标题，尝试移除末尾参考文献列表
         
         Args:
             text: 原始文本
@@ -128,289 +137,454 @@ class TextProcessor:
                 text = "\n".join(lines[:block_start]).rstrip()
         
         return text
-    
-    def _normalize_title(self, text: str) -> str:
-        normalized = text.strip().lower()
-        # 移除HTML标签（如 <sub>2</sub>, <sup>+</sup> 等）
-        normalized = re.sub(r"<[^>]+>", "", normalized)
-        # 移除括号和方括号内容
-        normalized = re.sub(r"\(.*?\)|\[.*?\]|\{.*?\}", " ", normalized)
-        # 移除年份
-        normalized = re.sub(r"\b(19|20)\d{2}\b", " ", normalized)
-        normalized = re.sub(r"\s+", " ", normalized)
-        normalized = re.sub(r"[^0-9a-z\u4e00-\u9fff ]+", " ", normalized)
-        normalized = re.sub(r"\s+", " ", normalized).strip()
-        return normalized
 
-    def _normalize_author(self, text: str) -> str:
+    @staticmethod
+    def _normalize_title_for_match(text: str) -> str:
+        """
+        Normalize a paper title for robust matching across Markdown/TSV sources.
+
+        Strategy: lowercase, remove HTML tags/markdown emphasis, collapse punctuation to spaces.
+        """
         if not text:
             return ""
-        author = text.split(",")[0]
-        author = re.sub(r"[^a-zA-Z\u4e00-\u9fff]+", "", author).lower()
-        return author
+        t = text.strip().lower()
+        # Remove HTML tags like <sub>2</sub>, <sup>+</sup>.
+        t = re.sub(r"<[^>]+>", "", t)
+        # Drop common markdown emphasis markers.
+        t = t.replace("**", " ").replace("*", " ").replace("_", " ").replace("`", " ")
+        # Collapse non-word characters to spaces (keep ASCII alnum + CJK).
+        t = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
 
-    def _extract_year_from_text(self, text: str) -> Optional[str]:
-        match = re.search(r"\b(19|20)\d{2}\b", text)
-        return match.group(0) if match else None
+    @staticmethod
+    def _extract_title_candidates_from_markdown(content: str) -> List[str]:
+        """
+        Extract plausible title candidates from a Markdown file.
 
-    def _extract_author_from_filename(self, filename: str) -> str:
-        stem = Path(filename).stem
-        parts = re.split(r"\s*[-–—]\s*", stem, maxsplit=1)
-        author_part = parts[0] if parts else ""
-        author_part = author_part.split("等")[0]
-        author_part = author_part.split("et al")[0]
-        return self._normalize_author(author_part)
+        Heuristics (in priority order):
+        - Prefer the first *non-generic* H1 (# ...) title near the top.
+        - Skip common section/journal headers like "FULL PAPER", "RESEARCH ARTICLE", "ABSTRACT", etc.
+        - If needed, fall back to a "Title:" marker or bold-only lines.
+        """
+        if not content:
+            return []
 
-    def _build_title_variants(self, title: str) -> List[str]:
-        variants = [title]
-        if ":" in title:
-            variants.append(title.split(":", 1)[0].strip())
-        if " - " in title:
-            variants.append(title.split(" - ", 1)[0].strip())
-        if " – " in title:
-            variants.append(title.split(" – ", 1)[0].strip())
-        if " — " in title:
-            variants.append(title.split(" — ", 1)[0].strip())
-        return [v for v in variants if v]
+        lines = content.splitlines()
+        head_lines = lines[:120]
 
-    def _extract_title_candidates(self, content: str, filename: str = "") -> List[str]:
-        candidates = []
-        
-        # Priority 1: Filename title (most reliable for this dataset)
-        # Format: "Author - Year - Title.md" or "Author等 - Year - Title.md"
-        if filename:
-            stem = Path(filename).stem
-            # Split by " - " and extract the part after year
-            parts = re.split(r'\s*[-–—]\s*', stem)
-            
-            title_part = None
-            if len(parts) >= 3:
-                # Try to find year part (4-digit number)
-                for i, part in enumerate(parts):
-                    if re.match(r'^\d{4}$', part.strip()):
-                        # Everything after year is title
-                        if i + 1 < len(parts):
-                            title_part = ' - '.join(parts[i+1:])
-                        break
-            
-            # Fallback: if no year found, use the whole stem
-            if not title_part:
-                title_part = stem
-                # Remove common author patterns
-                title_part = re.sub(r'^.+?等\s*[-–—]\s*\d{4}\s*[-–—]\s*', '', title_part)
-                title_part = re.sub(r'^.+?\s*[-–—]\s*\d{4}\s*[-–—]\s*', '', title_part)
-            
-            if title_part and title_part.strip():
-                candidates.extend(self._build_title_variants(title_part.strip()))
-        
-        # Priority 2: Content-based extraction as additional candidates
-        if content:
-            lines = content.splitlines()
-            
-            # Pattern A: **Title:** marker (common in published papers)
-            found_title_marker = False
-            for i, line in enumerate(lines[:50]):
-                if re.search(r'\*\*Title:\*\*', line, re.IGNORECASE):
-                    title = re.sub(r'\*\*Title:\*\*\s*', '', line, flags=re.IGNORECASE).strip()
-                    title = re.sub(r'^\*\*|\*\*$', '', title).strip()
-                    if title and len(title) > 15:
-                        candidates.extend(self._build_title_variants(title))
-                        found_title_marker = True
-                        break
-            
-            # Pattern B: # title (最重要的内容标题,skip metadata headers)
-            if not found_title_marker:  # Only if no **Title:** found
-                skip_patterns = [
-                    r'^accepted\s+article',
-                    r'^research\s+article',
-                    r'^original\s+article',
-                    r'^review\s+article',
-                    r'^\d+\.?\s*introduction',
-                    r'^chemnanomat',
-                    r'^received:',
-                    r'^www\.',
-                    r'^\d+\.\s+introduction',
-                    r'^protective\s+immune',
-                    r'^dalton\s+transactions?',
-                    r'^inorganic\s+chemistry',
-                    r'^.*?\s+frontiers?$',
-                    r'^ecs\s+transactions?',
-                    r'^advanced\s+(materials?|energy)',
-                    r'^journal\s+of',
-                    r'^nature\s+(chemistry|materials?|communications?)',
-                    r'^angewandte\s+chemie',
-                ]
-                for line in lines[:50]:
-                    stripped = line.strip()
-                    if stripped.startswith("#"):
-                        title = stripped.lstrip("# ").strip()
-                        # Remove markdown formatting (**, *, etc.)
-                        title = re.sub(r'^\*+|\*+$', '', title).strip()
-                        title = re.sub(r'\*\*([^*]+)\*\*', r'\1', title)  # Remove **text**
-                        if title and len(title) > 15:
-                            is_metadata = any(re.match(pat, title, re.IGNORECASE) for pat in skip_patterns)
-                            if not is_metadata:
-                                candidates.extend(self._build_title_variants(title))
-                                break
-            
-            # Pattern C: Bold/italic text with keywords (lowest priority, skip journal headers)
-            if len(candidates) <= 1:  # Only if filename extraction failed or too short
-                for i in range(min(7, len(lines)), min(35, len(lines))):
-                    line = lines[i].strip()
-                    if re.search(r'\*\*[^\n]+\*\*', line) and not line.startswith('#'):
-                        title = re.sub(r'\*+', ' ', line).strip()
-                        title = re.sub(r'\s+', ' ', title)
-                        if len(title) > 15:
-                            skip_bold = [r'^(Abstract|Received|DOI|Introduction|Correspondence|Funding|Keywords)$', 
-                                        r'^www\.', r'^Nanocrystals$', r'^\d+\s*$', r'^ECS Transactions',
-                                        r'^\w+\s+Chemistry', r'^\w+\s+Materials']
-                            is_skip = any(re.match(pat, title, re.IGNORECASE) for pat in skip_bold)
-                            has_keywords = any(kw in title.lower() for kw in 
-                                             ['catalyst', 'electro', 'oxidation', 'fuel', 'nanop', 'metal', 
-                                              'reaction', 'interface', 'synthesis', 'performance', 'activity'])
-                            if not is_skip and (has_keywords or len(title) > 40):
-                                candidates.extend(self._build_title_variants(title))
-                                break
-        
+        noise_exact = {
+            "full paper",
+            "paper",
+            "short note",
+            "selected paper",
+            "research article",
+            "research articles",
+            "original article",
+            "original research",
+            "review article",
+            "accepted article",
+            "open",
+            "open access",
+            "abstract",
+            "keywords",
+            "keyword",
+            "correspondence",
+            "funding",
+            "funding information",
+            "author contributions",
+            "acknowledgment",
+            "acknowledgments",
+            "acknowledgement",
+            "acknowledgements",
+            "introduction",
+            "conclusion",
+            "conclusions",
+            "references",
+            "reference",
+            "zuschriften",
+            "forschungsartikel",
+        }
+        noise_patterns = [
+            re.compile(r"(?i)^(original|research|review)\s+article\b"),
+            re.compile(r"(?i)^.*open\s+access.*$"),
+            re.compile(r"(?i)^\d+(\.\d+)?\s*\|\s*\w+.*$"),  # e.g. "1 | INTRODUCTION"
+            re.compile(r"(?i)^(figure|scheme|table)\b"),
+        ]
+
+        def _strip_markdown(text: str) -> str:
+            t = (text or "").strip()
+            if not t:
+                return ""
+            # Remove outer emphasis markers and inline formatting.
+            t = re.sub(r"^\*+|\*+$", "", t).strip()
+            t = re.sub(r"`+", "", t)
+            t = re.sub(r"\*\*([^*]+)\*\*", r"\1", t)
+            t = re.sub(r"_([^_]+)_", r"\1", t)
+            return t.strip()
+
+        def _is_noise_title(text: str) -> bool:
+            plain = _strip_markdown(text)
+            if not plain:
+                return True
+            norm = TextProcessor._normalize_title_for_match(plain)
+            if not norm:
+                return True
+            if norm in noise_exact:
+                return True
+            for rx in noise_patterns:
+                if rx.match(plain) or rx.match(norm):
+                    return True
+
+            # Many exports put section/journal headers in ALL CAPS; treat short ALL-CAPS as noise.
+            letters = re.sub(r"[^A-Za-z]+", "", plain)
+            if letters and letters.isupper():
+                words = plain.split()
+                if len(words) <= 4 and len(plain) <= 40:
+                    return True
+
+            return False
+
+        candidates: List[str] = []
+
+        # Pattern 1: "Title:" marker (sometimes present in structured exports).
+        for line in head_lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            m = re.match(r"(?i)^title\s*[:：]\s*(.+)$", stripped)
+            if not m:
+                continue
+            title = _strip_markdown(m.group(1))
+            if title and not _is_noise_title(title):
+                candidates.append(title)
+
+        # Pattern 2: Markdown headings; prefer H1 and skip noisy headers like "FULL PAPER".
+        headings: List[tuple[int, str]] = []
+        for line in head_lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+            if not m:
+                continue
+            level = len(m.group(1))
+            title = _strip_markdown(m.group(2))
+            if not title or _is_noise_title(title):
+                continue
+            headings.append((level, title))
+
+        # Preserve document order, but prioritize lower heading level (H1 -> H6).
+        for wanted_level in range(1, 7):
+            for level, title in headings:
+                if level != wanted_level:
+                    continue
+                if title not in candidates:
+                    candidates.append(title)
+                if len(candidates) >= 5:
+                    return candidates
+
+        # Pattern 3: bold-only lines (last resort).
+        for line in head_lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("**") and stripped.endswith("**") and len(stripped) > 4:
+                title = _strip_markdown(stripped)
+                if title and len(title) >= 15 and not _is_noise_title(title):
+                    candidates.append(title)
+                    break
+
+        return candidates
+
+    @staticmethod
+    def _build_title_variants(title: str) -> List[str]:
+        """Build a small set of variants to improve exact-match recall."""
+        t = (title or "").strip()
+        if not t:
+            return []
+        variants = [t]
+        for sep in (":", " - ", " – ", " — "):
+            if sep in t:
+                variants.append(t.split(sep, 1)[0].strip())
+        # De-dup while preserving order.
         seen = set()
-        deduped = []
-        for candidate in candidates:
-            if candidate not in seen:
-                seen.add(candidate)
-                deduped.append(candidate)
-        return deduped
+        out: List[str] = []
+        for v in variants:
+            if v and v not in seen:
+                seen.add(v)
+                out.append(v)
+        return out
 
-    def _get_reaction_key_from_path(self, file_path: str) -> Optional[str]:
+    @staticmethod
+    def _get_reaction_key_from_path(file_path: str) -> Optional[str]:
         if not file_path:
             return None
-        parts = [p.upper() for p in Path(file_path).parts]
-        reaction_types = {"CO2RR", "EOR", "HER", "HOR", "HZOR", "O5H", "OER", "ORR", "UOR"}
+        parts = [p.lower() for p in Path(file_path).parts]
         for part in parts:
-            if part in reaction_types:
-                return part.lower()
+            if part in _REACTION_TYPES:
+                return part
         return None
 
-    def _load_metadata_index(self) -> Dict[str, Dict[str, Dict[str, str]]]:
-        if self._metadata_index is not None:
-            return self._metadata_index
+    def _get_metadata_tsv_paths(self) -> Dict[str, List[Path]]:
+        """
+        Map reaction_key -> list of TSV paths under ./metadata.
 
-        index: Dict[str, Dict[str, Dict[str, str]]] = {}
+        TSV files in this repo are large; we only load the reaction we need on demand.
+        """
+        if self._metadata_tsv_paths is not None:
+            return self._metadata_tsv_paths
+
         metadata_dir = Path("./metadata")
-        if not metadata_dir.exists():
-            self._metadata_index = index
-            return index
+        paths: Dict[str, List[Path]] = {}
+        if metadata_dir.exists():
+            for tsv_path in metadata_dir.glob("*.tsv"):
+                name = tsv_path.name.lower()
+                reaction_key = None
+                for rt in _REACTION_TYPES:
+                    if rt in name:
+                        reaction_key = rt
+                        break
+                if reaction_key is None:
+                    continue
+                paths.setdefault(reaction_key, []).append(tsv_path)
 
-        for csv_path in metadata_dir.glob("*.csv"):
-            reaction_key = csv_path.stem.lower()
-            index[reaction_key] = {}
+        self._metadata_tsv_paths = paths
+        return paths
+
+    def _load_metadata_tsv_index(self, reaction_key: str) -> Dict[str, str]:
+        """
+        Load and cache {normalized_title: doi} for a given reaction TSV metadata file.
+
+        Expected TSV schema includes at least: title, doi
+        """
+        rk = (reaction_key or "").strip().lower()
+        if not rk:
+            return {}
+        if rk in self._metadata_tsv_index:
+            return self._metadata_tsv_index[rk]
+
+        paths_by_reaction = self._get_metadata_tsv_paths()
+        tsv_paths = paths_by_reaction.get(rk) or []
+        if not tsv_paths:
+            self._metadata_tsv_index[rk] = {}
+            return self._metadata_tsv_index[rk]
+
+        index: Dict[str, str] = {}
+        for tsv_path in tsv_paths:
             try:
-                with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
-                    reader = csv.DictReader(handle)
-                    for row in reader:
-                        title = (row.get("Title") or "").strip()
-                        doi = (row.get("DOI") or "").strip()
-                        year = (row.get("Publication Year") or "").strip()
-                        author = (row.get("Author") or "").strip()
-                        if not title or not doi:
-                            continue
-                        normalized_title = self._normalize_title(title)
-                        if normalized_title:
-                            index[reaction_key][normalized_title] = {
-                                "doi": doi,
-                                "year": year,
-                                "author": self._normalize_author(author)
-                            }
-            except Exception as exc:
-                logger.error(f"✗ 读取元数据失败: {csv_path} - {exc}")
+                logger.info(f"Loading metadata TSV for {rk}: {tsv_path.name}")
+                with tsv_path.open("r", encoding="utf-8-sig", errors="ignore") as handle:
+                    header = handle.readline()
+                    if not header:
+                        continue
+                    columns = [c.strip().lower() for c in header.rstrip("\n").split("\t")]
 
-        self._metadata_index = index
+                    def _find_col(*names: str) -> Optional[int]:
+                        for n in names:
+                            if n in columns:
+                                return columns.index(n)
+                        return None
+
+                    title_idx = _find_col("title", "paper_title", "article_title")
+                    doi_idx = _find_col("doi", "doi_url", "doi link", "doi_link")
+                    if title_idx is None or doi_idx is None:
+                        logger.warning(f"TSV missing required columns (title/doi): {tsv_path.name}")
+                        continue
+
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        parts = line.rstrip("\n").split("\t")
+                        if len(parts) <= max(title_idx, doi_idx):
+                            continue
+                        title = (parts[title_idx] or "").strip()
+                        doi_raw = (parts[doi_idx] or "").strip()
+                        if not title or not doi_raw:
+                            continue
+                        doi = self._normalize_doi(doi_raw) or self._normalize_doi(doi_raw.replace("https://doi.org/", ""))
+                        if not doi:
+                            continue
+                        key = self._normalize_title_for_match(title)
+                        if key and key not in index:
+                            index[key] = doi
+            except Exception as exc:
+                logger.error(f"Failed to load TSV metadata: {tsv_path} - {exc}")
+
+        self._metadata_tsv_index[rk] = index
         return index
 
-    def _find_best_similarity_match(
-        self,
-        candidate: str,
-        reaction_map: Dict[str, Dict[str, str]],
-        year: Optional[str],
-        author: str
-    ) -> Optional[str]:
-        best_score = 0.0
-        best_doi = None
-        
-        # Extract first 5-8 significant words for prefix matching
-        candidate_words = [w for w in candidate.split() if len(w) > 2][:8]
-        candidate_prefix = ' '.join(candidate_words[:5]) if len(candidate_words) >= 5 else candidate
-        
-        for title_key, meta in reaction_map.items():
-            # Skip year/author mismatch if hints available
-            if year and meta.get("year") and meta.get("year") != year:
-                continue
-            if author and meta.get("author") and author not in meta.get("author"):
-                continue
-            
-            # Strategy 1: Full similarity match
-            ratio = SequenceMatcher(None, candidate, title_key).ratio()
-            
-            # Strategy 2: Prefix match (for truncated filenames)
-            if len(candidate_words) >= 4:
-                title_words = [w for w in title_key.split() if len(w) > 2]
-                title_prefix = ' '.join(title_words[:5]) if len(title_words) >= 5 else title_key
-                prefix_ratio = SequenceMatcher(None, candidate_prefix, title_prefix).ratio()
-                # Boost score if prefix matches well
-                if prefix_ratio > 0.85:
-                    ratio = max(ratio, prefix_ratio * 0.95)
-            
-            if ratio > best_score:
-                best_score = ratio
-                best_doi = meta.get("doi")
-        
-        # Lower threshold for better recall with prefix matching
-        if best_score >= 0.75:
-            return best_doi
+    def _extract_doi_from_tsv_metadata(self, content: str, file_path: str = "") -> Optional[str]:
+        """Fallback: match Markdown title to metadata TSV (title -> doi)."""
+        reaction_key = self._get_reaction_key_from_path(file_path) if file_path else None
+        if not reaction_key:
+            return None
+
+        titles = self._extract_title_candidates_from_markdown(content)
+        if not titles:
+            return None
+
+        title_map = self._load_metadata_tsv_index(reaction_key)
+        if not title_map:
+            return None
+
+        for title in titles:
+            for variant in self._build_title_variants(title):
+                key = self._normalize_title_for_match(variant)
+                if not key:
+                    continue
+                doi = title_map.get(key)
+                if doi:
+                    return doi
+
         return None
+    
+    @staticmethod
+    def _normalize_doi(raw: str) -> Optional[str]:
+        """Normalize an extracted DOI candidate into canonical `10.xxxx/...` form."""
+        if not raw:
+            return None
+
+        doi = raw.strip()
+
+        # Strip common URL / label prefixes (defensive; regexes usually capture DOI only).
+        doi = re.sub(r"(?i)^(?:doi\s*[:：]\s*)", "", doi)
+        doi = re.sub(r"(?i)^(?:https?://)?(?:dx\.)?doi\.org/", "", doi)
+
+        # Remove query/fragment if DOI came from a URL.
+        doi = doi.split("?", 1)[0].split("#", 1)[0]
+
+        # Strip surrounding wrappers often introduced by Markdown/prose.
+        doi = doi.strip().strip("<>")
+        doi = doi.lstrip("([{<\"'")
+        doi = doi.rstrip(".,;:!?\"'")
+
+        # Guardrails for Markdown artifacts:
+        # Some marker-generated Markdown contains patterns like:
+        #   [https://doi.org/10.3390/](https://doi.org/10.3390/catal15080767)
+        # Our permissive DOI regex can accidentally capture "10.3390/](https://...)" (no whitespace),
+        # which is NOT a valid DOI and also bloats metadata, crashing metadata-aware chunking.
+        low = doi.lower()
+        if "](" in low or "](http" in low or "doi.org" in low or "http://" in low or "https://" in low:
+            return None
+
+        # Remove unbalanced closing brackets at the end, e.g. from Markdown links "...(doi)".
+        closers = {")": "(", "]": "[", "}": "{", ">": "<"}
+        while doi and doi[-1] in closers and doi.count(closers[doi[-1]]) < doi.count(doi[-1]):
+            doi = doi[:-1]
+            doi = doi.rstrip(".,;:!?\"'")
+
+        doi = doi.strip()
+        if not doi:
+            return None
+
+        # Basic validation (keep permissive; DOI suffix allows many characters but no whitespace).
+        if re.search(r"\s", doi):
+            return None
+        # Require at least one suffix character after the slash.
+        if not re.match(r"(?i)^10\.\d{4,9}/\S+", doi):
+            return None
+
+        # Canonicalize for stable IDs in metadata / source_id.
+        return doi.lower()
+
+    def _extract_doi_from_markdown(self, content: str) -> Optional[str]:
+        """Extract DOI from Markdown content (plain form or doi.org URL)."""
+        if not content:
+            return None
+
+        # Avoid picking up DOIs from reference lists at the end of the document.
+        cleaned = self.clean_text(content)
+
+        # Most papers place DOI in the header area; scan head first (more reliable).
+        head = cleaned[:8000]
+        for regex in (_DOI_URL_RE, _DOI_LABEL_RE, _DOI_BARE_RE):
+            for match in regex.finditer(head):
+                doi = self._normalize_doi(match.group("doi"))
+                if doi:
+                    return doi
+
+        # Fallback: scan a larger window for explicit DOI/url forms (still avoid bare matches).
+        window = cleaned[:20000]
+        for regex in (_DOI_URL_RE, _DOI_LABEL_RE):
+            for match in regex.finditer(window):
+                doi = self._normalize_doi(match.group("doi"))
+                if doi:
+                    return doi
+
+        return None
+
+    def _build_fallback_doc_id(self, filename: str = "", file_path: str = "") -> str:
+        """
+        构造一个稳定的“非DOI”文档标识，用于 doc_id/source_id。
+
+        说明：
+        - 下游会用 (doc_id, chunk_id) 拼接 source_id；若大量返回 "unknown"，会产生跨文档冲突。
+        - 因此在没有 DOI 的情况下，优先用“相对 data_dir 的路径”生成一个稳定 ID。
+        """
+        candidate = ""
+
+        # Prefer a path relative to the dataset root for stability across machines.
+        if file_path:
+            try:
+                p = Path(file_path)
+                try:
+                    rel = p.resolve().relative_to(self.data_dir.resolve())
+                    candidate = rel.as_posix()
+                except Exception:
+                    candidate = p.name
+            except Exception:
+                candidate = str(file_path)
+        elif filename:
+            candidate = str(filename)
+
+        candidate = (candidate or "").strip().replace("\\", "/")
+        if not candidate:
+            return "unknown"
+
+        # Drop extension and sanitize to keep the ID URL-safe-ish.
+        candidate = re.sub(r"(?i)\.md$", "", candidate)
+        candidate = re.sub(r"\s+", "_", candidate)
+        candidate = re.sub(r"[^0-9A-Za-z._/-]+", "_", candidate).strip("_")
+
+        # IMPORTANT:
+        # LlamaIndex's metadata-aware chunking counts metadata tokens against `chunk_size`.
+        # If users name markdown files with very long titles, keeping the full filename/path
+        # here can make `doc_id` exceed the chunk token budget and crash chunking.
+        #
+        # To keep metadata bounded while still being stable + partially readable, we use:
+        #   no-doi:<basename_trunc>_<sha16>
+        slug = candidate.lower()
+        basename = slug.rsplit("/", 1)[-1] or "doc"
+        basename = basename[:30].strip("_") or "doc"
+        digest = hashlib.sha256(slug.encode("utf-8")).hexdigest()[:16]
+        return f"no-doi:{basename}_{digest}"
 
     def extract_doi_from_content(self, content: str, filename: str = "", file_path: str = "") -> str:
         """
-        从外部CSV元数据中查找并返回DOI
-        
+        提取并返回DOI。
+
+        优先从Markdown正文中直接解析DOI（支持显式 DOI: 10.xxxx/... 以及 doi.org URL 形式）。
+        若正文未找到，则回退到 ./metadata/*.tsv 中按 title->doi 匹配提取。
+        若仍未找到，则返回稳定的 fallback 标识（no-doi:...），避免 doc_id="unknown" 导致 source_id 冲突。
+         
         Args:
             content: 文本内容
             filename: 文件名
             file_path: 文件路径
             
         Returns:
-            str: DOI，如果未找到则返回"unknown"
+            str: DOI；如果未找到则返回稳定的 fallback 标识（no-doi:...）
         """
-        index = self._load_metadata_index()
-        if not index:
-            return "unknown"
+        doi = self._extract_doi_from_markdown(content)
+        if doi:
+            return doi
 
-        reaction_key = self._get_reaction_key_from_path(file_path)
-        candidates = self._extract_title_candidates(content, filename)
-        normalized_candidates = [self._normalize_title(c) for c in candidates]
-        year_hint = self._extract_year_from_text(filename)
-        author_hint = self._extract_author_from_filename(filename) if filename else ""
+        doi = self._extract_doi_from_tsv_metadata(content, file_path=file_path)
+        if doi:
+            return doi
 
-        if reaction_key and reaction_key in index:
-            for candidate in normalized_candidates:
-                meta = index[reaction_key].get(candidate)
-                if meta and meta.get("doi"):
-                    return meta["doi"]
-            for candidate in normalized_candidates:
-                doi = self._find_best_similarity_match(candidate, index[reaction_key], year_hint, author_hint)
-                if doi:
-                    return doi
-
-        for reaction_map in index.values():
-            for candidate in normalized_candidates:
-                meta = reaction_map.get(candidate)
-                if meta and meta.get("doi"):
-                    return meta["doi"]
-            for candidate in normalized_candidates:
-                doi = self._find_best_similarity_match(candidate, reaction_map, year_hint, author_hint)
-                if doi:
-                    return doi
-
-        return "unknown"
+        return self._build_fallback_doc_id(filename=filename, file_path=file_path)
     
     def load_documents(
         self,
@@ -432,10 +606,13 @@ class TextProcessor:
         """
         data_path = Path(data_dir)
         if not data_path.exists():
-            logger.error(f"✗ 目录不存在: {data_dir}")
+            logger.error(f"Directory does not exist: {data_dir}")
             return []
         
         try:
+            # Local import: DOI-only scripts shouldn't require LlamaIndex installed.
+            from llama_index.core import SimpleDirectoryReader
+
             reader = SimpleDirectoryReader(
                 input_dir=str(data_path),
                 required_exts=[".md"],  
@@ -444,20 +621,20 @@ class TextProcessor:
             documents = reader.load_data()
             
             if not documents:
-                logger.error(f"✗ 未找到任何Markdown文件: {data_dir}")
+                logger.error(f"No Markdown files found: {data_dir}")
                 return []
             
-            # 为每个文档添加自定义metadata
+            # Add custom metadata to each document
             processed_documents = []
             for doc in documents:
-                # 获取文件名（从原始metadata中）
+                # Get file name (from original metadata)
                 file_name = doc.metadata.get('file_name', '')
                 file_path_str = doc.metadata.get('file_path', '')
                 
-                # 从文件名推断反应类型（如果未指定）
+                # Infer reaction type from file name (if not specified)
                 inferred_reaction = reaction_type
                 if inferred_reaction is None and file_name:
-                    # 尝试从文件名中提取反应类型
+                    # Try to extract reaction type from file name
                     filename_upper = Path(file_name).stem.upper()
                     reaction_types = ["CO2RR", "EOR", "HER", "HOR", "HZOR", "O5H", "OER", "ORR", "UOR"]
                     for rt in reaction_types:
@@ -465,10 +642,10 @@ class TextProcessor:
                             inferred_reaction = rt
                             break
                 
-                # 提取DOI号
+                # Extract DOI 
                 doc_id = self.extract_doi_from_content(doc.text, file_name, file_path_str)
                 
-                # 重置metadata，只包含reaction_type和doc_id
+                # Reset metadata to only include reaction_type and doc_id
                 doc.metadata = {
                     "reaction_type": inferred_reaction or "unknown",
                     "doc_id": doc_id
@@ -476,15 +653,15 @@ class TextProcessor:
                 
                 processed_documents.append(doc)
                 
-                logger.info(f"✓ Loaded {file_name}")
-                logger.info(f"  Reaction Type: {doc.metadata['reaction_type']}")
-                logger.info(f"  DOI: {doc.metadata['doc_id']}")
+                logger.info(f" Loaded {file_name}")
+                logger.info(f" Reaction Type: {doc.metadata['reaction_type']}")
+                logger.info(f" DOI: {doc.metadata['doc_id']}")
             
             logger.info(f"\nLoaded a total of {len(processed_documents)} Document objects")
             return processed_documents
             
         except Exception as e:
-            logger.error(f"✗ Failed to load documents: {str(e)}")
+            logger.error(f" Failed to load documents: {str(e)}")
             return []
     
     def load_reaction_documents(
@@ -544,14 +721,21 @@ class TextProcessor:
         """
         if not documents:
             return []
+
+        # Local import: keep the module importable even when LlamaIndex isn't installed,
+        # as long as callers don't use chunking/loading.
+        from llama_index.core import Document
+        from llama_index.core.ingestion import IngestionPipeline
+        from llama_index.core.node_parser import MarkdownNodeParser, SentenceSplitter
         
-        # 第一级：基于Markdown标题的切分器
-        markdown_parser = MarkdownNodeParser()
+        # 第一级：Splitter Based on Markdown Title 
+        markdown_parser = MarkdownNodeParser(include_metadata=False)
         
-        # 第二级：基于句子的细分切分器
+        # 第二级：Splitter Based on Sentence 
         sentence_splitter = SentenceSplitter(
             chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap
+            chunk_overlap=chunk_overlap,
+            include_metadata=False
         )
         
         # 使用IngestionPipeline串联两级切分器
@@ -563,22 +747,32 @@ class TextProcessor:
         )
         
         chunked_documents = []
+        skipped_empty_chunks = 0
         
         for doc in documents:
-            # 通过pipeline处理文档，获取分块后的节点
             nodes = pipeline.run(documents=[doc])
             
-            # 将节点转换为Document对象，保留原始metadata
             for idx, node in enumerate(nodes):
+                content = node.get_content()
+                if not content or not str(content).strip():
+                    skipped_empty_chunks += 1
+                    continue
+
                 chunk_metadata = doc.metadata.copy()
                 chunk_metadata["chunk_id"] = idx
                 chunk_metadata["total_chunks"] = len(nodes)
                 
                 chunk_doc = Document(
-                    text=node.get_content(),
+                    text=content,
                     metadata=chunk_metadata
                 )
                 chunked_documents.append(chunk_doc)
         
-        logger.info(f"\nChunk Completed: {len(documents)} documents -> {len(chunked_documents)} chunks")
+        if skipped_empty_chunks:
+            logger.info(
+                f"\nChunk Completed: {len(documents)} documents -> {len(chunked_documents)} chunks "
+                f"(skipped {skipped_empty_chunks} empty chunks)"
+            )
+        else:
+            logger.info(f"\nChunk Completed: {len(documents)} documents -> {len(chunked_documents)} chunks")
         return chunked_documents

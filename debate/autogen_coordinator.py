@@ -5,17 +5,36 @@ AutoGen Debate Coordinator
 ===================================
 """
 
+import logging
 import re
 import time
+import warnings
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
+
+# Silence noisy optional-dependency warnings from third-party libs (autogen/flaml).
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    module=r"flaml(\..*)?",
+    message=r"flaml\.automl is not available\..*",
+)
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    module=r"autogen\.oai\.gemini(\..*)?",
+    message=r"\s*All support for the `google\.generativeai` package has ended\..*",
+)
+
 from autogen import ConversableAgent, GroupChat, GroupChatManager
 
 from agents.react_agent import ReActAgent
 from agents.react_reasoning import ReActTrajectory
 from prompts.system_prompts import UNIFIED_SYSTEM_PROMPT
 from prompts.debate_phase_prompts import build_initial_debate_prompt
+from utils.logger import get_run_id, make_debate_id, write_debate_artifacts
 
+logger = logging.getLogger("MAD.debate.autogen")
 
 class ReActAutoGenAgent(ConversableAgent):
     """
@@ -203,6 +222,19 @@ class AutoGenDebateCoordinator:
         Returns:
             DebateResult: 辩论结果
         """
+        debate_id = make_debate_id("autogen", components, reaction_type)
+        logger.info(
+            "autogen_debate_start",
+            extra={
+                "event": "autogen.debate.start",
+                "debate_id": debate_id,
+                "components": components,
+                "reaction_type": reaction_type,
+                "max_rounds": self.max_rounds,
+                "consensus_threshold": self.consensus_threshold,
+            },
+        )
+
         print("=" * 60)
         print("Starting Multi-Agent Debate (AutoGen Mode)")
         print("=" * 60)
@@ -239,6 +271,48 @@ class AutoGenDebateCoordinator:
             
             elapsed_time = time.time() - start_time
             result.time_elapsed = elapsed_time
+
+            logger.info(
+                "autogen_debate_end",
+                extra={
+                    "event": "autogen.debate.end",
+                    "debate_id": debate_id,
+                    "time_elapsed": elapsed_time,
+                    "consensus_reached": getattr(result, "consensus_reached", None),
+                    "debate_rounds": getattr(result, "debate_rounds", None),
+                },
+            )
+
+            # Artifacts (structured):
+            try:
+                payload = {
+                    "debate_id": debate_id,
+                    "run_id": get_run_id() or None,
+                    "engine": "autogen",
+                    "reaction_type": reaction_type,
+                    "components": components,
+                    "result": result.to_dict(),
+                }
+                paths = write_debate_artifacts(
+                    debate_id=debate_id,
+                    engine="autogen",
+                    payload=payload,
+                    transcript_events=debate_history,
+                )
+                logger.info(
+                    "autogen_artifacts_written",
+                    extra={
+                        "event": "autogen.artifacts.written",
+                        "debate_id": debate_id,
+                        "full_path": paths.get("full_path"),
+                        "transcript_path": paths.get("transcript_path"),
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "autogen_artifacts_write_failed",
+                    extra={"event": "autogen.artifacts.error", "debate_id": debate_id},
+                )
             
             print("\n" + "=" * 60)
             print(f"Debate Ended (Time: {elapsed_time:.2f}s)")
@@ -247,8 +321,26 @@ class AutoGenDebateCoordinator:
             return result
             
         except Exception as e:
+            logger.exception("autogen_debate_error", extra={"event": "autogen.debate.error"})
             print(f"Error during debate: {str(e)}")
             elapsed_time = time.time() - start_time
+            try:
+                payload = {
+                    "debate_id": debate_id,
+                    "run_id": get_run_id() or None,
+                    "engine": "autogen",
+                    "reaction_type": reaction_type,
+                    "components": components,
+                    "error": str(e),
+                }
+                write_debate_artifacts(
+                    debate_id=debate_id,
+                    engine="autogen",
+                    payload=payload,
+                    transcript_events=[],
+                )
+            except Exception:
+                pass
             
             return DebateResult(
                 consensus_reached=False,

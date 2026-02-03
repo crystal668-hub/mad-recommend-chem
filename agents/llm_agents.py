@@ -23,10 +23,10 @@ def create_agent(
     experience_store=None,
 ) -> ReActAgent:
     """
-    Create an agent using the config.yaml model settings.
+    Create an agent using the 'config.yaml' model settings.
 
     The project uses OpenAI-compatible endpoints:
-    - OpenRouter for openai/deepseek/google (Gemini via OpenRouter)
+    - OpenRouter for openai/deepseek/google 
     - DashScope compatible-mode for Qwen
     """
 

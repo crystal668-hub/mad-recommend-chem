@@ -117,7 +117,11 @@ QWEN_API_KEY=your_qwen_api_key
 
 6. 构建向量数据库
 ```bash
+# 单个collection（可在脚本中指定agent_name）
 python build_vector_db.py
+
+# 批量构建4个collection（agent1~agent4，各自embedding_model）
+python build_vector_db_batch.py --clear
 ```
 
 ## 使用方法
@@ -176,7 +180,11 @@ for step in trajectory.steps:
 
 1. **构建向量数据库**
 ```bash
+# 单个collection（可在脚本中指定agent_name）
 python build_vector_db.py
+
+# 批量构建4个collection（agent1~agent4，各自embedding_model）
+python build_vector_db_batch.py --clear
 ```
 
 2. **Run debate system**

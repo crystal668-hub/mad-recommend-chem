@@ -1,28 +1,26 @@
 """
 ===================================
-向量数据库管理模块
-功能：管理Chroma向量数据库的创建、查询和维护
+Vector Database Management Module
+Function: Manage the creation, querying, and maintenance of the Chroma vector database
 ===================================
 """
 
 import os
-from datetime import datetime
-from typing import List, Dict, Optional, Any, Callable
 import hashlib
 import json
+import re
 import uuid
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
 import chromadb
 from chromadb.config import Settings
-from pathlib import Path
+
 from utils.logger import Logger
 
-db_log_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-db_log_file = Path("./logs/db_log") / f"vector_store_{db_log_timestamp}.log"
-logger = Logger.get_logger(
-    name=f"MAD.DB.VectorStore.{db_log_timestamp}",
-    log_file=str(db_log_file),
-    level="INFO"
-)
+logger = Logger.create_module_logger("database.vector_store")
+
+_DOI_PREFIX_RE = re.compile(r"(?i)^10\.\d{4,9}/")
 
 
 class VectorStore:
@@ -53,7 +51,7 @@ class VectorStore:
         self.distance_metric = distance_metric
         self.embedding_function = embedding_function
         
-        # 初始化Chroma客户端
+        # Initialize Chroma client
         self.client = chromadb.PersistentClient(
             path=str(self.persist_directory),
             settings=Settings(
@@ -62,40 +60,40 @@ class VectorStore:
             )
         )
         
-        # 获取或创建集合
+        # Get or create collection
         self.collection = self._get_or_create_collection()
     
     def _get_or_create_collection(self):
         """
-        尝试获取已存在的集合，若不存在，则创建新集合
+        Try to get an existing collection, or create a new one if it doesn't exist
         
         Returns:
-            chromadb.Collection: Chroma集合对象
+            chromadb.Collection: Chroma collection object
         """
         try:
-            # 如果没有embedding_function，不传递该参数
+            # If embedding_function is not provided, do not pass this parameter
             if self.embedding_function is None:
-                # 使用自定义向量，不需要embedding_function
+                # Use custom vectors, no need for embedding_function
                 collection = self.client.get_or_create_collection(
                     name=self.collection_name,
                     metadata={"hnsw:space": self.distance_metric}
                 )
-                logger.info("[OK] 初始化向量数据库 (使用自定义向量模型)")
+                logger.info("[OK] Initialized vector database (using custom vector model)")
             else:
-                # 使用提供的embedding_function
+                # Use provided embedding_function
                 collection = self.client.get_or_create_collection(
                     name=self.collection_name,
                     embedding_function=self.embedding_function,
                     metadata={"hnsw:space": self.distance_metric}
                 )
-                logger.info("[OK] 初始化向量数据库 (使用embedding_function)")
+                logger.info("[OK] Initialized vector database (using embedding_function)")
             
-            logger.info(f"  集合名称: {self.collection_name}")
-            logger.info(f"  存储路径: {self.persist_directory}")
-            logger.info(f"  当前文档数: {collection.count()}")
+            logger.info(f"  Collection name: {self.collection_name}")
+            logger.info(f"  Storage path: {self.persist_directory}")
+            logger.info(f"  Current document count: {collection.count()}")
             
         except Exception as e:
-            logger.error(f"[ERROR] 初始化向量数据库失败: {str(e)}")
+            logger.error(f"[ERROR] Failed to initialize vector database: {str(e)}")
             raise
         
         return collection
@@ -118,17 +116,72 @@ class VectorStore:
         """
 
         if embeddings is not None:
+            if metadatas is None:
+                metadatas = [{} for _ in documents]
             if ids is None:
-                ids = self.create_ids(
-                    documents=documents,
-                    metadatas=metadatas,
-                    strategy="content_hash",
-                    prefix="doc"
-                )
+                # Chunk-level ID strategy:
+                # - If the chunk belongs to a doc with a real DOI, build a stable id = "<doi>#chunk:<idx>".
+                # - Otherwise, hash the chunk content and use the hash as id.
+                #
+                # Persist both:
+                # - metadata["chunk_id"]: string id used as Chroma id
+                # - metadata["chunk_index"]: integer chunk index within the doc (for citations/source_id)
+                ids = []
+                seen: set[str] = set()
+
+                def _coerce_int(value: Any) -> Optional[int]:
+                    if value is None:
+                        return None
+                    if isinstance(value, int):
+                        return value
+                    if isinstance(value, str):
+                        v = value.strip()
+                        if v.isdigit():
+                            try:
+                                return int(v)
+                            except Exception:
+                                return None
+                        return None
+                    try:
+                        return int(value)
+                    except Exception:
+                        return None
+
+                for doc, meta in zip(documents, metadatas):
+                    meta = meta or {}
+                    doc_id = (meta.get("doc_id") or "").strip()
+
+                    # Preserve the original numeric chunk index (produced by TextProcessor.chunk_documents).
+                    chunk_index = _coerce_int(meta.get("chunk_id"))
+                    if chunk_index is not None:
+                        meta["chunk_index"] = chunk_index
+
+                    if doc_id and _DOI_PREFIX_RE.match(doc_id) and chunk_index is not None:
+                        chunk_uid = f"{doc_id}#chunk:{chunk_index}"
+                    else:
+                        raw = (doc or "").encode("utf-8")
+                        digest = hashlib.sha256(raw).hexdigest()
+                        chunk_uid = f"hash_{digest}"
+
+                    # Ensure ids are unique within this batch. If we hit a collision (rare),
+                    # disambiguate deterministically using a short hash suffix.
+                    if chunk_uid in seen:
+                        payload = {
+                            "doc_id": doc_id,
+                            "chunk_index": chunk_index,
+                            "reaction_type": meta.get("reaction_type"),
+                        }
+                        salt = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
+                        digest2 = hashlib.sha256(((doc or "") + "|" + salt).encode("utf-8")).hexdigest()[:16]
+                        chunk_uid = f"{chunk_uid}#dup:{digest2}"
+
+                    meta["chunk_id"] = chunk_uid
+                    ids.append(chunk_uid)
+                    seen.add(chunk_uid)
             assert len(documents) == len(embeddings) == len(metadatas) == len(ids), \
-                "documents, embeddings, metadatas, ids长度必须一致"
+                "documents, embeddings, metadatas, ids lengths must be consistent"
             
-            # 批量添加
+            # Batch add documents 
             batch_size = 100
             for i in range(0, len(documents), batch_size):
                 batch_documents = documents[i:i + batch_size]
@@ -143,8 +196,9 @@ class VectorStore:
                     ids=batch_ids
                 )
             
+            logger.info(f"Added {len(documents)} documents to collection '{self.collection_name}'")
             return
-        logger.info(f"[OK] 添加 {len(documents)} 个文档到集合 '{self.collection_name}'")
+        logger.info(f"Added {len(documents)} documents to collection '{self.collection_name}'")
 
 
     def update_documents(
@@ -167,17 +221,17 @@ class VectorStore:
             metadatas=metadatas
         )
         
-        logger.info(f"成功更新 {len(ids)} 个文档")
+        logger.info(f"Successfully updated {len(ids)} documents")
             
     def delete_documents(self, ids: List[str]) -> None:
         """
-        删除文档
+        Delete documents
         
         Args:
-            ids: 要删除的文档ID列表
+            ids: List of document IDs to delete
         """
         self.collection.delete(ids=ids)
-        logger.info(f"成功删除 {len(ids)} 个文档")
+        logger.info(f"Successfully deleted {len(ids)} documents")
 
     def query(
         self,
@@ -245,7 +299,7 @@ class VectorStore:
                 where_document=where_document
             )
         
-        # 解析结果
+        # Parse results
         similar_docs = []
         if results.get('documents') and len(results['documents']) > 0:
             for i in range(len(results['documents'][0])):
@@ -256,7 +310,7 @@ class VectorStore:
                     'metadata': results['metadatas'][0][i] if results.get('metadatas') else None
                 }
                 
-                # 应用阈值过滤（如果指定）
+                # Apply threshold filtering
                 if threshold is None or (doc_dict['distance'] is not None and doc_dict['distance'] <= threshold):
                     similar_docs.append(doc_dict)
         
@@ -278,7 +332,7 @@ class VectorStore:
         """
         self.client.delete_collection(name=self.collection_name)
         self.collection = self._get_or_create_collection()
-        logger.info(f"集合 {self.collection_name} 已重置")
+        logger.info(f"Collection {self.collection_name} has been reset")
     
     def get_all_documents(self) -> Dict:
         """
@@ -297,7 +351,7 @@ class VectorStore:
         strategy: str = "content_hash",
         prefix: str = "doc"
     ) -> List[str]:
-        """生成文档ID。
+        """Generate document IDs
 
         strategy:
             - content_hash: 基于 document + metadata 的 sha256 哈希
@@ -306,7 +360,7 @@ class VectorStore:
         if metadatas is None:
             metadatas = [{}] * len(documents)
         if len(metadatas) != len(documents):
-            raise ValueError("metadatas长度必须与documents一致")
+            raise ValueError("metadatas length must be consistent with documents")
 
         if strategy == "uuid4":
             return [f"{prefix}_{uuid.uuid4().hex}" for _ in documents]

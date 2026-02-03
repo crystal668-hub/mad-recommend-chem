@@ -14,8 +14,24 @@ Functionality:
 import os
 import sys
 import argparse
+import warnings
 from pathlib import Path
 from typing import List, Optional, Dict
+
+# Silence noisy optional-dependency warnings from third-party libs (autogen/flaml).
+# These warnings are not actionable for typical runs and pollute CLI output/logs.
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    module=r"flaml(\..*)?",
+    message=r"flaml\.automl is not available\..*",
+)
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    module=r"autogen\.oai\.gemini(\..*)?",
+    message=r"\s*All support for the `google\.generativeai` package has ended\..*",
+)
 
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
@@ -38,6 +54,7 @@ from utils import (
     ensure_dir
 )
 from database import RAGSystem
+from database.embedder import MultiModelEmbedder
 from agents import AgentConfig
 from agents.llm_agents import create_agent
 from experience import ExperienceStore
@@ -152,39 +169,41 @@ class MADSystem:
             self.experience_store = MockExperienceStore()
     
     def _init_rag_systems(self) -> None:
-        """Initialize RAG systems - create independent RAG systems for each Agent"""
+        """Initialize RAG retrieval adapters (Chroma/VectorStore-backed)."""
         print("Initializing RAG systems...")
         rag_config = self.config.get('rag', {})
         vector_config = self.config.get('vector_store', {})
-        
-        # Create independent RAG systems for each Agent
-        data_dir = self.config.get('paths', {}).get('raw_data', './data/raw')
-        persist_dir = vector_config.get('persist_directory', './data/chroma_db')
-        base_collection_name = vector_config.get('collection_name', 'chemical_reactions')
-        
-        # Check if data directory has files
-        if not any(Path(data_dir).iterdir()):
-            self.logger.warning(f"Data directory is empty: {data_dir}, RAG systems may not function properly")
-            print(f"  Warning: Data directory is empty, please place chemical literature data in {data_dir}")
-        
-        # Create independent RAG systems for each Agent, using different collection_names
-        self.rag_systems = {}
-        provider_keys = ['openai', 'deepseek', 'gemini', 'qwen']
 
-        for provider_key in provider_keys:
-            collection_name = f"{base_collection_name}_{provider_key}"
-            print(f"  Creating RAG system for {provider_key}, using collection: {collection_name}")
-            
+        persist_dir = vector_config.get('persist_directory', './data/chroma_db')
+        base_collection_name = vector_config.get('collection_name', 'chemical_reactions_recommendation')
+        distance_metric = vector_config.get('distance_metric', 'cosine')
+
+        top_k = rag_config.get('top_k', 5)
+        similarity_threshold = rag_config.get('similarity_threshold', None)
+
+        # Build a shared embedder that knows each agent's embedding profile.
+        agent_config = AgentConfig(self.config)
+        agent_keys = ["agent1", "agent2", "agent3", "agent4"]
+        all_agent_configs = {k: agent_config.get_llm_config(k) for k in agent_keys}
+        embedder = MultiModelEmbedder(all_agent_configs["agent1"], agent_configs=all_agent_configs)
+
+        # One collection per agent (matches `build_vector_db.py`: <base>_<agentX>).
+        self.rag_systems = {}
+        for agent_key in agent_keys:
+            collection_name = f"{base_collection_name}_{agent_key}"
+            print(f"  Creating RAG adapter for {agent_key}, using collection: {collection_name}")
+
             rag_system = RAGSystem(
-                data_dir=data_dir,
                 persist_dir=persist_dir,
                 collection_name=collection_name,
-                chunk_size=rag_config.get('chunk_size', 256),
-                chunk_overlap=rag_config.get('chunk_overlap', 50),
-                top_k=rag_config.get('top_k', 5)
+                embedder=embedder,
+                agent_name=agent_key,
+                top_k=top_k,
+                similarity_threshold=similarity_threshold,
+                distance_metric=distance_metric,
             )
-            self.rag_systems[provider_key] = rag_system
-        
+            self.rag_systems[agent_key] = rag_system
+
         self.logger.info("RAG systems initialization completed")
     
     def _init_agents(self) -> None:
@@ -194,10 +213,10 @@ class MADSystem:
         agent_config = AgentConfig(self.config)
 
         agent_specs = [
-            ("agent1", "GPT Researcher", "openai"),
-            ("agent2", "DeepSeek Researcher", "deepseek"),
-            ("agent3", "Gemini Researcher", "gemini"),
-            ("agent4", "Qwen Researcher", "qwen")
+            ("agent1", "GPT Researcher", "agent1"),
+            ("agent2", "DeepSeek Researcher", "agent2"),
+            ("agent3", "Gemini Researcher", "agent3"),
+            ("agent4", "Qwen Researcher", "agent4")
         ]
 
         self.agents = []
@@ -206,7 +225,7 @@ class MADSystem:
             rag_system = self.rag_systems.get(provider_key)
 
             agent = create_agent(
-                agent_type=model_config.get("provider", provider_key),
+                agent_type=model_config.get("provider", "openai"),
                 agent_id=agent_key,
                 name=agent_name,
                 model_config=model_config,

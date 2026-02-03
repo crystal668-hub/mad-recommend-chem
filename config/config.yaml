@@ -4,7 +4,7 @@
 
 # ===== LLM Configuration =====
 llm:
-  # Agent 1: OpenRouter GPT-5.2 Thinking + text-embedding-3-large
+  # Agent 1: OpenRouter GPT-5.2 + text-embedding-3-large
   agent1:
     provider: "openai"
     model: "openai/gpt-5.2"
@@ -18,7 +18,7 @@ llm:
   
   # Agent 2: DeepSeek V3.2 + voyage-3-large
   agent2:
-    provider: "openai"
+    provider: "deepseek"
     model: "deepseek/deepseek-v3.2"
     api_key: "${DEEPSEEK_API_KEY}"  
     base_url: "https://openrouter.ai/api/v1"
@@ -56,8 +56,8 @@ llm:
 vector_store:
   type: "chroma"
   persist_directory: "./data/chroma_db"
-  collection_name: "chemical_reactions_recommendation"
-  distance_metric: "cosine"  # cosine, l2, ip
+  collection_name: "electrochemistry_literature"
+  distance_metric: "cosine"  # 'cosine, l2, ip'
   
 # ===== RAG System Configuration =====
 rag:
@@ -66,16 +66,20 @@ rag:
   top_k: 5  
   similarity_threshold: 0.8  
   
-# ===== AutoGen Debate Configuration =====
+# ===== Debate Configuration =====
 debate:
   max_rounds: 3  # Maximum number of debate rounds
-  consensus_threshold: 3  # Number of consecutive identical answers considered as consensus
-  timeout: 300  # Timeout for a single debate round (seconds)
-  speaker_selection_method: "round_robin"  # round_robin, auto, manual
+  timeout: 300  # [Fallback] Timeout in seconds
+  review_timeout: 300  # LangGraph REVIEW phase wall-clock budget in seconds
+  rebuttal_timeout: 300  # LangGraph REBUTTAL phase wall-clock budget in seconds
 
-  # LangGraph-style debate parameters (proposal elimination protocol)
+  # LangGraph-style debate parameters 
   no_response_threshold: 2  # consecutive rounds failing to rebut valid reviews => defeated
   max_reviews_per_target: 1  # per reviewer per target proposal per round
+
+  # AutoGen-style debate parameters 
+  consensus_threshold: 3  # Number of consecutive identical answers considered as consensus
+  speaker_selection_method: "round_robin"  # round_robin, auto, manual
   
 # ===== Experience Store Configuration =====
 experience:
@@ -103,12 +107,12 @@ chemistry:
 logging:
   level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
   log_file: "./logs/system.log"
-  log_format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  max_file_size: 10485760  # 10MB
+  run_dir: "./logs/runs"   # per-run logs: ./logs/runs/<run_id>/run.log, events.jsonl, etc.
+  log_format: "%(asctime)s | %(levelname)s | %(name)s | run=%(run_id)s | %(message)s"
+  max_file_size: 20971520  # 20MB
   backup_count: 5
   
 # ===== Paths Configuration =====
 paths:
   raw_data: "./data/raw"
-  models: "./models"
   outputs: "./outputs"

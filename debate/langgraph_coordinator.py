@@ -17,8 +17,10 @@ Notes:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -27,12 +29,15 @@ from pydantic import BaseModel, Field, ValidationError
 from agents.react_agent import ReActAgent
 from agents.react_reasoning import ReActTrajectory
 from prompts.debate_phase_prompts import (
-    DEBATE_PROPOSE_SYSTEM_PROMPT,
     build_initial_debate_prompt,
+    DEBATE_PROPOSE_SYSTEM_PROMPT,
     DEBATE_REVIEW_SYSTEM_PROMPT,
     DEBATE_REBUTTAL_SYSTEM_PROMPT,
 )
+from utils.logger import get_run_id, make_debate_id, write_debate_artifacts
 from utils.source_id import is_valid_chroma_source_id
+
+logger = logging.getLogger("MAD.debate.langgraph")
 
 
 # =========================
@@ -167,6 +172,22 @@ class LangGraphDebateCoordinator:
         self.no_response_threshold = int(self.config.get("no_response_threshold", 2))
         self.max_reviews_per_target = int(self.config.get("max_reviews_per_target", 1))
 
+        # Runtime controls (to bound wall-clock time)
+        self.max_concurrency = int(self.config.get("max_concurrency", max(1, len(self.agents))))
+        # Backward-compatible: `timeout` exists in config.yaml; treat as the default per-phase wall-clock budget.
+        default_timeout = float(self.config.get("timeout", 300))
+        self.round_timeout_seconds = float(self.config.get("round_timeout", default_timeout))
+        self.review_timeout_seconds = float(self.config.get("review_timeout", default_timeout))
+        self.rebuttal_timeout_seconds = float(self.config.get("rebuttal_timeout", default_timeout))
+        # Per-agent-call request timeout (best-effort; enforced by the LLM client if supported).
+        self.call_timeout_seconds = float(self.config.get("call_timeout", default_timeout))
+
+        # Dynamic ReAct step budgets per phase (defaults requested)
+        self.propose_max_react_steps = int(self.config.get("propose_max_react_steps", 8))
+        self.review_max_react_steps = int(self.config.get("review_max_react_steps", 3))
+        self.rebuttal_max_react_steps = int(self.config.get("rebuttal_max_react_steps", 3))
+        self._current_debate_id: Optional[str] = None
+
     # -------------------------
     # Public API
     # -------------------------
@@ -178,12 +199,43 @@ class LangGraphDebateCoordinator:
         reaction_type: Optional[str] = None,
     ) -> GraphDebateResult:
         start_time = time.time()
+        debate_id = make_debate_id("langgraph", components, reaction_type)
+        self._current_debate_id = debate_id
 
         if initial_prompt is None:
             initial_prompt = build_initial_debate_prompt(components, reaction_type)
 
+        logger.info(
+            "langgraph_debate_start",
+            extra={
+                "event": "langgraph.debate.start",
+                "debate_id": debate_id,
+                "components": components,
+                "reaction_type": reaction_type,
+                "max_rounds": self.max_rounds,
+                "no_response_threshold": self.no_response_threshold,
+                "max_reviews_per_target": self.max_reviews_per_target,
+                "max_concurrency": self.max_concurrency,
+                "round_timeout_seconds": self.round_timeout_seconds,
+                "review_timeout_seconds": self.review_timeout_seconds,
+                "rebuttal_timeout_seconds": self.rebuttal_timeout_seconds,
+                "call_timeout_seconds": self.call_timeout_seconds,
+                "propose_max_react_steps": self.propose_max_react_steps,
+                "review_max_react_steps": self.review_max_react_steps,
+                "rebuttal_max_react_steps": self.rebuttal_max_react_steps,
+            },
+        )
+
         # 1) Propose
         proposals = self._run_propose_phase(components, reaction_type, initial_prompt)
+        logger.info(
+            "langgraph_propose_done",
+            extra={
+                "event": "langgraph.propose.done",
+                "debate_id": debate_id,
+                "proposal_ids": sorted(list(proposals.keys())),
+            },
+        )
 
         # 2) Review/Rebuttal loop
         debate_history: List[Dict[str, Any]] = []
@@ -200,14 +252,27 @@ class LangGraphDebateCoordinator:
         consensus_reached = False
 
         for round_number in range(1, self.max_rounds + 1):
+            review_deadline = time.time() + self.review_timeout_seconds
             active_ids = [pid for pid, p in proposals.items() if p.status == "active"]
+            logger.info(
+                "langgraph_round_start",
+                extra={
+                    "event": "langgraph.round.start",
+                    "debate_id": debate_id,
+                    "round": round_number,
+                    "active_proposals": sorted(active_ids),
+                },
+            )
             if len(active_ids) <= 1:
                 consensus_reached = True
                 break
 
-            round_reviews, review_calls = self._run_review_round(round_number, proposals, components, reaction_type)
+            round_reviews, review_calls = self._run_review_round(
+                round_number, proposals, components, reaction_type, deadline_ts=review_deadline
+            )
+            rebuttal_deadline = time.time() + self.rebuttal_timeout_seconds
             round_rebuttals, rebuttal_calls = self._run_rebuttal_round(
-                round_number, proposals, round_reviews, components, reaction_type
+                round_number, proposals, round_reviews, components, reaction_type, deadline_ts=rebuttal_deadline
             )
 
             # Adjudicate and update proposal states
@@ -216,6 +281,24 @@ class LangGraphDebateCoordinator:
                 round_number=round_number,
                 round_reviews=round_reviews,
                 round_rebuttals=round_rebuttals,
+            )
+
+            status_counts: Dict[str, int] = {}
+            for p in proposals.values():
+                status_counts[p.status] = status_counts.get(p.status, 0) + 1
+
+            logger.info(
+                "langgraph_round_end",
+                extra={
+                    "event": "langgraph.round.end",
+                    "debate_id": debate_id,
+                    "round": round_number,
+                    "changed": round_changed,
+                    "consensus": round_consensus,
+                    "valid_reviews": sum(1 for r in round_reviews if r.valid),
+                    "valid_rebuttals": sum(1 for r in round_rebuttals if r.valid),
+                    "status_counts": status_counts,
+                },
             )
 
             debate_history.extend(review_calls)
@@ -239,7 +322,20 @@ class LangGraphDebateCoordinator:
 
         final_products, final_performance = self._best_effort_final_fields(surviving)
 
-        return GraphDebateResult(
+        logger.info(
+            "langgraph_debate_end",
+            extra={
+                "event": "langgraph.debate.end",
+                "debate_id": debate_id,
+                "consensus_reached": consensus_reached,
+                "time_elapsed": elapsed,
+                "surviving": [p.proposal_id for p in surviving],
+                "defeated": [p.proposal_id for p in defeated],
+                "withdrawn": [p.proposal_id for p in withdrawn],
+            },
+        )
+
+        result = GraphDebateResult(
             consensus_reached=consensus_reached,
             final_products=final_products,
             final_performance=final_performance,
@@ -252,6 +348,42 @@ class LangGraphDebateCoordinator:
             withdrawn_proposals=[self._proposal_to_dict(p) for p in withdrawn],
         )
 
+        # Structured artifacts:
+        # - transcript jsonl (per event)
+        # - full debate json (single file)
+        try:
+            payload = {
+                "debate_id": debate_id,
+                "run_id": get_run_id() or None,
+                "engine": "langgraph",
+                "reaction_type": reaction_type,
+                "components": components,
+                "result": result.to_dict(),
+            }
+            paths = write_debate_artifacts(
+                debate_id=debate_id,
+                engine="langgraph",
+                payload=payload,
+                transcript_events=debate_history,
+            )
+            logger.info(
+                "langgraph_artifacts_written",
+                extra={
+                    "event": "langgraph.artifacts.written",
+                    "debate_id": debate_id,
+                    "full_path": paths.get("full_path"),
+                    "transcript_path": paths.get("transcript_path"),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "langgraph_artifacts_write_failed",
+                extra={"event": "langgraph.artifacts.error", "debate_id": debate_id},
+            )
+
+        self._current_debate_id = None
+        return result
+
     # -------------------------
     # Phase: Propose
     # -------------------------
@@ -263,22 +395,93 @@ class LangGraphDebateCoordinator:
         prompt: str,
     ) -> Dict[str, ProposalState]:
         proposals: Dict[str, ProposalState] = {}
-        for agent in self.agents:
-            proposal_id = agent.agent_id
-            proposals[proposal_id] = ProposalState(
-                proposal_id=proposal_id,
-                agent_name=agent.name,
-            )
 
-            response, trajectory = self._run_react_call(
-                agent,
-                query=prompt,
-                components=None,  # components are already included in the PROPOSE user prompt
-                system_prompt_override=DEBATE_PROPOSE_SYSTEM_PROMPT,
-            )
-            proposals[proposal_id].propose_response = response.content if response else ""
-            proposals[proposal_id].propose_trajectory = trajectory
-            proposals[proposal_id].claim = (response.content or "").strip()
+        for agent in self.agents:
+            proposals[agent.agent_id] = ProposalState(proposal_id=agent.agent_id, agent_name=agent.name)
+
+        # Parallelize per-agent propose calls; bound wall-clock time with a phase deadline.
+        deadline_ts = time.time() + self.round_timeout_seconds
+        futures: Dict[Future, str] = {}
+        call_starts: Dict[str, float] = {}
+        ex = ThreadPoolExecutor(max_workers=self.max_concurrency)
+        try:
+            for agent in self.agents:
+                proposal_id = agent.agent_id
+                call_starts[proposal_id] = time.time()
+                futures[
+                    ex.submit(
+                        self._run_react_call,
+                        agent,
+                        prompt,
+                        components,  # pass explicitly so agents can enforce component-level guards
+                        DEBATE_PROPOSE_SYSTEM_PROMPT,
+                        self.propose_max_react_steps,
+                        self.call_timeout_seconds,
+                    )
+                ] = proposal_id
+
+            remaining = max(0.0, deadline_ts - time.time())
+            done, not_done = wait(list(futures.keys()), timeout=remaining)
+
+            for fut in done:
+                proposal_id = futures[fut]
+                agent = next(a for a in self.agents if a.agent_id == proposal_id)
+                call_elapsed = time.time() - call_starts.get(proposal_id, time.time())
+                response = None
+                trajectory = None
+                err = None
+                try:
+                    response, trajectory = fut.result()
+                except Exception as e:
+                    err = str(e)
+
+                proposals[proposal_id].propose_response = response.content if response else ""
+                proposals[proposal_id].propose_trajectory = trajectory
+                proposals[proposal_id].claim = (response.content or "").strip() if response else ""
+
+                # If the agent failed outright, mark it withdrawn so it doesn't block the debate.
+                if err:
+                    proposals[proposal_id].status = "withdrawn"
+
+                retrieved_ids = _collect_retrieved_source_ids(trajectory)
+                logger.info(
+                    "langgraph_propose_call",
+                    extra={
+                        "event": "langgraph.propose.call",
+                        "debate_id": self._current_debate_id,
+                        "proposal_id": proposal_id,
+                        "agent_name": agent.name,
+                        "time_elapsed": call_elapsed,
+                        "error": err,
+                        "steps": len(getattr(trajectory, "steps", []) or []) if trajectory else 0,
+                        "retrieved_source_id_count": len(retrieved_ids),
+                        "retrieved_source_ids_preview": sorted(list(retrieved_ids))[:10],
+                        "claim_len": len((response.content or "").strip()) if response else 0,
+                    },
+                )
+
+            for fut in not_done:
+                proposal_id = futures[fut]
+                agent = next(a for a in self.agents if a.agent_id == proposal_id)
+                fut.cancel()
+                proposals[proposal_id].propose_response = ""
+                proposals[proposal_id].propose_trajectory = None
+                proposals[proposal_id].claim = ""
+                proposals[proposal_id].status = "withdrawn"
+                logger.warning(
+                    "langgraph_propose_timeout",
+                    extra={
+                        "event": "langgraph.propose.timeout",
+                        "debate_id": self._current_debate_id,
+                        "proposal_id": proposal_id,
+                        "agent_name": agent.name,
+                        "timeout_seconds": self.round_timeout_seconds,
+                        "time_elapsed": time.time() - call_starts.get(proposal_id, time.time()),
+                    },
+                )
+        finally:
+            # Don't block on slow/stuck threads; per-call request timeouts should stop them eventually.
+            ex.shutdown(wait=False, cancel_futures=True)
 
         return proposals
 
@@ -286,62 +489,179 @@ class LangGraphDebateCoordinator:
     # Phase: Review
     # -------------------------
 
+    def _assign_review_targets(self, round_number: int, active_ids: List[str]) -> Dict[str, List[str]]:
+        """
+        Assign review responsibilities so every active proposal is reviewed at least once per round.
+
+        We deterministically assign each reviewer exactly one target (a rotation over active_ids).
+        The rotation offset changes by round to vary pairings while preventing self-review.
+        """
+        n = len(active_ids)
+        if n <= 1:
+            return {}
+
+        # Offset cycles through 1..n-1 (never 0) so a reviewer is never assigned to itself.
+        offset = ((round_number - 1) % (n - 1)) + 1
+
+        assignments: Dict[str, List[str]] = {}
+        for i, reviewer_id in enumerate(active_ids):
+            target_id = active_ids[(i + offset) % n]
+            if target_id == reviewer_id:
+                # Should be impossible given the offset selection, but keep a safe fallback.
+                target_id = active_ids[(i + 1) % n]
+            assignments[reviewer_id] = [target_id]
+
+        return assignments
+
     def _run_review_round(
         self,
         round_number: int,
         proposals: Dict[str, ProposalState],
         components: List[str],
         reaction_type: Optional[str],
+        deadline_ts: Optional[float] = None,
     ) -> Tuple[List[DebateReview], List[Dict[str, Any]]]:
         reviews: List[DebateReview] = []
         call_history: List[Dict[str, Any]] = []
 
         active_ids = [pid for pid, p in proposals.items() if p.status == "active"]
+        assignments = self._assign_review_targets(round_number, active_ids)
+
+        # Pre-build prompts (cheap) then execute calls in parallel.
+        task_inputs: Dict[str, Tuple[ReActAgent, str, List[str]]] = {}
         for agent in self.agents:
             from_id = agent.agent_id
             if from_id not in active_ids:
                 continue
 
-            targets = [pid for pid in active_ids if pid != from_id]
+            # Only assign a subset of targets per reviewer; across all reviewers we cover all proposals.
+            targets = assignments.get(from_id, [])
             if not targets:
                 continue
 
             review_prompt = self._build_review_prompt(round_number, from_id, proposals, targets)
-            response, trajectory = self._run_react_call(
-                agent,
-                query=review_prompt,
-                components=components,
-                system_prompt_override=DEBATE_REVIEW_SYSTEM_PROMPT,
-            )
-            retrieved_ids = _collect_retrieved_source_ids(trajectory)
-            call_history.append(
-                {
-                    "type": "review_call",
-                    "round": round_number,
-                    "from_proposal_id": from_id,
-                    "targets": targets,
-                    "raw_output": (response.content if response else ""),
-                    "trajectory": trajectory.to_dict() if trajectory else None,
-                    "retrieved_source_ids": sorted(retrieved_ids),
-                }
-            )
+            task_inputs[from_id] = (agent, review_prompt, targets)
 
-            parsed = _parse_json_output(response.content if response else "", expected_key="reviews")
-            validated = _validate_review_output(parsed)
+        phase_deadline = deadline_ts if deadline_ts is not None else (time.time() + self.round_timeout_seconds)
+        futures: Dict[Future, str] = {}
+        call_starts: Dict[str, float] = {}
+        ex = ThreadPoolExecutor(max_workers=self.max_concurrency)
+        try:
+            for from_id, (agent, prompt, _targets) in task_inputs.items():
+                call_starts[from_id] = time.time()
+                futures[
+                    ex.submit(
+                        self._run_react_call,
+                        agent,
+                        prompt,
+                        components,
+                        DEBATE_REVIEW_SYSTEM_PROMPT,
+                        self.review_max_react_steps,
+                        self.call_timeout_seconds,
+                    )
+                ] = from_id
 
-            for item_idx, item in enumerate(validated.reviews[: len(targets) * self.max_reviews_per_target]):
-                review_id = f"rev_r{round_number}_{from_id}_{item_idx}"
-                review = self._validate_review_item(
-                    review_id=review_id,
-                    round_number=round_number,
-                    from_id=from_id,
-                    item=item,
-                    proposals=proposals,
-                    retrieved_source_ids=retrieved_ids,
+            remaining = max(0.0, phase_deadline - time.time())
+            done, not_done = wait(list(futures.keys()), timeout=remaining)
+
+            for fut in done:
+                from_id = futures[fut]
+                agent, _prompt, targets = task_inputs[from_id]
+                response = None
+                trajectory = None
+                err = None
+                try:
+                    response, trajectory = fut.result()
+                except Exception as e:
+                    err = str(e)
+
+                retrieved_ids = _collect_retrieved_source_ids(trajectory)
+                call_history.append(
+                    {
+                        "type": "review_call",
+                        "round": round_number,
+                        "from_proposal_id": from_id,
+                        "targets": targets,
+                        "raw_output": (response.content if response else ""),
+                        "trajectory": trajectory.to_dict() if trajectory else None,
+                        "retrieved_source_ids": sorted(retrieved_ids),
+                        "error": err,
+                        "time_elapsed": time.time() - call_starts.get(from_id, time.time()),
+                    }
                 )
-                reviews.append(review)
-                proposals[from_id].sent_reviews.append(review)
-                proposals[review.target_proposal_id].received_reviews.append(review)
+
+                parsed = _parse_json_output(response.content if response else "", expected_key="reviews")
+                validated = _validate_review_output(parsed)
+
+                selected = validated.reviews[: len(targets) * self.max_reviews_per_target]
+                valid_count = 0
+                invalid_count = 0
+                for item_idx, item in enumerate(selected):
+                    review_id = f"rev_r{round_number}_{from_id}_{item_idx}"
+                    review = self._validate_review_item(
+                        review_id=review_id,
+                        round_number=round_number,
+                        from_id=from_id,
+                        item=item,
+                        proposals=proposals,
+                        retrieved_source_ids=retrieved_ids,
+                    )
+                    if review.valid:
+                        valid_count += 1
+                    else:
+                        invalid_count += 1
+                    reviews.append(review)
+                    proposals[from_id].sent_reviews.append(review)
+                    proposals[review.target_proposal_id].received_reviews.append(review)
+
+                logger.info(
+                    "langgraph_review_call",
+                    extra={
+                        "event": "langgraph.review.call",
+                        "debate_id": self._current_debate_id,
+                        "round": round_number,
+                        "from_proposal_id": from_id,
+                        "targets": targets,
+                        "time_elapsed": time.time() - call_starts.get(from_id, time.time()),
+                        "error": err,
+                        "retrieved_source_id_count": len(retrieved_ids),
+                        "parsed_reviews": len(validated.reviews),
+                        "emitted_reviews": len(selected),
+                        "valid_reviews": valid_count,
+                        "invalid_reviews": invalid_count,
+                    },
+                )
+
+            # Timeouts -> no review for that agent this round.
+            for fut in not_done:
+                from_id = futures[fut]
+                agent, _prompt, targets = task_inputs[from_id]
+                fut.cancel()
+                call_history.append(
+                    {
+                        "type": "review_call",
+                        "round": round_number,
+                        "from_proposal_id": from_id,
+                        "targets": targets,
+                        "raw_output": "",
+                        "trajectory": None,
+                        "retrieved_source_ids": [],
+                        "error": "timeout",
+                        "time_elapsed": time.time() - call_starts.get(from_id, time.time()),
+                    }
+                )
+                logger.warning(
+                    "langgraph_review_timeout",
+                    extra={
+                        "event": "langgraph.review.timeout",
+                        "debate_id": self._current_debate_id,
+                        "round": round_number,
+                        "from_proposal_id": from_id,
+                        "agent_name": agent.name,
+                    },
+                )
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
 
         return reviews, call_history
 
@@ -356,6 +676,7 @@ class LangGraphDebateCoordinator:
         round_reviews: List[DebateReview],
         components: List[str],
         reaction_type: Optional[str],
+        deadline_ts: Optional[float] = None,
     ) -> Tuple[List[DebateRebuttal], List[Dict[str, Any]]]:
         rebuttals: List[DebateRebuttal] = []
         call_history: List[Dict[str, Any]] = []
@@ -367,6 +688,8 @@ class LangGraphDebateCoordinator:
                 continue
             valid_reviews_by_target.setdefault(r.target_proposal_id, []).append(r)
 
+        # Pre-build prompts then execute calls in parallel.
+        task_inputs: Dict[str, Tuple[ReActAgent, str, List[DebateReview]]] = {}
         for agent in self.agents:
             from_id = agent.agent_id
             if from_id not in active_ids:
@@ -377,48 +700,136 @@ class LangGraphDebateCoordinator:
                 continue
 
             rebuttal_prompt = self._build_rebuttal_prompt(round_number, from_id, proposals[from_id], target_reviews)
-            response, trajectory = self._run_react_call(
-                agent,
-                query=rebuttal_prompt,
-                components=components,
-                system_prompt_override=DEBATE_REBUTTAL_SYSTEM_PROMPT,
-            )
-            retrieved_ids = _collect_retrieved_source_ids(trajectory)
-            call_history.append(
-                {
-                    "type": "rebuttal_call",
-                    "round": round_number,
-                    "from_proposal_id": from_id,
-                    "target_review_ids": [r.review_id for r in target_reviews],
-                    "raw_output": (response.content if response else ""),
-                    "trajectory": trajectory.to_dict() if trajectory else None,
-                    "retrieved_source_ids": sorted(retrieved_ids),
-                }
-            )
+            task_inputs[from_id] = (agent, rebuttal_prompt, target_reviews)
 
-            parsed = _parse_json_output(response.content if response else "", expected_key="rebuttals")
-            validated = _validate_rebuttal_output(parsed)
+        phase_deadline = deadline_ts if deadline_ts is not None else (time.time() + self.round_timeout_seconds)
+        futures: Dict[Future, str] = {}
+        call_starts: Dict[str, float] = {}
+        ex = ThreadPoolExecutor(max_workers=self.max_concurrency)
+        try:
+            for from_id, (agent, prompt, _target_reviews) in task_inputs.items():
+                call_starts[from_id] = time.time()
+                futures[
+                    ex.submit(
+                        self._run_react_call,
+                        agent,
+                        prompt,
+                        components,
+                        DEBATE_REBUTTAL_SYSTEM_PROMPT,
+                        self.rebuttal_max_react_steps,
+                        self.call_timeout_seconds,
+                    )
+                ] = from_id
 
-            # Optional claim revision
-            if validated.revised_claim and validated.revised_claim.strip():
-                proposals[from_id].claim = validated.revised_claim.strip()
+            remaining = max(0.0, phase_deadline - time.time())
+            done, not_done = wait(list(futures.keys()), timeout=remaining)
 
-            for item_idx, item in enumerate(validated.rebuttals):
-                rebuttal_id = f"reb_r{round_number}_{from_id}_{item_idx}"
-                rebuttal = self._validate_rebuttal_item(
-                    rebuttal_id=rebuttal_id,
-                    round_number=round_number,
-                    from_id=from_id,
-                    item=item,
-                    valid_review_ids={r.review_id for r in target_reviews},
-                    retrieved_source_ids=retrieved_ids,
+            for fut in done:
+                from_id = futures[fut]
+                agent, _prompt, target_reviews = task_inputs[from_id]
+                response = None
+                trajectory = None
+                err = None
+                try:
+                    response, trajectory = fut.result()
+                except Exception as e:
+                    err = str(e)
+
+                retrieved_ids = _collect_retrieved_source_ids(trajectory)
+                call_history.append(
+                    {
+                        "type": "rebuttal_call",
+                        "round": round_number,
+                        "from_proposal_id": from_id,
+                        "target_review_ids": [r.review_id for r in target_reviews],
+                        "raw_output": (response.content if response else ""),
+                        "trajectory": trajectory.to_dict() if trajectory else None,
+                        "retrieved_source_ids": sorted(retrieved_ids),
+                        "error": err,
+                        "time_elapsed": time.time() - call_starts.get(from_id, time.time()),
+                    }
                 )
-                rebuttals.append(rebuttal)
-                proposals[from_id].sent_rebuttals.append(rebuttal)
 
-                # If agent explicitly withdraws, reflect immediately.
-                if rebuttal.valid and rebuttal.response_mode == "withdraw":
-                    proposals[from_id].status = "withdrawn"
+                parsed = _parse_json_output(response.content if response else "", expected_key="rebuttals")
+                validated = _validate_rebuttal_output(parsed)
+
+                # Optional claim revision
+                did_revise_claim = False
+                if validated.revised_claim and validated.revised_claim.strip():
+                    proposals[from_id].claim = validated.revised_claim.strip()
+                    did_revise_claim = True
+
+                valid_count = 0
+                invalid_count = 0
+                for item_idx, item in enumerate(validated.rebuttals):
+                    rebuttal_id = f"reb_r{round_number}_{from_id}_{item_idx}"
+                    rebuttal = self._validate_rebuttal_item(
+                        rebuttal_id=rebuttal_id,
+                        round_number=round_number,
+                        from_id=from_id,
+                        item=item,
+                        valid_review_ids={r.review_id for r in target_reviews},
+                        retrieved_source_ids=retrieved_ids,
+                    )
+                    if rebuttal.valid:
+                        valid_count += 1
+                    else:
+                        invalid_count += 1
+                    rebuttals.append(rebuttal)
+                    proposals[from_id].sent_rebuttals.append(rebuttal)
+
+                    # If agent explicitly withdraws, reflect immediately.
+                    if rebuttal.valid and rebuttal.response_mode == "withdraw":
+                        proposals[from_id].status = "withdrawn"
+
+                logger.info(
+                    "langgraph_rebuttal_call",
+                    extra={
+                        "event": "langgraph.rebuttal.call",
+                        "debate_id": self._current_debate_id,
+                        "round": round_number,
+                        "from_proposal_id": from_id,
+                        "target_review_ids": [r.review_id for r in target_reviews],
+                        "time_elapsed": time.time() - call_starts.get(from_id, time.time()),
+                        "error": err,
+                        "retrieved_source_id_count": len(retrieved_ids),
+                        "parsed_rebuttals": len(validated.rebuttals),
+                        "valid_rebuttals": valid_count,
+                        "invalid_rebuttals": invalid_count,
+                        "revised_claim": did_revise_claim,
+                    },
+                )
+
+            # Timeouts -> no rebuttals for that agent this round.
+            for fut in not_done:
+                from_id = futures[fut]
+                agent, _prompt, target_reviews = task_inputs[from_id]
+                fut.cancel()
+                call_history.append(
+                    {
+                        "type": "rebuttal_call",
+                        "round": round_number,
+                        "from_proposal_id": from_id,
+                        "target_review_ids": [r.review_id for r in target_reviews],
+                        "raw_output": "",
+                        "trajectory": None,
+                        "retrieved_source_ids": [],
+                        "error": "timeout",
+                        "time_elapsed": time.time() - call_starts.get(from_id, time.time()),
+                    }
+                )
+                logger.warning(
+                    "langgraph_rebuttal_timeout",
+                    extra={
+                        "event": "langgraph.rebuttal.timeout",
+                        "debate_id": self._current_debate_id,
+                        "round": round_number,
+                        "from_proposal_id": from_id,
+                        "agent_name": agent.name,
+                    },
+                )
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
 
         return rebuttals, call_history
 
@@ -624,7 +1035,8 @@ class LangGraphDebateCoordinator:
     ) -> str:
         parts = [
             f"REVIEW phase (Round {round_number}).",
-            f"Write up to {self.max_reviews_per_target} review item(s) per target proposal (do not review yourself).",
+            "You are assigned to review ONLY the target proposal(s) listed below (do not review yourself).",
+            f"Write up to {self.max_reviews_per_target} review item(s) per target proposal, and include AT LEAST 1 item per target.",
             "Target a specific step_number that exists in the target's trajectory.",
             "Use `search_rag` and cite at least one verifiable source_id.",
             "Return STRICT JSON only (follow the schema in the system prompt).",
@@ -683,6 +1095,8 @@ class LangGraphDebateCoordinator:
         query: str,
         components: Optional[List[str]] = None,
         system_prompt_override: Optional[str] = None,
+        max_steps_override: Optional[int] = None,
+        llm_timeout_seconds: Optional[float] = None,
     ):
         # Treat every call as an isolated, memoryless run.
         return agent.generate_response_with_react(
@@ -690,6 +1104,8 @@ class LangGraphDebateCoordinator:
             components=components,
             context=None,
             system_prompt_override=system_prompt_override,
+            max_steps_override=max_steps_override,
+            llm_timeout_seconds=llm_timeout_seconds,
         )
 
     # -------------------------

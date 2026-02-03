@@ -269,9 +269,6 @@ def main() -> int:
             "Retrieve relevant literature and summarize the key performance metrics."
         )
 
-    print(f"\n{'='*40}\n INPUT PROMPT \n{'='*40}")
-    print(initial_prompt)
-
     # ---------------------------------------------------------
     # 2. Execute Agent (Start ReAct Loop)
     # ---------------------------------------------------------

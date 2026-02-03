@@ -20,7 +20,7 @@ wheels/
 .installed.cfg
 *.egg
 
-# 虚拟环境
+# Virtual Environments
 venv/
 ENV/
 env/
@@ -32,27 +32,27 @@ env/
 *.swo
 *~
 
-# 环境变量
+# Environment variables
 .env
 
-# 日志
+# Logs
 logs/
 *.log
 
-# 数据和模型
+# Data
 data/chroma_db/
-data/experience_db.json
-models/
+data/raw/
+data/experience_db.json/
 *.db
 *.sqlite
 
-# 输出
+# Outputs
 outputs/
 results/
 
 # Jupyter Notebook
 .ipynb_checkpoints
 
-# 系统文件
+# System files
 .DS_Store
 Thumbs.db

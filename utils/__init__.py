@@ -2,7 +2,7 @@
 工具模块初始化文件
 """
 
-from utils.logger import Logger, setup_logging, DebateLogger
+from utils.logger import Logger, setup_logging, DebateLogger, get_run_id, get_run_dir
 from utils.helpers import (
     load_config,
     ensure_dir,
@@ -29,6 +29,8 @@ __all__ = [
     'Logger',
     'setup_logging',
     'DebateLogger',
+    'get_run_id',
+    'get_run_dir',
     'load_config',
     'ensure_dir',
     'save_json',
