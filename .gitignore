@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.pyd
 .Python
 build/
 develop-eggs/
@@ -21,9 +22,24 @@ wheels/
 *.egg
 
 # Virtual Environments
+.venv/
 venv/
 ENV/
 env/
+
+# Caches / Test artifacts
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+*.cover
+*.py,cover
 
 # IDE
 .vscode/
@@ -34,6 +50,8 @@ env/
 
 # Environment variables
 .env
+.env.*
+!.env.example
 
 # Logs
 logs/
@@ -42,9 +60,14 @@ logs/
 # Data
 data/chroma_db/
 data/raw/
-data/experience_db.json/
+data/experience_db.json
 *.db
 *.sqlite
+*.sqlite3
+*.sqlite3-journal
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
 metadata/
 
 # Outputs
@@ -57,3 +80,4 @@ results/
 # System files
 .DS_Store
 Thumbs.db
+Desktop.ini
