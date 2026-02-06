@@ -36,29 +36,42 @@ from utils.source_id import is_valid_chroma_source_id
 
 @dataclass
 class DummyRAGAdapter:
-    """Minimal RAG adapter compatible with ReActAgent.search_rag (expects .retrieve(query)->List[Dict])."""
+    """Minimal RAG adapter compatible with ReActAgent.search_literature (expects .retrieve(query)->List[Dict])."""
 
     collection_name: str = "dummy_collection"
     top_k: int = 5
+    reaction_type: str = "UNKNOWN"
 
-    def retrieve(self, query: str) -> List[Dict[str, Any]]:
+    def retrieve(self, query: str, top_k: int = 5, where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         query = (query or "").strip()
         if not query:
             return []
+
+        try:
+            k = int(top_k) if top_k is not None else int(self.top_k)
+        except Exception:
+            k = int(self.top_k)
+        k = max(1, k)
+
+        rt = None
+        if isinstance(where, dict):
+            rt = where.get("reaction_type")
+        rt = (rt or self.reaction_type or "UNKNOWN")
+        rt = str(rt).strip().upper() or "UNKNOWN"
 
         # Include doc_id + chunk_id so ReActAgent can enrich each item with `source_id`.
         return [
             {
                 "text": "Dummy evidence: OER activity can be enhanced via alloying and electronic structure tuning.",
                 "score": 0.99,
-                "metadata": {"doc_id": "10.0000/dummy-oer", "chunk_id": 1},
+                "metadata": {"doc_id": "10.0000/dummy-oer", "chunk_id": 1, "reaction_type": rt},
             },
             {
                 "text": "Dummy evidence: Overpotential depends on adsorption energies and surface reconstruction.",
                 "score": 0.97,
-                "metadata": {"doc_id": "10.0000/dummy-oer", "chunk_id": 2},
+                "metadata": {"doc_id": "10.0000/dummy-oer", "chunk_id": 2, "reaction_type": rt},
             },
-        ][: int(self.top_k)]
+        ][: int(k)]
 
 
 def _force_logs_into_repo(cfg_obj: AgentConfig) -> None:
@@ -88,7 +101,7 @@ def _collect_source_ids(trajectory) -> List[str]:
     sids: List[str] = []
     for step in getattr(trajectory, "steps", []) or []:
         for call in getattr(step, "tool_calls", []) or []:
-            if getattr(call, "tool_name", "") != "search_rag":
+            if getattr(call, "tool_name", "") != "search_literature":
                 continue
             data = getattr(call, "observation_data", None) or []
             if not isinstance(data, list):
@@ -130,7 +143,7 @@ def main() -> int:
         agent_id="agent3",
         name="Gemini Researcher",
         model_config=model_cfg,
-        rag_system=DummyRAGAdapter(collection_name="dummy_collection", top_k=5),
+        rag_system=DummyRAGAdapter(collection_name="dummy_collection", top_k=5, reaction_type=args.reaction_type),
         experience_store=None,
     )
 
@@ -139,7 +152,7 @@ def main() -> int:
         f"Target reaction: {args.reaction_type}\n"
         f"Components: {args.components}\n\n"
         "Requirements:\n"
-        "1) In ACTION phase, call `search_rag` at least once (do NOT answer without tool calls).\n"
+        "1) In ACTION phase, call `search_literature` at least once (do NOT answer without tool calls).\n"
         "2) After observing results, call `conclude` with a short answer that cites at least one `source_id`.\n"
     )
 
@@ -160,8 +173,8 @@ def main() -> int:
         print("tool_calls_preview:")
         for step_no, name in tool_calls[:20]:
             print(f"- step={step_no} tool={name}")
-    print(f"search_rag_source_id_total: {len(source_ids)}")
-    print(f"search_rag_source_id_valid: {len(valid_source_ids)}")
+    print(f"search_literature_source_id_total: {len(source_ids)}")
+    print(f"search_literature_source_id_valid: {len(valid_source_ids)}")
     if valid_source_ids:
         print("valid_source_id_preview:")
         for sid in valid_source_ids[:5]:
@@ -174,11 +187,11 @@ def main() -> int:
     if (response.content or "").strip().lower() == "no conclusion generated.":
         print("FAIL: forced conclude produced empty content")
         ok = False
-    if not any(name == "search_rag" for _step, name in tool_calls):
-        print("FAIL: no search_rag tool call recorded")
+    if not any(name == "search_literature" for _step, name in tool_calls):
+        print("FAIL: no search_literature tool call recorded")
         ok = False
     if not valid_source_ids:
-        print("FAIL: no valid source_id found in search_rag observation_data")
+        print("FAIL: no valid source_id found in search_literature observation_data")
         ok = False
 
     print("PASS" if ok else "FAIL")

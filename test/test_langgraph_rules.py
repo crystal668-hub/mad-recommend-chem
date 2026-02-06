@@ -42,7 +42,7 @@ class LangGraphRuleAdjudicationTests(unittest.TestCase):
             )
         ]
         rebuttals_r1 = []
-        changed, consensus = coord._rule_adjudicate(proposals, 1, reviews_r1, rebuttals_r1)
+        changed, consensus = coord._rule_adjudicate(proposals, 1, reviews_r1, rebuttals_r1, round_review_calls=[])
         self.assertTrue(changed)
         self.assertFalse(consensus)
         self.assertEqual(proposals["agent1"].no_response_streak, 1)
@@ -63,7 +63,7 @@ class LangGraphRuleAdjudicationTests(unittest.TestCase):
             )
         ]
         rebuttals_r2 = []
-        changed, _consensus = coord._rule_adjudicate(proposals, 2, reviews_r2, rebuttals_r2)
+        changed, _consensus = coord._rule_adjudicate(proposals, 2, reviews_r2, rebuttals_r2, round_review_calls=[])
         self.assertTrue(changed)
         self.assertEqual(proposals["agent1"].no_response_streak, 2)
         self.assertEqual(proposals["agent1"].status, "defeated")
@@ -103,12 +103,41 @@ class LangGraphRuleAdjudicationTests(unittest.TestCase):
             )
         ]
 
-        changed, _consensus = coord._rule_adjudicate(proposals, 1, reviews, rebuttals)
+        changed, _consensus = coord._rule_adjudicate(proposals, 1, reviews, rebuttals, round_review_calls=[])
         self.assertTrue(changed)
         self.assertEqual(proposals["agent1"].no_response_streak, 0)
         self.assertEqual(proposals["agent1"].status, "active")
 
+    def test_no_valid_reviews_is_consensus_only_if_review_calls_clean(self):
+        coord = self._coordinator(no_response_threshold=2)
+
+        proposals = {
+            "agent1": ProposalState(proposal_id="agent1", agent_name="A"),
+            "agent2": ProposalState(proposal_id="agent2", agent_name="B"),
+        }
+
+        # No valid reviews, but a reviewer call errored -> NOT consensus.
+        changed, consensus = coord._rule_adjudicate(
+            proposals,
+            1,
+            round_reviews=[],
+            round_rebuttals=[],
+            round_review_calls=[{"error": "timeout"}],
+        )
+        self.assertFalse(changed)
+        self.assertFalse(consensus)
+
+        # No valid reviews and all review calls clean -> consensus.
+        changed, consensus = coord._rule_adjudicate(
+            proposals,
+            2,
+            round_reviews=[],
+            round_rebuttals=[],
+            round_review_calls=[{"error": None}],
+        )
+        self.assertFalse(changed)
+        self.assertTrue(consensus)
+
 
 if __name__ == "__main__":
     unittest.main()
-

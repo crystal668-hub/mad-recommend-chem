@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Union
 class ActionType(Enum):
     """Available ReAct actions."""
 
-    SEARCH_RAG = "search_rag"
+    SEARCH_LITERATURE = "search_literature"
     SEARCH_EXPERIENCE = "search_experience"
     ANALYZE = "analyze"
     CONCLUDE = "conclude"
@@ -151,4 +151,3 @@ class ReActTrajectory:
         if self.final_answer:
             summary_parts.append(f" FINAL ANSWER:\n {self.final_answer}")
         return "\n".join(summary_parts)
-

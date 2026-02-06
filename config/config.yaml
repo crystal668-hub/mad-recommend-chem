@@ -68,14 +68,25 @@ rag:
   
 # ===== Debate Configuration =====
 debate:
-  max_rounds: 3  # Maximum number of debate rounds
-  timeout: 300  # [Fallback] Timeout in seconds
+  max_rounds: 5  # Maximum number of debate rounds
   review_timeout: 300  # LangGraph REVIEW phase wall-clock budget in seconds
   rebuttal_timeout: 300  # LangGraph REBUTTAL phase wall-clock budget in seconds
+  timeout: 300  # [Fallback] Timeout in seconds
+
+  # Auto-withdraw agents that repeatedly timeout / emit invalid JSON to avoid dragging the wall-clock.
+  auto_withdraw_on_call_errors: true
+  auto_withdraw_call_error_threshold: 2
+  auto_withdraw_call_error_types: ["timeout", "invalid_json"]
+  auto_withdraw_status: "withdrawn"
+
+  # ReAct step budgets per phase 
+  propose_max_react_steps: 5
+  review_max_react_steps: 3
+  rebuttal_max_react_steps: 4
 
   # LangGraph-style debate parameters 
   no_response_threshold: 2  # consecutive rounds failing to rebut valid reviews => defeated
-  max_reviews_per_target: 1  # per reviewer per target proposal per round
+  max_reviews_per_target: 2  # per reviewer per target proposal per round
 
   # AutoGen-style debate parameters 
   consensus_threshold: 3  # Number of consecutive identical answers considered as consensus

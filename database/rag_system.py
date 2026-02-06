@@ -69,14 +69,19 @@ class RAGSystem:
     # Public API
     # -------------------------
 
-    def retrieve(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+    def retrieve(
+        self,
+        query: str,
+        top_k: Optional[int] = None,
+        where: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Retrieve relevant chunks from Chroma.
 
         Returns:
             List[Dict]: each item has:
               - text: chunk text
-              - score: similarity score (higher is better) when computable
+              - score: similarity score when computable
               - metadata: stored metadata (must include doc_id + chunk_id for `source_id`)
         """
         q = (query or "").strip()
@@ -91,6 +96,7 @@ class RAGSystem:
             query_embedding=query_embedding,
             top_k=k,
             threshold=None,  # apply similarity_threshold ourselves on normalized "score"
+            where=where,
         )
 
         results: List[Dict[str, Any]] = []

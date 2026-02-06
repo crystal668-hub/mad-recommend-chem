@@ -4,10 +4,11 @@ E2E LangGraph debate test (4 agents) using an existing Chroma DB.
 What this script does:
 - Binds agent1-agent4 to collections in the existing ./data/chroma_db (no rebuild).
 - Runs a LangGraph-style debate (propose -> review -> rebuttal -> adjudication).
-- Ensures agents use the `search_rag` tool (which queries Chroma) to retrieve evidence.
+- Ensures agents use the `search_literature` tool (which queries Chroma) to retrieve evidence.
 
 Typical usage:
   python .\test\test_debate_langgraph_rag_chroma.py --reaction-type OER --components "Pt,Pd,Ni,Fe,Co"
+  python .\test\test_debate_langgraph_rag_chroma.py --reaction-type OER --components "Ni(69.00%), Co(19.07%), Fe(11.48%), Cu(0.40%), Zn(0.05%)"
 
 Notes:
 - This script calls external LLM + embedding APIs; make sure your .env has the needed keys.
@@ -31,13 +32,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dotenv import load_dotenv
 
-import chromadb
-from chromadb.config import Settings
-
 from agents.agent_config import AgentConfig
 from agents.llm_agents import create_agent
-from database.embedder import MultiModelEmbedder
 from debate.langgraph_coordinator import LangGraphDebateCoordinator
+from prompts.debate_phase_prompts import build_initial_debate_prompt
+from utils.electrode_composition import parse_components_with_percent, build_electrode_composition
 from utils.helpers import parse_component_string
 from utils.logger import setup_logging
 from utils.source_id import is_valid_chroma_source_id
@@ -52,12 +51,17 @@ class AgentBinding:
 
 
 class ChromaRAGAdapter:
-    """Minimal RAG adapter compatible with ReActAgent.search_rag (expects .retrieve(query)->List[Dict])."""
+    """Minimal RAG adapter compatible with ReActAgent.search_literature.
+
+    Supports:
+    - `top_k` (n_results)
+    - `where` metadata filter by 'reaction_type'
+    """
 
     def __init__(
         self,
         collection: Any,
-        embedder: MultiModelEmbedder,
+        embedder: Any,
         agent_name: str,
         collection_name: str,
         top_k: int = 5,
@@ -68,10 +72,16 @@ class ChromaRAGAdapter:
         self.collection_name = collection_name
         self.top_k = int(top_k)
 
-    def retrieve(self, query: str) -> List[Dict[str, Any]]:
+    def retrieve(self, query: str, top_k: int = 5, where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         query = (query or "").strip()
         if not query:
             return []
+
+        try:
+            k = int(top_k) if top_k is not None else int(self.top_k)
+        except Exception:
+            k = int(self.top_k)
+        k = max(1, k)
 
         # Use the SAME embedding profile used to build this collection.
         query_embedding = self.embedder.embed_text(query, agent_name=self.agent_name)
@@ -80,15 +90,23 @@ class ChromaRAGAdapter:
         try:
             raw = self.collection.query(
                 query_embeddings=[query_embedding],
-                n_results=self.top_k,
+                n_results=k,
+                where=where,
                 include=["documents", "metadatas", "distances"],
             )
         except TypeError:
-            # Backward compatibility for older Chroma versions.
-            raw = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=self.top_k,
-            )
+            # Backward compatibility for older Chroma versions (varying support for include/where).
+            try:
+                raw = self.collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=k,
+                    where=where,
+                )
+            except TypeError:
+                raw = self.collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=k,
+                )
 
         docs = (raw.get("documents") or [[]])[0] or []
         metas = (raw.get("metadatas") or [[]])[0] or []
@@ -219,7 +237,7 @@ def _iter_tool_calls_from_trajectory_dict(traj: Optional[Dict[str, Any]]) -> Ite
                 yield call
 
 
-def _collect_search_rag_stats(history: List[Dict[str, Any]]) -> Tuple[int, Set[str]]:
+def _collect_search_literature_stats(history: List[Dict[str, Any]]) -> Tuple[int, Set[str]]:
     total_calls = 0
     source_ids: Set[str] = set()
 
@@ -228,7 +246,7 @@ def _collect_search_rag_stats(history: List[Dict[str, Any]]) -> Tuple[int, Set[s
         if not isinstance(traj, dict):
             continue
         for call in _iter_tool_calls_from_trajectory_dict(traj):
-            if call.get("tool_name") != "search_rag":
+            if call.get("tool_name") != "search_literature":
                 continue
             total_calls += 1
             data = call.get("observation_data") or []
@@ -245,6 +263,24 @@ def _collect_search_rag_stats(history: List[Dict[str, Any]]) -> Tuple[int, Set[s
 
 def main() -> int:
     load_dotenv()
+
+    # Lazy imports so unit-test discovery doesn't hard-fail when optional E2E deps are missing.
+    try:
+        import chromadb
+        from chromadb.config import Settings
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(
+            "Missing optional dependency `chromadb` required for this E2E script.\n"
+            "Install project requirements (including chromadb extras) before running this script."
+        ) from e
+
+    try:
+        from database.embedder import MultiModelEmbedder
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(
+            "Failed to import MultiModelEmbedder (embedding dependencies may be missing, e.g. voyageai).\n"
+            "Install project requirements before running this script."
+        ) from e
 
     parser = argparse.ArgumentParser(description="E2E LangGraph debate test with 4 agents + existing Chroma DB")
     parser.add_argument("--config", default="./config/config.yaml", help="Config file path")
@@ -267,10 +303,18 @@ def main() -> int:
             "(default: inferred from collection name, else agent2)."
         ),
     )
-    parser.add_argument("--top-k", type=int, default=5, help="Top-k retrieval for search_rag")
-    parser.add_argument("--components", default="Pt,Pd,Ni,Fe,Co", help="Comma/space-separated metal elements")
+    parser.add_argument("--top-k", type=int, default=5, help="Top-k retrieval for search_literature")
+    parser.add_argument(
+        "--components",
+        default="Pt,Pd,Ni,Fe,Co",
+        help=(
+            "Exactly 5 metal components. Accepts symbols only (e.g., Pt,Pd,Ni,Fe,Co) "
+            "or symbols with relative percentages (e.g., Ni(69.00%), Co(19.07%), ...). "
+            "Separators: comma / Chinese comma / semicolon / Chinese semicolon / '、'."
+        ),
+    )
     parser.add_argument("--reaction-type", default="OER", help="Reaction type, e.g., OER")
-    parser.add_argument("--strict", dest="strict", action="store_true", default=True, help="Fail if no search_rag calls / no verifiable source_id")
+    parser.add_argument("--strict", dest="strict", action="store_true", default=True, help="Fail if no search_literature calls / no verifiable source_id")
     parser.add_argument("--lenient", dest="strict", action="store_false", help="Only check debate completes")
     args = parser.parse_args()
 
@@ -398,15 +442,24 @@ def main() -> int:
     debate_cfg = cfg.get_debate_config() or {}
     coordinator = LangGraphDebateCoordinator(agents=agents, config=debate_cfg)
 
-    components = parse_component_string(args.components)
-    if not components:
+    raw_components = parse_component_string(args.components)
+    if not raw_components:
         raise RuntimeError("No components provided")
+
+    elements, percents = parse_components_with_percent(raw_components)
+    electrode_composition = build_electrode_composition(elements, percents=percents, seed="|".join(elements))
+    initial_prompt = build_initial_debate_prompt(
+        elements,
+        reaction_type=args.reaction_type,
+        electrode_composition=electrode_composition,
+    )
 
     print("\n" + "=" * 60)
     print("STARTING LANGGRAPH DEBATE")
     print("=" * 60)
     print(f"Reaction: {args.reaction_type}")
-    print(f"Components: {', '.join(components)}")
+    print(f"Electrode composition (relative %): {electrode_composition}")
+    print(f"Metal catalyst elements: {', '.join(elements)}")
     print(f"Persist dir: {persist_dir}")
     if shared_collection:
         print(f"Shared collection: {shared_collection}")
@@ -414,11 +467,12 @@ def main() -> int:
     else:
         print(f"Base collection: {base_collection}")
 
-    result = coordinator.start_debate(components=components, reaction_type=args.reaction_type)
+    result = coordinator.start_debate(components=elements, initial_prompt=initial_prompt, reaction_type=args.reaction_type)
     result_dict = result.to_dict()
+    result_dict["electrode_composition"] = electrode_composition
 
     # Collect tool usage stats.
-    total_search_rag_calls, source_ids = _collect_search_rag_stats(result_dict.get("debate_history") or [])
+    total_search_literature_calls, source_ids = _collect_search_literature_stats(result_dict.get("debate_history") or [])
     valid_source_ids = {sid for sid in source_ids if is_valid_chroma_source_id(sid)}
 
     print("\n" + "=" * 60)
@@ -428,18 +482,18 @@ def main() -> int:
     print(f"Rounds: {result_dict.get('debate_rounds')}")
     print(f"Final products: {result_dict.get('final_products')}")
     print(f"Final performance: {result_dict.get('final_performance')}")
-    print(f"search_rag calls (total): {total_search_rag_calls}")
+    print(f"search_literature calls (total): {total_search_literature_calls}")
     print(f"Retrieved source_id (unique): {len(source_ids)}")
     print(f"Valid source_id (unique): {len(valid_source_ids)}")
 
     if not args.strict:
-        print("\nLENIENT: not enforcing search_rag/source_id requirements.")
+        print("\nLENIENT: not enforcing search_literature/source_id requirements.")
         return 0
 
     problems: List[str] = []
 
-    if total_search_rag_calls <= 0:
-        problems.append("no_search_rag_calls")
+    if total_search_literature_calls <= 0:
+        problems.append("no_search_literature_calls")
 
     if not valid_source_ids:
         problems.append("no_valid_source_id_retrieved")

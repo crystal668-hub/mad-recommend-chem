@@ -284,20 +284,34 @@ class MADSystem:
         """
         if not self._initialized:
             raise RuntimeError("System not initialized, please call initialize() first")
-        
-        # Validate components
-        is_valid, error_msg = validate_components(components)
+
+        # Normalize input into:
+        # - `elements`: metal symbols used throughout the system (guards/experience/RAG)
+        # - `electrode_composition`: formatted "Ni(69.00%), ..." string used in the debate prompt
+        from utils.electrode_composition import parse_components_with_percent, build_electrode_composition
+        from prompts.debate_phase_prompts import build_initial_debate_prompt
+
+        elements, percents = parse_components_with_percent([str(c) for c in (components or [])])
+        electrode_composition = build_electrode_composition(elements, percents=percents, seed="|".join(elements))
+
+        # Validate components (symbols only)
+        is_valid, error_msg = validate_components(elements)
         if not is_valid:
             raise ValueError(f"Component validation failed: {error_msg}")
         
         if reaction_type:
-            self.logger.info(f"Starting debate with reaction type {reaction_type} and catalysts: {components}")
+            self.logger.info(
+                "Starting debate with reaction type %s and catalysts: %s (electrode=%s)",
+                reaction_type,
+                elements,
+                electrode_composition,
+            )
         else:
-            self.logger.info(f"Starting debate with metal catalysts: {components}")
+            self.logger.info("Starting debate with metal catalysts: %s (electrode=%s)", elements, electrode_composition)
         
         # Create debate logger
         debate_logger = DebateLogger()
-        debate_logger.log_debate_start(components, self.config.get('debate', {}))
+        debate_logger.log_debate_start(elements, self.config.get('debate', {}))
         
         # Select debate engine (default: langgraph)
         selected_engine = (engine or self.default_engine or "langgraph").strip().lower()
@@ -312,16 +326,22 @@ class MADSystem:
             raise RuntimeError(f"Debate coordinator for engine '{selected_engine}' is not initialized")
 
         # Run debate
-        result = coordinator.start_debate(components, reaction_type=reaction_type)
+        initial_prompt = build_initial_debate_prompt(
+            elements,
+            reaction_type=reaction_type,
+            electrode_composition=electrode_composition,
+        )
+        result = coordinator.start_debate(elements, initial_prompt=initial_prompt, reaction_type=reaction_type)
         result_dict = result.to_dict()
         result_dict["engine"] = selected_engine
+        result_dict["electrode_composition"] = electrode_composition
         
         # Log debate end
         debate_logger.log_debate_end(result_dict)
         
         # Save results
         if save_result:
-            self._save_result(result, components, engine=selected_engine)
+            self._save_result(result, elements, electrode_composition=electrode_composition, engine=selected_engine)
         
         self.logger.info("Debate completed")
         
@@ -331,7 +351,13 @@ class MADSystem:
         """Experience extraction interface reserved (currently disabled)"""
         return
     
-    def _save_result(self, result, components: List[str], engine: Optional[str] = None) -> None:
+    def _save_result(
+        self,
+        result,
+        components: List[str],
+        electrode_composition: Optional[str] = None,
+        engine: Optional[str] = None,
+    ) -> None:
         """Save debate results to file"""
         output_dir = ensure_dir(self.config.get('paths', {}).get('outputs', './outputs'))
         
@@ -347,6 +373,7 @@ class MADSystem:
             "timestamp": timestamp,
             "engine": engine,
             "components": components,
+            "electrode_composition": (electrode_composition or None),
             "result": result.to_dict()
         }
         
@@ -389,7 +416,10 @@ def main():
     parser.add_argument(
         '--components',
         type=str,
-        help='Metal components, separated by commas or Chinese commas, e.g., "Pt,Pd,Ru,Ir,Rh"'
+        help=(
+            'Metal components (exactly 5). You may provide symbols only, e.g., "Pt,Pd,Ru,Ir,Rh", '
+            'or symbols with relative percentages, e.g., "Ni(69.00%), Co(19.07%), Fe(11.48%), Cu(0.40%), Zn(0.05%)".'
+        )
     )
     parser.add_argument(
         '--reaction-type',

@@ -16,7 +16,7 @@ class EvidenceCollectionTests(unittest.TestCase):
                 observation="o",
                 tool_calls=[
                     ToolCallRecord(
-                        tool_name="search_rag",
+                        tool_name="search_literature",
                         tool_call_id="call_1",
                         tool_args={"query": "x"},
                         observation="obs",
@@ -36,4 +36,3 @@ class EvidenceCollectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

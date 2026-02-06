@@ -458,6 +458,9 @@ class TextProcessor:
         doi = doi.strip().strip("<>")
         doi = doi.lstrip("([{<\"'")
         doi = doi.rstrip(".,;:!?\"'")
+        # Markdown emphasis wrappers can be captured by permissive DOI regexes, e.g. **10.xxxx/...**
+        # Remove them so doc_id/source_id stays canonical.
+        doi = doi.strip("*_`")
 
         # Guardrails for Markdown artifacts:
         # Some marker-generated Markdown contains patterns like:

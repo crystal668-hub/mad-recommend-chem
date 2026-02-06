@@ -168,7 +168,7 @@ def format_component_list(components: List[str]) -> str:
 def parse_component_string(component_str: str) -> List[str]:
     """
     解析组分字符串为列表
-    支持多种分隔符：逗号、顿号、分号
+    支持多种分隔符：英文逗号/中文逗号、顿号、分号
     
     Args:
         component_str: 组分字符串
@@ -177,7 +177,13 @@ def parse_component_string(component_str: str) -> List[str]:
         List[str]: 组分列表
     """
     # 替换各种分隔符为统一的分隔符
-    normalized = component_str.replace('、', ',').replace('；', ',').replace(';', ',')
+    normalized = (
+        str(component_str or "")
+        .replace("，", ",")
+        .replace("、", ",")
+        .replace("；", ",")
+        .replace(";", ",")
+    )
     
     # 分割并去除空白
     components = [c.strip() for c in normalized.split(',') if c.strip()]

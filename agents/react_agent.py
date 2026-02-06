@@ -4,7 +4,7 @@ LangChain-based ReAct Agent.
 Goal:
 - Keep explicit "Thought -> Action -> Observation" trajectories.
 - Avoid manual OpenAI tool message formatting by using LangChain message classes.
-- Keep the original 4 tools: search_rag, search_experience, analyze, conclude.
+- Keep the original 4 tools: search_literature, search_experience, analyze, conclude.
 
 Design:
 Each ReAct iteration runs TWO LLM calls:
@@ -28,7 +28,7 @@ from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from agents.react_reasoning import ReActTrajectory, ReActStep, ActionType, ToolCallRecord
-from utils.source_id import build_chroma_source_id
+from utils.source_id import build_chroma_source_id, normalize_doc_id
 
 
 @dataclass
@@ -165,15 +165,23 @@ class ReActAgent:
     # Tools (raw retrieval)
     # -------------------------
 
-    def retrieve_knowledge(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def retrieve_knowledge(
+        self, query: str, top_k: int = 5, where: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
         if self.rag_system is None:
             raise RuntimeError("RAG System is not configured.")
         try:
-            # Some adapters accept a `top_k` arg; others don't. Try both.
+            # Some adapters accept `top_k` and/or `where`; others don't. Try best-effort combos.
             try:
-                results = self.rag_system.retrieve(query, top_k=int(top_k))
+                results = self.rag_system.retrieve(query, top_k=int(top_k), where=where)
             except TypeError:
-                results = self.rag_system.retrieve(query)
+                try:
+                    results = self.rag_system.retrieve(query, top_k=int(top_k))
+                except TypeError:
+                    try:
+                        results = self.rag_system.retrieve(query, where=where)
+                    except TypeError:
+                        results = self.rag_system.retrieve(query)
             return (results or [])[: int(top_k)]
         except Exception as e:
             return [{"text": "", "score": 0.0, "metadata": {}, "error": str(e)}]
@@ -190,7 +198,24 @@ class ReActAgent:
     # LangChain tool wrappers
     # -------------------------
 
-    def _tool_search_rag(self, query: str, top_k: int = 5) -> ToolResult:
+    def _tool_search_literature(self, query: str, top_k: int = 5) -> ToolResult:
+        # Clamp `top_k` in STRICT JSON phases (REVIEW/REBUTTAL) to reduce noisy retrieval.
+        try:
+            top_k_int = int(top_k)
+        except Exception:
+            top_k_int = 5
+        top_k_int = max(1, top_k_int)
+
+        if bool(getattr(self, "_current_requires_strict_json", False)):
+            try:
+                strict_cap = int(self.model_config.get("rag_top_k_strict_json", 3))
+            except Exception:
+                strict_cap = 3
+            strict_cap = max(1, strict_cap)
+            top_k_int = min(top_k_int, strict_cap)
+
+        top_k = top_k_int
+
         # Overfetch then rerank by task relevance (elements + reaction type) to reduce "HEA keyword drift"
         # (e.g., being pulled toward popular but off-target systems like CoCrFeMnNi for HEA queries).
         try:
@@ -200,7 +225,77 @@ class ReActAgent:
         overfetch = max(1, min(10, overfetch))
         fetch_k = max(int(top_k), int(top_k) * overfetch)
 
-        results = self.retrieve_knowledge(query=query, top_k=fetch_k)
+        # Infer task constraints from call context (current trajectory query).
+        ctx_text = ""
+        try:
+            ctx_text = str(getattr(getattr(self, "current_trajectory", None), "query", "") or "")
+        except Exception:
+            ctx_text = ""
+
+        task_components, task_reaction = _infer_task_constraints(
+            ctx_text, fallback_components=None, fallback_reaction=None
+        )
+        
+        # Only recall task_reaction relevant chunks if specified.
+        rag_filter_by_reaction_type = bool(self.model_config.get("rag_filter_by_reaction_type", True))
+        where = None
+        if rag_filter_by_reaction_type and task_reaction:
+            where = {"reaction_type": str(task_reaction).strip().upper()}
+
+        results = self.retrieve_knowledge(query=query, top_k=fetch_k, where=where)
+
+        # Filter junk chunks (e.g., pure headings) to reduce high-similarity / low-information hits.
+        rag_filter_junk_chunks = bool(self.model_config.get("rag_filter_junk_chunks", True))
+        try:
+            rag_min_chunk_chars = int(self.model_config.get("rag_min_chunk_chars", 80))
+        except Exception:
+            rag_min_chunk_chars = 80
+        rag_min_chunk_chars = max(1, rag_min_chunk_chars)
+        rag_keep_if_has_number = bool(self.model_config.get("rag_keep_if_has_number", True))
+
+        raw_results = list(results or [])
+
+        # Hard guarantee: if a target reaction type is known, only return chunks whose metadata.reaction_type matches it.
+        # Missing/unknown reaction_type is treated as mismatch and dropped (no cross-type fallback).
+        if rag_filter_by_reaction_type and task_reaction:
+            target_rt = str(task_reaction).strip().upper()
+            filtered: List[Dict[str, Any]] = []
+            for r in raw_results:
+                meta = r.get("metadata") or {}
+                rt_val = meta.get("reaction_type")
+                rt = str(rt_val or "").strip().upper()
+                if not rt or rt == "UNKNOWN":
+                    continue
+                if rt != target_rt:
+                    continue
+                filtered.append(r)
+            raw_results = filtered
+
+        if rag_filter_junk_chunks and raw_results:
+            kept: List[Dict[str, Any]] = []
+            soft_junk: List[Dict[str, Any]] = []
+            for r in raw_results:
+                text = str(r.get("text") or "")
+                kind = _classify_junk_chunk(
+                    text, min_chars=rag_min_chunk_chars, keep_if_has_number=rag_keep_if_has_number
+                )
+                if kind == "hard":
+                    # Never backfill hard junk (headings-only / keywords-only / empty).
+                    continue
+                if kind == "soft":
+                    soft_junk.append(r)
+                    continue
+                kept.append(r)
+
+            # Backfill only from non-hard junk, and allow returning fewer than top_k (prefer precision over volume).
+            if len(kept) < int(top_k):
+                for r in soft_junk:
+                    kept.append(r)
+                    if len(kept) >= int(top_k):
+                        break
+            raw_results = kept
+
+        results = raw_results
 
         # Enrich with stable source_id for later verification.
         collection = getattr(self.rag_system, "collection_name", "unknown")
@@ -216,18 +311,15 @@ class ReActAgent:
             if doc_id is None or chunk_index is None:
                 continue
             try:
-                item["source_id"] = build_chroma_source_id(str(collection), str(doc_id), int(chunk_index))
+                # Normalize doc_id to avoid Markdown wrappers like trailing "**" from bold DOIs.
+                item["source_id"] = build_chroma_source_id(
+                    str(collection),
+                    normalize_doc_id(str(doc_id)),
+                    int(chunk_index),
+                )
             except Exception:
                 continue
 
-        # Annotate + rerank results using task constraints extracted from the call context.
-        ctx_text = ""
-        try:
-            ctx_text = str(getattr(getattr(self, "current_trajectory", None), "query", "") or "")
-        except Exception:
-            ctx_text = ""
-
-        task_components, task_reaction = _infer_task_constraints(ctx_text, fallback_components=None, fallback_reaction=None)
         required = [c for c in (task_components or []) if str(c).strip()]
         required_set = {c for c in required}
 
@@ -292,8 +384,8 @@ class ReActAgent:
 
         tools = [
             StructuredTool.from_function(
-                func=self._tool_search_rag,
-                name=ActionType.SEARCH_RAG.value,
+                func=self._tool_search_literature,
+                name=ActionType.SEARCH_LITERATURE.value,
                 description=(
                     "Search the local literature database (Chroma-backed RAG) and return relevant chunks. "
                     "Use AFTER `search_experience` when you need verifiable citations; cite source_id from results."
@@ -302,7 +394,7 @@ class ReActAgent:
             StructuredTool.from_function(
                 func=self._tool_search_experience,
                 name=ActionType.SEARCH_EXPERIENCE.value,
-                description="Search the experience database for similar past cases / guidelines (preferred before `search_rag`).",
+                description="Search the experience database for similar past cases / guidelines (preferred before `search_literature`).",
             ),
             StructuredTool.from_function(
                 func=self._tool_analyze,
@@ -345,13 +437,13 @@ class ReActAgent:
             "You MUST call one or more tools.\n"
             "Do NOT output normal text answers in this phase; use tool calls.\n"
             "Critical constraint:\n"
-            "- In a single ACTION step, do NOT mix search tools (`search_rag`, `search_experience`) with "
+            "- In a single ACTION step, do NOT mix search tools (`search_literature`, `search_experience`) with "
             "analysis tools (`analyze`, `conclude`).\n"
             "  - If you need evidence: call one or more search tools first.\n"
             "  - After you receive observations, in the NEXT step you may call `analyze` or `conclude`.\n"
             "Rules:\n"
-            "- Tool priority: prefer `search_experience` FIRST; then use `search_rag` for verifiable citations.\n"
-            "- When calling `search_rag`, include the target reaction type (e.g., OER/HER/ORR/HOR) AND ALL provided metal element symbols in the query.\n"
+            "- Tool priority: prefer `search_experience` FIRST; then use `search_literature` for verifiable citations.\n"
+            "- When calling `search_literature`, include the target reaction type (e.g., OER/HER/ORR/HOR) AND ALL provided metal element symbols in the query.\n"
             "- Do NOT drift to evidence about different catalyst metals; ignore off-target compositions.\n"
             "- Using tools instead of guessing.\n"
             "- If you have enough evidence, call `conclude`.\n"
@@ -440,6 +532,8 @@ class ReActAgent:
 
         # Many debate phases (REVIEW/REBUTTAL) require STRICT JSON; PROPOSE does not.
         requires_strict_json = "STRICT JSON" in (system_prompt or "").upper()
+        # Expose per-call STRICT JSON requirement to tools (e.g., top_k clamp in search_literature).
+        self._current_requires_strict_json = bool(requires_strict_json)
         task_components, task_reaction = _infer_task_constraints(
             full_query, fallback_components=components, fallback_reaction=None
         )
@@ -464,7 +558,270 @@ class ReActAgent:
         model_name_hint = str(self.model_config.get("model") or "").strip().lower()
         use_user_role_for_thought = provider_hint in {"google", "gemini"} or ("gemini" in model_name_hint)
 
+        deadline_mode = bool(self.model_config.get("deadline_mode", True))
+
+        propose_metric_line_enforce_point_estimate = bool(
+            self.model_config.get("propose_metric_line_enforce_point_estimate", True)
+        )
+        propose_metric_line_require_confidence = bool(
+            self.model_config.get("propose_metric_line_require_confidence", True)
+        )
+
+        def _log_strict_json_fallback(schema_detected: str, reason: str, original_preview: str) -> None:
+            try:
+                self.logger.warning(
+                    "react_strict_json_fallback_used",
+                    extra={
+                        "event": "agent.react.strict_json_fallback_used",
+                        "agent_id": self.agent_id,
+                        "schema_detected": schema_detected,
+                        "phase_hint": schema_detected if schema_detected != "unknown" else "unknown",
+                        "reason": reason,
+                        "original_preview": (original_preview or "")[:500],
+                    },
+                )
+            except Exception:
+                pass
+
+        def _run_forced_conclude(messages_: List[Any]) -> Tuple[str, str, bool, str]:
+            """Generate a final answer draft and a tool_call_id via a forced conclude attempt (best-effort)."""
+            retrieved_ = _collect_retrieved_source_ids_from_trajectory(trajectory)
+            sid_hint_ = ""
+            if retrieved_:
+                sid_hint_ = (
+                    "\nYou MUST cite at least one of these source_id values verbatim in your final answer:\n"
+                    + "\n".join(f"- {sid}" for sid in sorted(list(retrieved_))[:10])
+                )
+            elements_hint_ = ""
+            if task_components:
+                elements_hint_ = (
+                    "\nThe metal catalyst elements for this task are EXACTLY:\n- "
+                    + ", ".join([str(c) for c in (task_components or [])])
+                    + "\nYou MUST explicitly include ALL of these elements in your final conclusion."
+                )
+
+            draft_ = ""
+            forced_conclude_tool_call_id_ = "forced_conclude"
+            strict_json_fallback_used_ = False
+            schema_detected_ = "unknown"
+
+            # Best-effort: force a specific tool if the backend supports it; otherwise fall back to "required".
+            force_conclude_llm_ = llm_with_tools_forced
+            try:
+                if hasattr(llm, "bind_tools"):
+                    force_conclude_llm_ = llm.bind_tools(tools, tool_choice=ActionType.CONCLUDE.value)
+                else:  # pragma: no cover
+                    force_conclude_llm_ = llm.bind(tools=tools, tool_choice=ActionType.CONCLUDE.value)
+            except Exception:
+                force_conclude_llm_ = llm_with_tools_forced
+
+            forced_action_msg_ = None
+            try:
+                forced_action_msg_ = force_conclude_llm_.invoke(
+                    messages_
+                    + [
+                        SystemMessage(
+                            content=(
+                                (
+                                    "FINAL ACTION: You MUST call ONLY the `conclude` tool now.\n"
+                                    "Set the `conclusion` argument to STRICT JSON ONLY that follows the schema in the system prompt EXACTLY.\n"
+                                    "- No markdown, no extra text.\n"
+                                    "- If evidence is required, cite at least one verifiable source_id.\n"
+                                    + sid_hint_
+                                    + elements_hint_
+                                )
+                                if requires_strict_json
+                                else (
+                                    "FINAL ACTION: You MUST call ONLY the `conclude` tool now.\n"
+                                    "Set the `conclusion` argument to the best possible final answer.\n"
+                                    "- Include the reaction type explicitly.\n"
+                                    "- Explicitly restate the catalyst metal elements exactly as provided.\n"
+                                    "- Provide a single speculated value + confidence for key performance metric(s) (no numeric range).\n"
+                                    "- If you used literature evidence, cite source_id exactly as provided.\n"
+                                    + sid_hint_
+                                    + elements_hint_
+                                )
+                            )
+                        )
+                    ]
+                )
+            except Exception:
+                forced_action_msg_ = None
+
+            if self.verbose and forced_action_msg_ is not None:
+                self.logger.debug(
+                    "react_forced_conclude_action_raw",
+                    extra={
+                        "event": "agent.react.forced_conclude.action.raw",
+                        "agent_id": self.agent_id,
+                        "forced_action_additional_kwargs": _preview(getattr(forced_action_msg_, "additional_kwargs", None)),
+                        "forced_action_tool_calls": _preview(getattr(forced_action_msg_, "tool_calls", None)),
+                        "forced_action_text": (getattr(forced_action_msg_, "content", "") or "")[:1500],
+                    },
+                )
+
+            if forced_action_msg_ is not None:
+                forced_calls_ = _extract_tool_calls(forced_action_msg_)
+                for name, args, call_id in (_normalize_tool_call(c) for c in forced_calls_):
+                    if name != ActionType.CONCLUDE.value:
+                        continue
+                    if call_id:
+                        forced_conclude_tool_call_id_ = call_id
+                    conclusion_ = None
+                    if isinstance(args, dict):
+                        conclusion_ = args.get("conclusion") or args.get("final_answer")
+                    if isinstance(conclusion_, (dict, list)):
+                        try:
+                            conclusion_ = json.dumps(conclusion_, ensure_ascii=False)
+                        except Exception:
+                            conclusion_ = str(conclusion_)
+                    if conclusion_ is not None:
+                        draft_ = str(conclusion_).strip()
+                        break
+
+            if not draft_:
+                # Fallback: ask for a final answer in free-form text (no tools).
+                forced_ = llm.invoke(
+                    messages_
+                    + [
+                        SystemMessage(
+                            content=(
+                                (
+                                    "FINAL PHASE: Output STRICT JSON ONLY.\n"
+                                    "- Follow the output schema in the system prompt EXACTLY.\n"
+                                    "- No markdown, no extra text.\n"
+                                    "- If evidence is required, cite at least one verifiable source_id.\n"
+                                    + sid_hint_
+                                    + elements_hint_
+                                )
+                                if requires_strict_json
+                                else (
+                                    "FINAL PHASE: Write the best possible final answer now.\n"
+                                    "- Include the reaction type explicitly.\n"
+                                    "- Explicitly restate the catalyst metal elements exactly as provided.\n"
+                                    "- Provide a single speculated value + confidence for key performance metric(s) (no numeric range).\n"
+                                    "- If you used literature evidence, cite source_id exactly as provided.\n"
+                                    + sid_hint_
+                                    + elements_hint_
+                                )
+                            )
+                        )
+                    ]
+                )
+                if self.verbose:
+                    self.logger.debug(
+                        "react_forced_conclude_text_raw",
+                        extra={
+                            "event": "agent.react.forced_conclude.text.raw",
+                            "agent_id": self.agent_id,
+                            "forced_text_additional_kwargs": _preview(getattr(forced_, "additional_kwargs", None)),
+                            "forced_text_tool_calls": _preview(getattr(forced_, "tool_calls", None)),
+                            "forced_text": (getattr(forced_, "content", "") or "")[:1500],
+                        },
+                    )
+                draft_ = (getattr(forced_, "content", "") or "").strip()
+                if not draft_:
+                    # Some providers return a legacy function_call even when tools are not bound.
+                    fc_ = (getattr(forced_, "additional_kwargs", {}) or {}).get("function_call")
+                    if isinstance(fc_, dict):
+                        args_ = fc_.get("arguments")
+                        parsed_ = None
+                        if isinstance(args_, str):
+                            try:
+                                parsed_ = json.loads(args_)
+                            except Exception:
+                                parsed_ = None
+                        elif isinstance(args_, dict):
+                            parsed_ = args_
+                        if isinstance(parsed_, dict):
+                            draft_ = str(parsed_.get("conclusion") or parsed_.get("final_answer") or "").strip()
+
+            if requires_strict_json:
+                schema_detected_ = _detect_strict_json_schema(system_prompt)
+                if not _is_valid_strict_json_payload(draft_, system_prompt):
+                    strict_json_fallback_used_ = True
+                    _orig_ = draft_
+                    draft_ = _minimal_strict_json_payload(system_prompt)
+                    _log_strict_json_fallback(
+                        schema_detected=schema_detected_,
+                        reason="forced_conclude_invalid_or_empty",
+                        original_preview=str(_orig_),
+                    )
+
+            if not draft_:
+                draft_ = "No conclusion generated."
+
+            # If strict JSON is not required and the model forgot to include a verifiable source_id,
+            # attach a minimal evidence line.
+            if (not requires_strict_json) and retrieved_ and not any(sid in draft_ for sid in retrieved_):
+                draft_ = draft_.rstrip() + "\n\nEvidence (retrieved source_id): " + ", ".join(sorted(list(retrieved_))[:3])
+
+            # If a PROPOSE conclusion is missing required task elements, patch a minimal explicit line.
+            # This prevents the agent from getting stuck on the final step due to guard enforcement.
+            if (not requires_strict_json) and task_components:
+                ok_, reason_ = _validate_conclusion_against_task(draft_, task_components)
+                if not ok_ and "missing required catalyst" in str(reason_).lower():
+                    draft_ = (
+                        draft_.rstrip()
+                        + "\n\nCatalyst metal elements (exactly as provided): "
+                        + ", ".join([str(c) for c in (task_components or [])])
+                    )
+
+            return draft_, forced_conclude_tool_call_id_, strict_json_fallback_used_, schema_detected_
+
         while step_number < effective_max_steps:
+            remaining_steps = effective_max_steps - step_number
+            if deadline_mode and remaining_steps == 1:
+                # Deadline mode: force an in-loop conclude so we don't fall into the post-loop forced_conclude path.
+                self.logger.warning(
+                    "react_deadline_force_conclude",
+                    extra={
+                        "event": "agent.react.deadline_force_conclude",
+                        "agent_id": self.agent_id,
+                        "steps_so_far": step_number,
+                        "max_react_steps": effective_max_steps,
+                    },
+                )
+                draft, forced_tool_call_id, strict_json_fallback_used, schema_detected = _run_forced_conclude(messages)
+                final_answer = draft
+
+                if requires_strict_json and not _is_valid_strict_json_payload(final_answer, system_prompt):
+                    strict_json_fallback_used = True
+                    schema_detected = _detect_strict_json_schema(system_prompt)
+                    _orig = final_answer
+                    final_answer = _minimal_strict_json_payload(system_prompt)
+                    _log_strict_json_fallback(
+                        schema_detected=schema_detected,
+                        reason="deadline_force_conclude_invalid_or_empty",
+                        original_preview=str(_orig),
+                    )
+
+                step_number += 1
+                tool_call = ToolCallRecord(
+                    tool_name=ActionType.CONCLUDE.value,
+                    tool_call_id=forced_tool_call_id or "deadline_conclude",
+                    tool_args={"conclusion": final_answer},
+                    observation=final_answer,
+                    observation_data=final_answer,
+                )
+                thought_text = "Deadline mode: forced conclude on the final step to avoid budget overrun."
+                if strict_json_fallback_used:
+                    thought_text += (
+                        " Strict JSON fallback: emitted minimal schema JSON due to empty/invalid conclude."
+                    )
+                trajectory.add_step(
+                    ReActStep(
+                        step_number=step_number,
+                        thought=thought_text,
+                        action=ActionType.CONCLUDE.value,
+                        action_input={"conclusion": final_answer},
+                        observation=final_answer,
+                        tool_call_id=forced_tool_call_id or "deadline_conclude",
+                        observation_data=final_answer,
+                        tool_calls=[tool_call],
+                    )
+                )
+                break
 
             # ----- THOUGHT -----
 
@@ -506,6 +863,13 @@ class ReActAgent:
             tool_calls: List[Dict[str, Any]] = []
             action_msg = None
             raw_action_text = ""
+            deadline_hint = ""
+            if deadline_mode and remaining_steps == 2:
+                deadline_hint = (
+                    "\nDEADLINE MODE: You have only 2 steps left.\n"
+                    "- Do NOT call `search_literature` or `search_experience`.\n"
+                    "- You may ONLY call `analyze` or `conclude`.\n"
+                )
             for attempt in range(2):
                 retry_hint = ""
                 if attempt > 0:
@@ -522,7 +886,7 @@ class ReActAgent:
                 action_msg = action_llm.invoke(
                     messages
                     + [
-                        SystemMessage(content=self._get_action_phase_instruction() + retry_hint),
+                        SystemMessage(content=self._get_action_phase_instruction() + retry_hint + deadline_hint),
                         SystemMessage(content=f"THOUGHT (plan; do not repeat):\n{thought_content}"),
                     ]
                 )
@@ -552,7 +916,7 @@ class ReActAgent:
                 failure_note = (
                     "ACTION FAILURE: You did not emit any tool calls.\n"
                     "Next ACTION MUST emit at least one tool call via the tool-calling mechanism (no plain text).\n"
-                    "If you need evidence, call `search_experience` and/or `search_rag`.\n"
+                    "If you need evidence, call `search_experience` and/or `search_literature`.\n"
                 )
                 # Avoid spamming the same failure note repeatedly.
                 try:
@@ -616,7 +980,7 @@ class ReActAgent:
                         "tools": [name for name, _args, _id in normalized_calls],
                     },
                 )
-            search_tools = {ActionType.SEARCH_RAG.value, ActionType.SEARCH_EXPERIENCE.value}
+            search_tools = {ActionType.SEARCH_LITERATURE.value, ActionType.SEARCH_EXPERIENCE.value}
             analysis_tools = {ActionType.ANALYZE.value, ActionType.CONCLUDE.value}
             has_search = any(name in search_tools for name, _args, _id in normalized_calls)
             has_analysis = any(name in analysis_tools for name, _args, _id in normalized_calls)
@@ -646,7 +1010,13 @@ class ReActAgent:
                     conclusion_text = ""
                     if isinstance(tool_args, dict):
                         conclusion_text = str(tool_args.get("conclusion") or "")
-                    ok, reason = _validate_conclusion_against_task_with_evidence(conclusion_text, task_components, trajectory)
+                    ok, reason = _validate_conclusion_against_task_with_evidence(
+                        conclusion_text,
+                        task_components,
+                        trajectory,
+                        enforce_point_estimate=propose_metric_line_enforce_point_estimate,
+                        require_confidence=propose_metric_line_require_confidence,
+                    )
                     if not ok:
                         blocked_guard = True
                         try:
@@ -665,11 +1035,28 @@ class ReActAgent:
                             pass
                         guard_msg = (
                             "Conclusion out of scope: " + reason + "\n"
-                            "You MUST revise and conclude for the exact metal elements: "
+                            "You MUST revise your conclusion to explicitly include ALL required catalyst metal elements "
+                            "(exactly as provided): "
                             + ", ".join([str(c) for c in (task_components or [])])
-                            + ".\n"
-                            "Do NOT introduce other catalyst metals (e.g., Cr, Mn)."
+                            + "."
                         )
+                    elif reason:
+                        # Evidence-level warnings should not block a PROPOSE conclusion.
+                        # We still log them for debugging/analytics.
+                        try:
+                            self.logger.warning(
+                                "react_conclude_guard_warning",
+                                extra={
+                                    "event": "agent.react.conclude.guard_warning",
+                                    "agent_id": self.agent_id,
+                                    "step": step_number + 1,
+                                    "warning": reason,
+                                    "required_components": task_components,
+                                    "cited_source_ids": _extract_source_ids_from_text(conclusion_text)[:10],
+                                },
+                            )
+                        except Exception:
+                            pass
 
                 blocked = blocked_mixed or blocked_guard
                 if blocked:
@@ -690,6 +1077,16 @@ class ReActAgent:
                             result = ToolResult(observation=f"Tool error: {str(e)}", data=None)
 
                 observation_text = str(result)
+                if tool_name == ActionType.CONCLUDE.value and requires_strict_json and not blocked:
+                    if not _is_valid_strict_json_payload(observation_text, system_prompt):
+                        schema_detected = _detect_strict_json_schema(system_prompt)
+                        _log_strict_json_fallback(
+                            schema_detected=schema_detected,
+                            reason="conclude_tool_output_invalid_or_empty",
+                            original_preview=str(observation_text),
+                        )
+                        observation_text = _minimal_strict_json_payload(system_prompt)
+                        result = ToolResult(observation=observation_text, data=observation_text)
                 messages.append(ToolMessage(content=observation_text, tool_call_id=tool_call_id))
 
                 tool_call_records.append(
@@ -703,10 +1100,10 @@ class ReActAgent:
                 )
                 observation_sections.append(f"--- Observation ({tool_name}) ---\n{observation_text}")
 
-                if self.verbose and tool_name in {ActionType.SEARCH_RAG.value, ActionType.SEARCH_EXPERIENCE.value}:
+                if self.verbose and tool_name in {ActionType.SEARCH_LITERATURE.value, ActionType.SEARCH_EXPERIENCE.value}:
                     n_items = len(result.data) if isinstance(result.data, list) else None
                     sid_preview: List[str] = []
-                    if tool_name == ActionType.SEARCH_RAG.value and isinstance(result.data, list):
+                    if tool_name == ActionType.SEARCH_LITERATURE.value and isinstance(result.data, list):
                         for item in result.data[:3]:
                             if isinstance(item, dict) and item.get("source_id"):
                                 sid_preview.append(str(item["source_id"]))
@@ -783,7 +1180,7 @@ class ReActAgent:
                 elements_hint = (
                     "\nThe metal catalyst elements for this task are EXACTLY:\n- "
                     + ", ".join([str(c) for c in (task_components or [])])
-                    + "\nDo NOT introduce other catalyst metals."
+                    + "\nYou MUST explicitly include ALL of these elements in your final conclusion."
                 )
 
             # Some callers (e.g. debate REVIEW/REBUTTAL) require strict JSON only; don't inject free-form text
@@ -826,7 +1223,7 @@ class ReActAgent:
                                     "Set the `conclusion` argument to the best possible final answer.\n"
                                     "- Include the reaction type explicitly.\n"
                                     "- Explicitly restate the catalyst metal elements exactly as provided.\n"
-                                    "- Summarize key performance metrics.\n"
+                                    "- Provide a single speculated value + confidence for key performance metric(s) (no numeric range).\n"
                                     "- If you used literature evidence, cite source_id exactly as provided.\n"
                                     + sid_hint
                                     + elements_hint
@@ -889,7 +1286,7 @@ class ReActAgent:
                                 "FINAL PHASE: Write the best possible final answer now.\n"
                                 "- Include the reaction type explicitly.\n"
                                 "- Explicitly restate the catalyst metal elements exactly as provided.\n"
-                                "- Summarize key performance metrics.\n"
+                                "- Provide a single speculated value + confidence for key performance metric(s) (no numeric range).\n"
                                 "- If you used literature evidence, cite source_id exactly as provided.\n"
                                 + sid_hint
                                 + elements_hint
@@ -925,13 +1322,35 @@ class ReActAgent:
                             parsed = args
                         if isinstance(parsed, dict):
                             draft = str(parsed.get("conclusion") or parsed.get("final_answer") or "").strip()
-            if not draft:
+            strict_json_fallback_used = False
+            if requires_strict_json and not _is_valid_strict_json_payload(draft, system_prompt):
+                strict_json_fallback_used = True
+                schema_detected = _detect_strict_json_schema(system_prompt)
+                _orig = draft
+                draft = _minimal_strict_json_payload(system_prompt)
+                _log_strict_json_fallback(
+                    schema_detected=schema_detected,
+                    reason="post_loop_forced_conclude_invalid_or_empty",
+                    original_preview=str(_orig),
+                )
+            elif not draft:
                 draft = "No conclusion generated."
 
             # If strict JSON is not required and the model forgot to include a verifiable source_id,
             # attach a minimal evidence line.
             if (not requires_strict_json) and retrieved and not any(sid in draft for sid in retrieved):
                 draft = draft.rstrip() + "\n\nEvidence (retrieved source_id): " + ", ".join(sorted(list(retrieved))[:3])
+
+            # If a PROPOSE conclusion is missing required task elements, patch a minimal explicit line.
+            # This keeps forced-conclude fallbacks consistent with the normal conclude guard behavior.
+            if (not requires_strict_json) and task_components:
+                ok_, reason_ = _validate_conclusion_against_task(draft, task_components)
+                if not ok_ and "missing required catalyst" in str(reason_).lower():
+                    draft = (
+                        draft.rstrip()
+                        + "\n\nCatalyst metal elements (exactly as provided): "
+                        + ", ".join([str(c) for c in (task_components or [])])
+                    )
 
             final_answer = draft
 
@@ -947,7 +1366,14 @@ class ReActAgent:
             trajectory.add_step(
                 ReActStep(
                     step_number=step_number,
-                    thought="Forced conclusion (model failed to call conclude tool).",
+                    thought=(
+                        "Forced conclusion (model failed to call conclude tool)."
+                        + (
+                            " Strict JSON fallback: emitted minimal schema JSON due to empty/invalid conclude."
+                            if strict_json_fallback_used
+                            else ""
+                        )
+                    ),
                     action=ActionType.CONCLUDE.value,
                     action_input={"conclusion": final_answer},
                     observation=final_answer,
@@ -974,6 +1400,8 @@ class ReActAgent:
             reasoning=trajectory.get_trajectory_summary(),
             sources=_extract_sources(trajectory),
         )
+        # Reset per-call state to avoid leaking into the next call on the same agent instance.
+        self._current_requires_strict_json = False
         return response, trajectory
 
     def save_trajectory(self, output_path: str) -> None:
@@ -1105,6 +1533,79 @@ def _sanitize_thought(text: str) -> str:
     return cleaned
 
 
+def _has_metric_number(text: str) -> bool:
+    """
+    Return True if `text` contains a *quantitative* number/metric.
+
+    We intentionally do NOT treat chemical formulas like O2/CO2/H2 as "has number".
+    """
+    s = str(text or "")
+    if not s:
+        return False
+
+    # Decimal numbers (e.g., 0.83).
+    if re.search(r"\b\d+\.\d+\b", s):
+        return True
+
+    # E1/2-like electrochemical metric tokens: E1/2, E_{1/2}, E 1/2, etc.
+    if re.search(r"\bE\s*(?:_\{)?\s*1\s*/\s*2\s*(?:\})?", s, flags=re.IGNORECASE):
+        return True
+
+    # Numbers + common units/contexts (domain-light but useful).
+    if re.search(
+        r"\b\d+(?:\.\d+)?\s*(?:V|mV|mA|A|%|rpm|cm\s*(?:-2|\^-2)|A\s*g\s*(?:-1|\^-1)|mA\s*cm\s*(?:-2|\^-2))\b",
+        s,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    return False
+
+
+def _classify_junk_chunk(text: str, min_chars: int = 80, keep_if_has_number: bool = True) -> str:
+    """
+    Classify low-information chunks.
+
+    Returns:
+        ""      -> keep
+        "soft"  -> low-information fallback (may be backfilled if needed)
+        "hard"  -> hard junk (never backfilled)
+    """
+    s = str(text or "").strip()
+    if not s:
+        return "hard"
+
+    has_metric_number = _has_metric_number(s)
+
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    first = lines[0] if lines else ""
+
+    # Keywords-only chunks are hard junk.
+    if re.match(r"^(?:#{1,6}\s*)?keywords?\b", first, flags=re.IGNORECASE):
+        return "hard"
+
+    # Heading-only chunks are hard junk unless they contain a metric number.
+    if len(lines) == 1:
+        ln = lines[0]
+        if re.fullmatch(r"#{1,6}\s+\S.*", ln) and not has_metric_number:
+            return "hard"
+
+    # Too short and no quantitative anchor.
+    if len(s) < int(min_chars):
+        if keep_if_has_number and has_metric_number:
+            return ""
+        return "soft"
+
+    return ""
+
+
+def _is_junk_chunk(text: str, min_chars: int = 80, keep_if_has_number: bool = True) -> bool:
+    """
+    Backward-compatible boolean wrapper around `_classify_junk_chunk`.
+    """
+    return _classify_junk_chunk(text, min_chars=min_chars, keep_if_has_number=keep_if_has_number) in {"hard", "soft"}
+
+
 _VALID_ELEMENT_SYMBOLS: set[str] = {
     # Periodic table symbols (1-118). Used for lightweight element extraction from text.
     "H","He","Li","Be","B","C","N","O","F","Ne",
@@ -1153,7 +1654,11 @@ def _infer_task_constraints(
     # Prefer explicit fallback components (passed by the coordinator).
     if fallback_components:
         for c in fallback_components:
+            # Accept tokens like "Ni(69.00%)" but normalize to element symbols for guards.
             s = str(c).strip()
+            m = re.match(r"^\s*([A-Z][a-z]?)", s)
+            if m:
+                s = m.group(1)
             if s:
                 comps.append(s)
 
@@ -1245,7 +1750,17 @@ def _validate_conclusion_against_task(conclusion: str, required_components: List
     if not c:
         return False, "empty conclusion"
 
-    required = [str(x).strip() for x in (required_components or []) if str(x).strip()]
+    required = []
+    for x in (required_components or []):
+        s = str(x).strip()
+        if not s:
+            continue
+        # Normalize "Ni(69.00%)" -> "Ni" so the guard remains stable even if callers
+        # pass percentage-decorated component tokens.
+        m = re.match(r"^\s*([A-Z][a-z]?)", s)
+        if m:
+            s = m.group(1)
+        required.append(s)
     required_set = {x for x in required}
     if not required_set:
         return True, ""
@@ -1264,11 +1779,99 @@ def _validate_conclusion_against_task(conclusion: str, required_components: List
     if missing:
         return False, "missing required catalyst metal(s): " + ", ".join(missing)
 
-    forbidden = sorted(list(detected.difference(required_set.union(_ALLOWED_NON_CATALYST_ELEMENTS))))
-    if forbidden:
-        return False, "mentions forbidden element(s) not in task: " + ", ".join(forbidden)
-
     return True, ""
+
+
+def _extract_first_json_object(text: str) -> Optional[str]:
+    """
+    Best-effort extraction of the first top-level JSON object from a string.
+
+    This mirrors the debate coordinator's robustness so STRICT JSON fallbacks do not
+    accidentally override outputs that contain a valid JSON object plus extra text.
+    """
+    s = str(text or "")
+    start = s.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(s)):
+        ch = s[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start : i + 1]
+    return None
+
+
+def _try_parse_json_object(text: str) -> Optional[Dict[str, Any]]:
+    s = str(text or "").strip()
+    if not s:
+        return None
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    obj = _extract_first_json_object(s)
+    if obj:
+        try:
+            parsed = json.loads(obj)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return None
+    return None
+
+
+def _detect_strict_json_schema(system_prompt: str) -> str:
+    """
+    Infer which STRICT JSON schema the current debate phase expects.
+    """
+    sp = str(system_prompt or "")
+    if re.search(r"\"rebuttals\"\\s*:", sp):
+        return "rebuttals"
+    if re.search(r"\"reviews\"\\s*:", sp):
+        return "reviews"
+    low = sp.lower()
+    if "rebuttals" in low:
+        return "rebuttals"
+    if "reviews" in low:
+        return "reviews"
+    return "unknown"
+
+
+def _minimal_strict_json_payload(system_prompt: str) -> str:
+    """
+    Emit a minimal schema-compatible STRICT JSON payload for REVIEW/REBUTTAL.
+    """
+    schema = _detect_strict_json_schema(system_prompt)
+    if schema == "rebuttals":
+        payload: Dict[str, Any] = {"rebuttals": [], "revised_claim": None}
+    else:
+        # Default to REVIEW schema on unknown to keep the output parseable.
+        payload = {"reviews": []}
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _is_valid_json_object(text: str) -> bool:
+    return _try_parse_json_object(text) is not None
+
+
+def _is_valid_strict_json_payload(text: str, system_prompt: str) -> bool:
+    """
+    Validate that text contains a parseable JSON object matching the expected top-level key.
+    """
+    parsed = _try_parse_json_object(text)
+    if not isinstance(parsed, dict):
+        return False
+    schema = _detect_strict_json_schema(system_prompt)
+    if schema == "rebuttals":
+        return isinstance(parsed.get("rebuttals"), list)
+    # Default to reviews.
+    return isinstance(parsed.get("reviews"), list)
 
 
 def _extract_source_ids_from_text(text: str) -> List[str]:
@@ -1294,25 +1897,85 @@ def _validate_conclusion_against_task_with_evidence(
     conclusion: str,
     required_components: List[str],
     trajectory: Optional["ReActTrajectory"],
+    enforce_point_estimate: bool = True,
+    require_confidence: bool = True,
 ) -> Tuple[bool, str]:
     """
-    Stronger PROPOSE guard: in addition to element checks on the conclusion text,
-    reject conclusions that cite source_id chunks whose retrieved text clearly contains
-    forbidden (off-task) catalyst metals.
+    PROPOSE guard: enforce element checks on the conclusion text, and (best-effort)
+    flag when cited source_id chunks contain forbidden (off-task) catalyst metals.
+
+    IMPORTANT:
+    - We still BLOCK if the conclusion is missing any required task metal elements.
+    - We DO NOT block solely because the conclusion mentions additional elements or because a cited
+      chunk contains forbidden elements; we return a warning so the agent can still conclude without
+      getting stuck in retrieval loops.
     """
     ok, reason = _validate_conclusion_against_task(conclusion, required_components)
     if not ok:
         return ok, reason
 
+    warnings: List[str] = []
+    # Warn (but do not block) if the conclusion mentions additional catalyst metals beyond the task.
+    required = []
+    for x in (required_components or []):
+        s = str(x).strip()
+        if not s:
+            continue
+        m = re.match(r"^\s*([A-Z][a-z]?)", s)
+        if m:
+            s = m.group(1)
+        required.append(s)
+    required_set = {x for x in required}
+    detected = _extract_element_symbols(conclusion)
+    extra_elements = sorted(list(detected.difference(required_set.union(_ALLOWED_NON_CATALYST_ELEMENTS))))
+    if extra_elements:
+        warnings.append(
+            "conclusion mentions extra catalyst metal(s) not in task: "
+            + ", ".join([str(x) for x in extra_elements[:10]])
+        )
+
+    # PROPOSE metric-line rules: only enforce/warn on the `Performance Metrics:` line.
+    # We allow literature ranges elsewhere (Rationale/Evidence), but prefer a single point estimate + confidence
+    # on the designated metric line for downstream parsing/analytics.
+    if bool(enforce_point_estimate) or bool(require_confidence):
+        metrics_line: Optional[str] = None
+        for raw in (conclusion or "").splitlines():
+            if re.match(r"^\s*Performance Metrics\s*:", raw, flags=re.IGNORECASE):
+                metrics_line = raw.strip()
+                break
+
+        if not metrics_line:
+            warnings.append("missing_metrics_line (expected: 'Performance Metrics: <point estimate> (Confidence: ...)')")
+        else:
+            if bool(enforce_point_estimate):
+                has_pm = ("±" in metrics_line) or (re.search(r"\+/\-", metrics_line) is not None)
+                has_range = re.search(
+                    r"\b\d+(?:\.\d+)?\s*[-\u2013\u2014]\s*\d+(?:\.\d+)?\b", metrics_line
+                ) is not None
+                has_to = re.search(
+                    r"\b\d+(?:\.\d+)?\s+to\s+\d+(?:\.\d+)?\b", metrics_line, flags=re.IGNORECASE
+                ) is not None
+                if has_pm or has_range or has_to:
+                    warnings.append(
+                        "performance_metrics_should_be_point_estimate_plus_confidence (avoid ±/ranges on the Performance Metrics line)"
+                    )
+
+            if bool(require_confidence) and (re.search(r"\bconf(?:idence)?\.?\b", metrics_line, flags=re.IGNORECASE) is None):
+                warnings.append(
+                    "missing_confidence_on_performance_metrics_line (include 'Confidence:' or 'Conf.')"
+                )
+
     cited = _extract_source_ids_from_text(conclusion)
     if not cited or trajectory is None:
+        if warnings:
+            return True, "warning: " + " | ".join(warnings)
         return True, ""
 
     by_sid: Dict[str, Dict[str, Any]] = {}
     try:
         for step in getattr(trajectory, "steps", []) or []:
             for call in getattr(step, "tool_calls", []) or []:
-                if getattr(call, "tool_name", "") != ActionType.SEARCH_RAG.value:
+                if getattr(call, "tool_name", "") != ActionType.SEARCH_LITERATURE.value:
                     continue
                 data = getattr(call, "observation_data", None) or []
                 if not isinstance(data, list):
@@ -1338,12 +2001,13 @@ def _validate_conclusion_against_task_with_evidence(
             )
 
     if offenders:
-        return (
-            False,
+        warnings.append(
             "cited evidence appears off-task (forbidden catalyst metals in retrieved chunk): "
-            + "; ".join(offenders[:3]),
+            + "; ".join(offenders[:3])
         )
 
+    if warnings:
+        return True, "warning: " + " | ".join(warnings)
     return True, ""
 
 
@@ -1371,7 +2035,7 @@ def _fallback_thought(
     if step_number <= 0:
         return f"Plan: gather evidence for {rt} on {elems}, then conclude with grounded metrics and source_id."
 
-    if last_action in {"search_rag", "search_experience"}:
+    if last_action in {"search_literature", "search_experience"}:
         return f"Plan: pick the most on-target evidence (must match {elems}) and conclude."
     if last_action == "analyze":
         return f"Plan: conclude concisely for {rt} on {elems} with cited source_id."
@@ -1384,7 +2048,7 @@ def _collect_retrieved_source_ids_from_trajectory(trajectory: Optional[ReActTraj
     sids: set[str] = set()
     for step in getattr(trajectory, "steps", []) or []:
         for call in getattr(step, "tool_calls", []) or []:
-            if getattr(call, "tool_name", "") != ActionType.SEARCH_RAG.value:
+            if getattr(call, "tool_name", "") != ActionType.SEARCH_LITERATURE.value:
                 continue
             data = getattr(call, "observation_data", None) or []
             for item in data:
@@ -1393,7 +2057,7 @@ def _collect_retrieved_source_ids_from_trajectory(trajectory: Optional[ReActTraj
                     sids.add(sid)
     # Backward-compatible fallback (legacy single-tool steps).
     for step in getattr(trajectory, "steps", []) or []:
-        if getattr(step, "action_name", "") != ActionType.SEARCH_RAG.value:
+        if getattr(step, "action_name", "") != ActionType.SEARCH_LITERATURE.value:
             continue
         data = getattr(step, "observation_data", None) or []
         for item in data:
@@ -1434,7 +2098,7 @@ def _format_rag_observation(results: List[Dict[str, Any]]) -> str:
                 pass
         if source_id:
             head += f" [Source: {source_id}]"
-        # Optional task-alignment annotations (added by _tool_search_rag).
+        # Optional task-alignment annotations (added by _tool_search_literature).
         required = r.get("required_elements") or []
         match_n = r.get("element_match_count")
         if required and match_n is not None:
@@ -1504,14 +2168,14 @@ def _extract_sources(trajectory: ReActTrajectory) -> List[Dict[str, Any]]:
     for step in trajectory.steps:
         # New: multi-tool step support.
         for call in getattr(step, "tool_calls", []) or []:
-            if call.tool_name == ActionType.SEARCH_RAG.value and isinstance(call.observation_data, list):
+            if call.tool_name == ActionType.SEARCH_LITERATURE.value and isinstance(call.observation_data, list):
                 sources.extend(call.observation_data[:3])
             if call.tool_name == ActionType.SEARCH_EXPERIENCE.value and isinstance(call.observation_data, list):
                 sources.extend(call.observation_data[:2])
 
         # Backward-compatible fallback (legacy single-tool steps).
         action_name = getattr(step, "action_name", "")
-        if action_name == ActionType.SEARCH_RAG.value and isinstance(getattr(step, "observation_data", None), list):
+        if action_name == ActionType.SEARCH_LITERATURE.value and isinstance(getattr(step, "observation_data", None), list):
             sources.extend(getattr(step, "observation_data")[:3])
         if action_name == ActionType.SEARCH_EXPERIENCE.value and isinstance(getattr(step, "observation_data", None), list):
             sources.extend(getattr(step, "observation_data")[:2])

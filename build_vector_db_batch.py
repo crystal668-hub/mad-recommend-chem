@@ -153,6 +153,7 @@ def build_vector_databases_batch(
     embedding_batch_size: int = 10,
     max_workers: int = 4,
     sleep_between_batches: float = 0.5,
+    resume: bool = True,
     clear_existing: Optional[bool] = None,
     skip_if_exists: bool = False,
     continue_on_error: bool = True,
@@ -174,6 +175,7 @@ def build_vector_databases_batch(
         embedding_batch_size: embedding批大小
         max_workers: 并发worker数量（默认4；设为1可退回串行）
         sleep_between_batches: 每个agent在embedding batch之间的sleep（秒），用于简单限速（默认0.5）
+        resume: 断点续跑（默认True）；为True时会跳过已存在的chunk并补齐缺失部分
         clear_existing: True=自动清空已有collection；False=不清空（若已有则按skip_if_exists策略处理）；None=交互式询问
         skip_if_exists: collection已有数据时，跳过该collection的构建（避免重复id导致Chroma报错）
         continue_on_error: 某个agent失败后是否继续构建其他agent
@@ -265,6 +267,7 @@ def build_vector_databases_batch(
         return {}
 
     texts = [doc.text for doc in chunked_documents]
+    total_chunks = len(texts)
     raw_metadatas = [dict(doc.metadata or {}) for doc in chunked_documents]
     # Precompute stable ids + prepared metadata (chunk_id becomes a string uid; chunk_index preserved).
     chunk_ids, base_metadatas = _prepare_chroma_ids_and_metadatas(texts, raw_metadatas)
@@ -328,17 +331,38 @@ def build_vector_databases_batch(
                         f"Refusing to add duplicates (use --clear or --skip-if-exists)."
                     )
                 else:
-                    prompt = f"\nCollection '{collection_name}' already has {current_count} documents. Clear it? (y/n): "
-                    logger.info(prompt)
-                    user_input = input(prompt)
-                    if user_input.lower() == "y":
-                        vector_store.reset_collection()
-                        logger.info("✓ Collection cleared")
-                    else:
-                        raise RuntimeError(
-                            f"User chose not to clear collection '{collection_name}'. "
-                            f"Aborting this agent (use --skip-if-exists to ignore)."
+                    if resume:
+                        # Default: resumable indexing (skip existing chunk ids and only add missing).
+                        if current_count >= total_chunks:
+                            logger.info(
+                                f"Collection already has {current_count} documents (>= total_chunks={total_chunks}); "
+                                "treating as complete and skipping."
+                            )
+                            results[agent_name] = {
+                                "status": "skipped",
+                                "reason": "already_complete",
+                                "collection_name": collection_name,
+                                "document_count": current_count,
+                                "embedding_model": embedding_model,
+                                "embedding_provider": embedding_provider,
+                            }
+                            continue
+                        logger.info(
+                            f"Resume enabled: collection has {current_count} docs; will skip existing chunk ids and continue."
                         )
+                    else:
+                        # Legacy behaviour: ask whether to clear; if not, abort this agent.
+                        prompt = f"\nCollection '{collection_name}' already has {current_count} documents. Clear it? (y/n): "
+                        logger.info(prompt)
+                        user_input = input(prompt)
+                        if user_input.lower() == "y":
+                            vector_store.reset_collection()
+                            logger.info("✓ Collection cleared")
+                        else:
+                            raise RuntimeError(
+                                f"User chose not to clear collection '{collection_name}'. "
+                                f"Aborting this agent (use --skip-if-exists or --resume to continue)."
+                            )
 
             build_plan[agent_name] = {
                 "collection_name": collection_name,
@@ -383,12 +407,30 @@ def build_vector_databases_batch(
             f"[{agent_name}] Start embedding: total_chunks={total}, model={embedding_model}, provider={embedding_provider}, dim={dim}"
         )
 
+        already_present = 0
+        newly_added = 0
+
         # Stream embeddings -> Chroma in small batches to keep memory bounded.
         for start in range(0, total, int(embedding_batch_size)):
             end = min(start + int(embedding_batch_size), total)
             batch_texts = texts[start:end]
             batch_ids = chunk_ids[start:end]
             batch_metas = base_metadatas[start:end]
+
+            # Resume: skip ids that already exist (avoid duplicate-id errors and wasted embedding calls).
+            if resume:
+                with chroma_write_lock:
+                    existing_ids = vector_store.get_existing_ids(batch_ids)
+                if existing_ids:
+                    already_present += len(existing_ids)
+
+                missing_indices = [i for i, cid in enumerate(batch_ids) if cid not in existing_ids]
+                if not missing_indices:
+                    continue
+
+                batch_texts = [batch_texts[i] for i in missing_indices]
+                batch_ids = [batch_ids[i] for i in missing_indices]
+                batch_metas = [batch_metas[i] for i in missing_indices]
 
             batch_embeddings: List[List[float]] = []
             for text in batch_texts:
@@ -404,9 +446,10 @@ def build_vector_databases_batch(
                 vector_store.add_documents(
                     documents=batch_texts,
                     embeddings=batch_embeddings,
-                    metadatas=batch_metas,
+                    metadatas=[m.copy() for m in batch_metas],
                     ids=batch_ids,
                 )
+            newly_added += len(batch_ids)
 
             if sleep_between_batches and end < total:
                 time.sleep(float(sleep_between_batches))
@@ -417,13 +460,18 @@ def build_vector_databases_batch(
         with chroma_write_lock:
             final_count = vector_store.get_collection_count()
 
-        logger.info(f"[{agent_name}] Done: collection={collection_name}, count={final_count}")
+        logger.info(
+            f"[{agent_name}] Done: collection={collection_name}, count={final_count}, "
+            f"already_present={already_present}, newly_added={newly_added}"
+        )
         return {
             "status": "ok",
             "collection_name": collection_name,
             "document_count": final_count,
             "embedding_model": embedding_model,
             "embedding_provider": embedding_provider,
+            "already_present": already_present,
+            "newly_added": newly_added,
         }
 
     # Run agent builds concurrently.
@@ -507,6 +555,10 @@ def main() -> int:
         help="chunk overlap (default: config.rag.chunk_overlap or 50)",
     )
     parser.add_argument("--embedding-batch-size", dest="embedding_batch_size", type=int, default=10, help="embed batch size")
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument("--resume", dest="resume", action="store_true", help="resume from existing collection data")
+    resume_group.add_argument("--no-resume", dest="resume", action="store_false", help="disable resume; require clear/skip")
+    parser.set_defaults(resume=True)
     parser.add_argument(
         "--max-workers",
         dest="max_workers",
@@ -555,6 +607,7 @@ def main() -> int:
         embedding_batch_size=args.embedding_batch_size,
         max_workers=args.max_workers,
         sleep_between_batches=args.sleep_between_batches,
+        resume=bool(args.resume),
         clear_existing=clear_existing,
         skip_if_exists=bool(args.skip_if_exists),
         continue_on_error=not bool(args.fail_fast),

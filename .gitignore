@@ -45,6 +45,7 @@ data/raw/
 data/experience_db.json/
 *.db
 *.sqlite
+metadata/
 
 # Outputs
 outputs/

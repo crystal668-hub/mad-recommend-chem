@@ -1,279 +1,118 @@
-# Multi-Agent Metal Catalyst Overpotential Prediction System
+# MAD (Multi-Agent Debate) for Electrocatalysis Literature
 
-## Project Overview
+MAD is a multi-agent debate system for electrocatalysis analysis. Given **exactly 5 metal elements** (catalyst composition; optionally with relative percentages) and a **target reaction type**, the system debates and predicts the required performance metric(s) for that reaction (reaction-type specific; CO2RR includes main product + Faradaic efficiency).
 
-This project aims to predict the reaction type that produces the lowest overpotential through a multi-agent debate mechanism, where five metal elements act as catalysts. The system employs four different LLM Agents, combined with RAG (Retrieval-Augmented Generation) technology and the AutoGen multi-agent debate framework, to reach consensus through collaborative reasoning.
+It combines:
+- 4 configurable LLM agents (LangChain tool-calling ReAct runtime)
+- Chroma-backed RAG over a local Markdown literature corpus
+- A debate coordinator (default: "LangGraph-style", implemented in-repo; no external `langgraph` dependency)
+- Optional experience-store retrieval
 
-## 系统架构
+## Quickstart
 
-```
-MAD/
-├── config/              # 配置文件目录
-│   └── config.yaml     # 主配置文件
-├── data/               # 数据目录
-│   ├── raw/           # 原始Markdown文献数据
-│   └── chroma_db/     # 向量数据库（运行时生成）
-├── database/          # 数据库模块
-│   ├── rag_system.py  # RAG系统实现
-│   └── vector_store.py # 向量数据库管理
-├── agents/            # Agent模块
-│   ├── base_agent.py  # Agent基类
-│   ├── llm_agents.py  # 四个LLM Agent实现（支持ReAct）
-│   ├── agent_config.py # Agent配置
-│   ├── react_reasoning.py # 🆕 ReAct推理引擎
-│   └── react_agent.py # 🆕 ReAct Agent基类
-├── debate/            # 辩论模块
-│   └── autogen_coordinator.py  # AutoGen辩论协调器
-├── experience/        # 经验库模块
-│   ├── experience_store.py      # 经验库管理
-│   └── experience_extractor.py  # 经验提取
-├── utils/             # 工具模块
-│   ├── logger.py      # 日志工具
-│   └── helpers.py     # 辅助函数
-├── main.py            # 主程序入口
-├── examples.py        # 使用示例
-├── example_react.py   # 🆕 ReAct功能示例
-├── test_react.py      # 🆕 ReAct功能测试
-├── requirements.txt   # 依赖列表
-├── README.md         # 项目说明
-├── REACT_QUICKSTART.md # 🆕 ReAct快速入门
-├── REACT_CAPABILITY.md # 🆕 ReAct功能详解
-└── REACT_SUMMARY.md   # 🆕 ReAct改造总结
-```
+### 1) Install
+Tested with Python 3.11.
 
-## 核心功能
-
-### 1. 数据预处理（database/text_processor.py）
-- 加载Markdown文献并进行分块
-- **自动文本清洗**：去除无关段落（如致谢与参考文献）
-
-### 2. 数据库建立（database/）
-- 使用LlamaIndex对Markdown文档进行分块与索引构建
-- 采用Chroma向量数据库存储嵌入向量
-- 支持四个不同的embedding模型
-
-### 3. Agent Definition (agents/)
-- **Agent 1**: Based on OpenAI GPT-5.2
-- **Agent 2**: Based on DeepSeek V3.2
-- **Agent 3**: Based on Google Gemini-3-pro
-- **Agent 4**: Based on Qwen3-Max
-- Each Agent is equipped with an independent RAG system for retrieval augmentation
-- Specialized in analyzing metal catalyst performance and electrochemical reactions
-- **🆕 ReAct Capability**: All Agents support ReAct (Reasoning + Acting) reasoning mode
-  - Thought: Analysis and sub-goal decomposition
-  - Action: Tool selection (RAG search, experience query, analysis, conclusion)
-  - Observation: Retrieval results and experience data
-  - Complete reasoning trajectory tracking
-
-### 4. 多Agent辩论（debate/）
-- 基于Microsoft AutoGen框架实现
-- 四个Agent自由辩论直至达成共识
-- 确保最终结果和推理轨迹保持一致
-
-### 5. 经验提取（experience/）
-- 从辩论中提取完整的LLM推理链条（包括thinking模式）
-- 提取统一答案和关键论据
-- 构建经验库用于后续推理辅助
-- 支持经验检索和上下文增强
-
-## 安装指南
-
-### 环境要求
-- Python 3.9+
-- 至少8GB RAM
-
-### 安装步骤
-
-1. 克隆项目并进入目录
-```bash
-cd MAD
-```
-
-2. 创建虚拟环境
-```bash
-python -m venv venv
-# Windows
-venv\Scripts\activate
-# Linux/Mac
-source venv/bin/activate
-```
-
-3. 安装依赖
 ```bash
 pip install -r requirements.txt
 ```
 
-4. 配置环境变量
-创建 `.env` 文件并填入API密钥：
-```
-OPENAI_API_KEY=your_openai_api_key
-GOOGLE_API_KEY=your_google_api_key
-DEEPSEEK_API_KEY=your_openrouter_api_key_for_deepseek
-QWEN_API_KEY=your_qwen_api_key
-```
+### 2) Configure API keys
+Create a `.env` file in the project root:
 
-5. 准备数据
-将Markdown格式的化学文献数据放入 `data/raw/` 目录（可按反应类型分子目录）
-
-6. 构建向量数据库
 ```bash
-# 单个collection（可在脚本中指定agent_name）
+OPENAI_API_KEY=...
+DEEPSEEK_API_KEY=...
+GOOGLE_API_KEY=...
+QWEN_API_KEY=...
+VOYAGE_API_KEY=...
+```
+
+Notes:
+- Agent 1/2/3 default to OpenRouter endpoints (`base_url: https://openrouter.ai/api/v1`).
+- Agent 4 uses DashScope compatible-mode (`base_url: https://dashscope.aliyuncs.com/compatible-mode/v1`).
+- See `config/config.yaml` for the exact mapping.
+
+### 3) Prepare literature data
+Place Markdown papers under:
+
+```text
+data/raw/CO2RR/*.md
+data/raw/EOR/*.md
+data/raw/HER/*.md
+data/raw/HOR/*.md
+data/raw/HZOR/*.md
+data/raw/O5H/*.md
+data/raw/OER/*.md
+data/raw/ORR/*.md
+data/raw/UOR/*.md
+```
+
+### 4) Build vector databases (Chroma)
+Preferred: build per-agent collections via the batch script.
+
+```bash
+python build_vector_db_batch.py --agents agent1,agent2,agent3,agent4 --clear
+```
+
+Collections are stored in `vector_store.persist_directory` (default `./data/chroma_db`) and named:
+`<vector_store.collection_name>_<agent_name>` (e.g., `electrochemistry_literature_agent1`).
+
+Useful options:
+- `--max-workers 1` (sequential build)
+- `--embedding-batch-size 10`
+- `--sleep-between-batches 0.5`
+
+Legacy (single-agent) script:
+
+```bash
 python build_vector_db.py
-
-# 批量构建4个collection（agent1~agent4，各自embedding_model）
-python build_vector_db_batch.py --clear
 ```
 
-## 使用方法
-
-### 基本使用
+### 5) Run a debate
+Provide **exactly 5** metal elements (symbols only):
 
 ```bash
-# 传统方式：使用多Agent辩论
-python main.py --components "Pt,Pd,Ru,Ir,Rh"
-
-# 选择辩论引擎（默认：langgraph；可选：autogen）
-python main.py --components "Pt,Pd,Ru,Ir,Rh" --engine langgraph
-python main.py --components "Pt,Pd,Ru,Ir,Rh" --engine autogen
-
-# 🆕 ReAct方式：使用ReAct推理
-python example_react.py
+python main.py --components "Pt,Pd,Ru,Ir,Rh" --reaction-type CO2RR --engine langgraph
 ```
 
-### ReAct推理模式 🆕
-
-使用新的ReAct推理能力，获得透明的推理过程：
-
-```python
-from agents import create_agent
-
-# 创建具备ReAct能力的Agent
-agent = create_agent(
-    agent_type="openai",
-    agent_id="agent_1",
-    name="Catalyst Expert",
-    model_config=config,
-    rag_system=rag_system,
-    experience_store=experience_store
-)
-
-# 使用ReAct推理
-response, trajectory = agent.generate_response_with_react(
-    query="分析这些金属的催化性能",
-    components=["Pt", "Pd", "Ru"]
-)
-
-# 查看完整推理过程
-for step in trajectory.steps:
-    print(f"步骤{step.step_number}:")
-    print(f"  思考: {step.thought}")
-    print(f"  动作: {step.action.value}")
-    print(f"  观察: {step.observation}")
-```
-
-详细文档：
-- 快速入门: `REACT_QUICKSTART.md`
-- 完整文档: `REACT_CAPABILITY.md`
-- 改造说明: `REACT_SUMMARY.md`
-
-### 完整流程
-
-1. **构建向量数据库**
-```bash
-# 单个collection（可在脚本中指定agent_name）
-python build_vector_db.py
-
-# 批量构建4个collection（agent1~agent4，各自embedding_model）
-python build_vector_db_batch.py --clear
-```
-
-2. **Run debate system**
-```bash
-# Specify five metal catalyst elements for debate
-python main.py --components "Pt,Pd,Ru,Ir,Rh"
-```
-
-### 高级选项
+You may also provide relative percentages (the system will treat them as the electrode composition):
 
 ```bash
-# Specify configuration file
-python main.py --config config/custom_config.yaml --components "Pt,Pd,Ru"
-
-# Skip RAG initialization (quick test)
-python main.py --components "Pt,Pd,Ru" --skip-rag
-
-# 查看系统状态
-python main.py --status
-
-# 使用示例脚本
-python examples.py
-
-# 🆕 运行ReAct示例
-python example_react.py
-
-# 🆕 测试ReAct功能
-python test_react.py
+python main.py --components "Ni(69.00%), Co(19.07%), Fe(11.48%), Cu(0.40%), Zn(0.05%)" --reaction-type OER --engine langgraph
 ```
 
-## 配置说明
+Arguments:
+- `--components`: comma-separated 5 metal elements
+- `--reaction-type`: one of `CO2RR/EOR/HER/HOR/HZOR/O5H/OER/ORR/UOR` (recommended)
+- `--engine`: `langgraph` (default) or `autogen` (optional; requires extra dependency installation)
 
-所有配置项位于 `config/config.yaml`，主要包括：
+### Outputs
+- Results: `paths.outputs` (default `./outputs`) as `result_<timestamp>.json` (timestamp format: `YYYYMMDD_HHMMSS`)
+- Logs:
+  - rolling: `./logs/system.log`
+  - per-run: `./logs/runs/<run_id>/run.log` (plus `events.jsonl`, `db.log`, `debate.log`)
 
-- **LLM配置**: 四个Agent的模型选择和参数
-- **向量数据库配置**: Chroma数据库设置
-- **RAG配置**: 文本分块和检索参数
-- **辩论配置**: 轮数、超时、共识阈值
-- **经验库配置**: 存储路径和相关性阈值
+## Configuration
+All runtime configuration lives in `config/config.yaml`:
+- `llm.*`: per-agent provider/model + embedding settings
+- `vector_store.*`: Chroma persistence + base collection name
+- `rag.*`: chunking + retrieval parameters
+- `debate.*`: debate protocol parameters
+- `paths.outputs`: output directory for saved results
 
-## 工作流程
+## How it works (high level)
+- `database/text_processor.py`: load + chunk Markdown documents (LlamaIndex parsers)
+- `database/embedder.py`: multi-provider embeddings selected per agent
+- `database/vector_store.py`: Chroma persistence with stable chunk ids
+- `database/rag_system.py`: query embedding + Chroma similarity search
+- `agents/react_agent.py`: LangChain tool-calling ReAct agent (`search_literature`, `search_experience`)
+- `debate/langgraph_coordinator.py`: default debate coordinator and evidence enforcement
 
-1. **初始化阶段**
-   - 加载配置和初始化日志系统
-   - 构建RAG索引和向量数据库
-   - 初始化四个LLM Agent
+## Tests
+```bash
+python -m unittest discover -s test -p "test_*.py"
+```
 
-2. **Debate Phase**
-   - Input five metal catalyst elements
-   - Four Agents analyze based on RAG and experience store
-   - Evaluate catalytic performance, reaction mechanisms, and overpotential
-   - Consider metal properties: d-band center, work function, surface energy, etc.
-   - 通过AutoGen框架组织多轮辩论
-   - 监控共识达成情况
-
-3. **结果提取阶段**
-   - 提取最终一致的反应类型和过电势
-   - 提取推理轨迹和关键论据
-   - 存储到经验库供后续使用
-
-4. **输出阶段**
-   - 生成详细报告
-   - 可视化辩论过程
-   - 保存结果到文件
-
-## 项目特点
-
-✅ **模块化设计**: 功能解耦，易于维护和扩展  
-✅ **详细注释**: 代码注释完整，提升可读性  
-✅ **鲁棒性强**: 异常处理和错误恢复机制  
-✅ **可配置性**: 灵活的YAML配置系统  
-✅ **可扩展性**: 易于添加新的LLM或Agent  
-✅ **🆕 ReAct推理**: 透明的思考-行动-观察推理过程  
-✅ **🆕 轨迹追踪**: 完整记录推理链条，可解释AI  
-
-## 注意事项
-
-1. 确保API密钥有效且有足够的配额
-2. 首次运行需要下载embedding模型，可能需要较长时间
-3. 辩论过程可能消耗大量token，注意成本控制
-4. 建议定期备份经验库数据
-
-## 许可证
-
-MIT License
-
-## 联系方式
-
-如有问题或建议，请提交Issue或联系项目维护者。
-
----
-**项目创建日期**: 2025年12月20日
+## License
+MIT

@@ -49,7 +49,7 @@ class Agent2RAGAdapter:
         self.voyage_api_key = voyage_api_key
         self.top_k = top_k
 
-    def retrieve(self, query: str) -> List[Dict]:
+    def retrieve(self, query: str, top_k: int = 5, where=None) -> List[Dict]:
         client = voyageai.Client(api_key=self.voyage_api_key)
         result = client.embed(
             texts=[query],
@@ -57,9 +57,15 @@ class Agent2RAGAdapter:
             input_type="query"
         )
         query_embedding = result.embeddings[0]
+        try:
+            k = int(top_k) if top_k is not None else int(self.top_k)
+        except Exception:
+            k = int(self.top_k)
+        k = max(1, k)
         similar_docs = self.vector_store.similarity_search(
             query_embedding=query_embedding,
-            top_k=self.top_k
+            top_k=k,
+            where=where,
         )
         formatted = []
         for item in similar_docs:
@@ -83,7 +89,7 @@ def _collect_retrieved_source_ids(trajectory) -> Set[str]:
 
     for step in getattr(trajectory, "steps", []) or []:
         for call in getattr(step, "tool_calls", []) or []:
-            if getattr(call, "tool_name", "") != "search_rag":
+            if getattr(call, "tool_name", "") != "search_literature":
                 continue
             data = getattr(call, "observation_data", None) or []
             for item in data:
@@ -93,7 +99,7 @@ def _collect_retrieved_source_ids(trajectory) -> Set[str]:
 
     # Backward-compatible fallback (legacy single-tool steps).
     for step in getattr(trajectory, "steps", []) or []:
-        if getattr(step, "action_name", "") != "search_rag":
+        if getattr(step, "action_name", "") != "search_literature":
             continue
         data = getattr(step, "observation_data", None) or []
         for item in data:
@@ -115,7 +121,7 @@ def _evaluate_proposal(
     Lightweight "does this look like a debate proposal?" check.
 
     strict=True enforces:
-    - at least one search_rag tool call happened
+    - at least one search_literature tool call happened
     - final answer cites at least one verifiable source_id retrieved in the same run
     - conclude tool was called
     """
@@ -151,7 +157,7 @@ def _evaluate_proposal(
     # Separation rule guard (should be enforced by the agent, but we still validate).
     for step in getattr(trajectory, "steps", []) or []:
         names = {getattr(c, "tool_name", "") for c in (getattr(step, "tool_calls", []) or [])}
-        has_search = bool(names.intersection({"search_rag", "search_experience"}))
+        has_search = bool(names.intersection({"search_literature", "search_experience"}))
         has_analysis = bool(names.intersection({"analyze", "conclude"}))
         if has_search and has_analysis:
             problems.append(f"mixed_search_and_analysis_in_step_{getattr(step, 'step_number', '?')}")
@@ -163,11 +169,11 @@ def _evaluate_proposal(
             problems.append("no_source_id_retrieved")
 
         if not any(
-            getattr(c, "tool_name", "") == "search_rag"
+            getattr(c, "tool_name", "") == "search_literature"
             for step in getattr(trajectory, "steps", []) or []
             for c in (getattr(step, "tool_calls", []) or [])
         ):
-            problems.append("no_search_rag_call")
+            problems.append("no_search_literature_call")
 
         conclude_calls = [
             c

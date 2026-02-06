@@ -318,17 +318,17 @@ class VectorStore:
     
     def get_collection_count(self) -> int:
         """
-        获取集合中的文档数量
+        Get the number of documents in the collection
         
         Returns:
-            int: 文档数量
+            int: Number of documents
         """
         return self.collection.count()
     
     def reset_collection(self) -> None:
         """
-        重置集合（删除所有文档）
-        警告：此操作不可逆
+        Reset collection (delete all documents)
+        Warning: This operation is irreversible
         """
         self.client.delete_collection(name=self.collection_name)
         self.collection = self._get_or_create_collection()
@@ -336,12 +336,26 @@ class VectorStore:
     
     def get_all_documents(self) -> Dict:
         """
-        获取集合中的所有文档
+        Get all documents in the collection
         
         Returns:
-            Dict: 所有文档及其元数据
+            Dict: All documents and their metadata
         """
         return self.collection.get()
+
+    def get_existing_ids(self, ids: List[str]) -> set[str]:
+        """
+        Return the subset of `ids` that already exist in this collection.
+
+        This is useful for resumable/breakpoint indexing: after an interrupted run,
+        we can skip chunks that were already written, avoiding duplicate-id errors.
+        """
+        if not ids:
+            return set()
+        # Chroma returns an empty list if none of the ids exist.
+        result = self.collection.get(ids=list(ids), include=[])
+        existing = result.get("ids") if isinstance(result, dict) else None
+        return set(existing or [])
 
 
     def create_ids(

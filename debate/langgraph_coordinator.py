@@ -4,8 +4,10 @@ LangGraph-style Debate Coordinator (no external dependency required).
 Implements the agreed debate protocol:
 1) Propose (one proposal per model/agent)
 2) Repeat rounds of (Review -> Rebuttal -> Rule adjudication)
-   - A Review must (a) target a specific ReAct step_number AND (b) cite verifiable source_id.
-   - If a proposal fails to respond (with verifiable evidence) for 2 consecutive rounds -> defeated.
+   - Reviews/Rebuttals MAY be parametric (no evidence). Evidence is OPTIONAL but must be verifiable if provided.
+   - Valid reviews (with or without evidence) affect consensus/penalties; this prevents false consensus when
+     agents raise substantive parametric critiques but cannot retrieve matching chunks within budget.
+   - If a proposal fails to respond to valid reviews for N consecutive rounds -> defeated.
    - Agents can also voluntarily withdraw their proposal.
 
 Notes:
@@ -35,7 +37,7 @@ from prompts.debate_phase_prompts import (
     DEBATE_REBUTTAL_SYSTEM_PROMPT,
 )
 from utils.logger import get_run_id, make_debate_id, write_debate_artifacts
-from utils.source_id import is_valid_chroma_source_id
+from utils.source_id import is_valid_chroma_source_id, normalize_chroma_source_id
 
 logger = logging.getLogger("MAD.debate.langgraph")
 
@@ -75,7 +77,7 @@ class RebuttalOutput(BaseModel):
 
 
 # =========================
-# Result/Data Structures
+# Result Structures
 # =========================
 
 
@@ -112,6 +114,8 @@ class ProposalState:
     agent_name: str
     status: str = "active"  # active | withdrawn | defeated
     no_response_streak: int = 0
+    call_error_streak: int = 0
+    last_call_error: Optional[str] = None
 
     claim: str = ""
     propose_response: Optional[str] = None
@@ -168,9 +172,9 @@ class LangGraphDebateCoordinator:
         self.config = config or {}
 
         # Protocol params
-        self.max_rounds = int(self.config.get("max_rounds", 3))
+        self.max_rounds = int(self.config.get("max_rounds", 5))
         self.no_response_threshold = int(self.config.get("no_response_threshold", 2))
-        self.max_reviews_per_target = int(self.config.get("max_reviews_per_target", 1))
+        self.max_reviews_per_target = int(self.config.get("max_reviews_per_target", 2))
 
         # Runtime controls (to bound wall-clock time)
         self.max_concurrency = int(self.config.get("max_concurrency", max(1, len(self.agents))))
@@ -182,10 +186,28 @@ class LangGraphDebateCoordinator:
         # Per-agent-call request timeout (best-effort; enforced by the LLM client if supported).
         self.call_timeout_seconds = float(self.config.get("call_timeout", default_timeout))
 
-        # Dynamic ReAct step budgets per phase (defaults requested)
-        self.propose_max_react_steps = int(self.config.get("propose_max_react_steps", 8))
+        # Auto-withdraw policy: repeated timeouts/invalid_json should not drag the whole debate.
+        self.auto_withdraw_on_call_errors = bool(self.config.get("auto_withdraw_on_call_errors", True))
+        self.auto_withdraw_call_error_threshold = int(self.config.get("auto_withdraw_call_error_threshold", 2))
+        self.auto_withdraw_call_error_threshold = max(1, self.auto_withdraw_call_error_threshold)
+        raw_types = self.config.get("auto_withdraw_call_error_types", ["timeout", "invalid_json"])
+        types: List[str] = []
+        if isinstance(raw_types, list):
+            for t in raw_types:
+                s = str(t).strip().lower()
+                if s:
+                    types.append(s)
+        else:
+            s = str(raw_types).strip().lower()
+            if s:
+                types.append(s)
+        self.auto_withdraw_call_error_types = types or ["timeout", "invalid_json"]
+        self.auto_withdraw_status = str(self.config.get("auto_withdraw_status", "withdrawn")).strip() or "withdrawn"
+
+        # Dynamic ReAct step budgets per phase 
+        self.propose_max_react_steps = int(self.config.get("propose_max_react_steps", 5))
         self.review_max_react_steps = int(self.config.get("review_max_react_steps", 3))
-        self.rebuttal_max_react_steps = int(self.config.get("rebuttal_max_react_steps", 3))
+        self.rebuttal_max_react_steps = int(self.config.get("rebuttal_max_react_steps", 4))
         self._current_debate_id: Optional[str] = None
 
     # -------------------------
@@ -281,6 +303,7 @@ class LangGraphDebateCoordinator:
                 round_number=round_number,
                 round_reviews=round_reviews,
                 round_rebuttals=round_rebuttals,
+                round_review_calls=review_calls,
             )
 
             status_counts: Dict[str, int] = {}
@@ -306,11 +329,6 @@ class LangGraphDebateCoordinator:
             debate_history.extend(self._format_round_history(round_number, round_reviews, round_rebuttals, proposals))
 
             if round_consensus:
-                consensus_reached = True
-                break
-
-            # If nothing changes and there are no valid reviews, we are done.
-            if not round_changed and not any(r.valid for r in round_reviews):
                 consensus_reached = True
                 break
 
@@ -485,6 +503,68 @@ class LangGraphDebateCoordinator:
 
         return proposals
 
+    def _apply_auto_withdraw_policy(
+        self,
+        proposals: Dict[str, ProposalState],
+        from_id: str,
+        phase: str,
+        err: Optional[str],
+        round_number: int,
+        call_history: List[Dict[str, Any]],
+    ) -> None:
+        """
+        Auto-withdraw an agent's proposal after repeated call errors (e.g., timeout/invalid_json).
+
+        This helps debates converge faster by preventing a consistently failing agent from consuming
+        the full wall-clock timeout budget every round.
+        """
+        if not self.auto_withdraw_on_call_errors:
+            return
+        p = proposals.get(from_id)
+        if p is None or p.status != "active":
+            return
+
+        err_norm = str(err or "").strip().lower()
+        if err_norm in set(self.auto_withdraw_call_error_types):
+            p.call_error_streak = int(getattr(p, "call_error_streak", 0) or 0) + 1
+            p.last_call_error = err_norm
+        else:
+            p.call_error_streak = 0
+            p.last_call_error = err_norm or None
+
+        if p.call_error_streak < self.auto_withdraw_call_error_threshold:
+            return
+
+        p.status = self.auto_withdraw_status
+        call_history.append(
+            {
+                "type": "auto_withdraw",
+                "phase": str(phase or ""),
+                "round": int(round_number),
+                "from_proposal_id": from_id,
+                "agent_name": p.agent_name,
+                "reason": err_norm or None,
+                "streak": p.call_error_streak,
+                "threshold": self.auto_withdraw_call_error_threshold,
+                "new_status": p.status,
+            }
+        )
+        logger.warning(
+            "langgraph_auto_withdraw",
+            extra={
+                "event": "langgraph.auto_withdraw",
+                "debate_id": self._current_debate_id,
+                "round": round_number,
+                "phase": phase,
+                "from_proposal_id": from_id,
+                "agent_name": p.agent_name,
+                "reason": err_norm,
+                "streak": p.call_error_streak,
+                "threshold": self.auto_withdraw_call_error_threshold,
+                "new_status": p.status,
+            },
+        )
+
     # -------------------------
     # Phase: Review
     # -------------------------
@@ -539,7 +619,7 @@ class LangGraphDebateCoordinator:
             if not targets:
                 continue
 
-            review_prompt = self._build_review_prompt(round_number, from_id, proposals, targets)
+            review_prompt = self._build_review_prompt(round_number, from_id, proposals, targets, reaction_type)
             task_inputs[from_id] = (agent, review_prompt, targets)
 
         phase_deadline = deadline_ts if deadline_ts is not None else (time.time() + self.round_timeout_seconds)
@@ -576,22 +656,39 @@ class LangGraphDebateCoordinator:
                     err = str(e)
 
                 retrieved_ids = _collect_retrieved_source_ids(trajectory)
+                raw_output = (response.content if response else "") or ""
+
+                parsed, parsed_ok = _parse_json_output(raw_output, expected_key="reviews")
+                validated, schema_ok = _validate_review_output(parsed)
+
+                # Prevent false consensus: an invalid review output should be treated as an error
+                # for the purposes of "0 valid reviews => consensus".
+                if err is None and (not parsed_ok or not schema_ok):
+                    err = "invalid_json"
+
                 call_history.append(
                     {
                         "type": "review_call",
                         "round": round_number,
                         "from_proposal_id": from_id,
                         "targets": targets,
-                        "raw_output": (response.content if response else ""),
+                        "raw_output": raw_output,
                         "trajectory": trajectory.to_dict() if trajectory else None,
                         "retrieved_source_ids": sorted(retrieved_ids),
+                        "parsed_ok": parsed_ok,
+                        "schema_ok": schema_ok,
                         "error": err,
                         "time_elapsed": time.time() - call_starts.get(from_id, time.time()),
                     }
                 )
-
-                parsed = _parse_json_output(response.content if response else "", expected_key="reviews")
-                validated = _validate_review_output(parsed)
+                self._apply_auto_withdraw_policy(
+                    proposals=proposals,
+                    from_id=from_id,
+                    phase="review",
+                    err=err,
+                    round_number=round_number,
+                    call_history=call_history,
+                )
 
                 selected = validated.reviews[: len(targets) * self.max_reviews_per_target]
                 valid_count = 0
@@ -625,6 +722,8 @@ class LangGraphDebateCoordinator:
                         "time_elapsed": time.time() - call_starts.get(from_id, time.time()),
                         "error": err,
                         "retrieved_source_id_count": len(retrieved_ids),
+                        "parsed_ok": parsed_ok,
+                        "schema_ok": schema_ok,
                         "parsed_reviews": len(validated.reviews),
                         "emitted_reviews": len(selected),
                         "valid_reviews": valid_count,
@@ -646,9 +745,19 @@ class LangGraphDebateCoordinator:
                         "raw_output": "",
                         "trajectory": None,
                         "retrieved_source_ids": [],
+                        "parsed_ok": False,
+                        "schema_ok": False,
                         "error": "timeout",
                         "time_elapsed": time.time() - call_starts.get(from_id, time.time()),
                     }
+                )
+                self._apply_auto_withdraw_policy(
+                    proposals=proposals,
+                    from_id=from_id,
+                    phase="review",
+                    err="timeout",
+                    round_number=round_number,
+                    call_history=call_history,
                 )
                 logger.warning(
                     "langgraph_review_timeout",
@@ -686,6 +795,7 @@ class LangGraphDebateCoordinator:
         for r in round_reviews:
             if not r.valid:
                 continue
+            # Rebut against all valid reviews (evidence is optional).
             valid_reviews_by_target.setdefault(r.target_proposal_id, []).append(r)
 
         # Pre-build prompts then execute calls in parallel.
@@ -699,7 +809,7 @@ class LangGraphDebateCoordinator:
             if not target_reviews:
                 continue
 
-            rebuttal_prompt = self._build_rebuttal_prompt(round_number, from_id, proposals[from_id], target_reviews)
+            rebuttal_prompt = self._build_rebuttal_prompt(round_number, from_id, proposals[from_id], target_reviews, reaction_type)
             task_inputs[from_id] = (agent, rebuttal_prompt, target_reviews)
 
         phase_deadline = deadline_ts if deadline_ts is not None else (time.time() + self.round_timeout_seconds)
@@ -736,31 +846,46 @@ class LangGraphDebateCoordinator:
                     err = str(e)
 
                 retrieved_ids = _collect_retrieved_source_ids(trajectory)
-                call_history.append(
-                    {
-                        "type": "rebuttal_call",
-                        "round": round_number,
-                        "from_proposal_id": from_id,
-                        "target_review_ids": [r.review_id for r in target_reviews],
-                        "raw_output": (response.content if response else ""),
-                        "trajectory": trajectory.to_dict() if trajectory else None,
-                        "retrieved_source_ids": sorted(retrieved_ids),
-                        "error": err,
-                        "time_elapsed": time.time() - call_starts.get(from_id, time.time()),
-                    }
+                raw_output = (response.content if response else "") or ""
+
+                parsed, parsed_ok = _parse_json_output(raw_output, expected_key="rebuttals")
+                validated, schema_ok = _validate_rebuttal_output(parsed)
+
+                # Helpful for debugging + consistent error reporting across phases.
+                if err is None and (not parsed_ok or not schema_ok):
+                    err = "invalid_json"
+
+                call_record: Dict[str, Any] = {
+                    "type": "rebuttal_call",
+                    "round": round_number,
+                    "from_proposal_id": from_id,
+                    "target_review_ids": [r.review_id for r in target_reviews],
+                    "raw_output": raw_output,
+                    "trajectory": trajectory.to_dict() if trajectory else None,
+                    "retrieved_source_ids": sorted(retrieved_ids),
+                    "parsed_ok": parsed_ok,
+                    "schema_ok": schema_ok,
+                    "error": err,
+                    "time_elapsed": time.time() - call_starts.get(from_id, time.time()),
+                    # Audits (filled after validation/patching below).
+                    "revised_claim_present": bool(validated.revised_claim and validated.revised_claim.strip()),
+                    "revised_claim_patched": False,
+                    "revised_claim_patch_source_ids": [],
+                }
+                call_history.append(call_record)
+                self._apply_auto_withdraw_policy(
+                    proposals=proposals,
+                    from_id=from_id,
+                    phase="rebuttal",
+                    err=err,
+                    round_number=round_number,
+                    call_history=call_history,
                 )
-
-                parsed = _parse_json_output(response.content if response else "", expected_key="rebuttals")
-                validated = _validate_rebuttal_output(parsed)
-
-                # Optional claim revision
-                did_revise_claim = False
-                if validated.revised_claim and validated.revised_claim.strip():
-                    proposals[from_id].claim = validated.revised_claim.strip()
-                    did_revise_claim = True
 
                 valid_count = 0
                 invalid_count = 0
+                valid_evidence_sids: List[str] = []
+                _seen_sid: Set[str] = set()
                 for item_idx, item in enumerate(validated.rebuttals):
                     rebuttal_id = f"reb_r{round_number}_{from_id}_{item_idx}"
                     rebuttal = self._validate_rebuttal_item(
@@ -773,6 +898,11 @@ class LangGraphDebateCoordinator:
                     )
                     if rebuttal.valid:
                         valid_count += 1
+                        for ev in rebuttal.evidence or []:
+                            sid = ev.get("source_id")
+                            if sid and sid not in _seen_sid:
+                                _seen_sid.add(str(sid))
+                                valid_evidence_sids.append(str(sid))
                     else:
                         invalid_count += 1
                     rebuttals.append(rebuttal)
@@ -781,6 +911,30 @@ class LangGraphDebateCoordinator:
                     # If agent explicitly withdraws, reflect immediately.
                     if rebuttal.valid and rebuttal.response_mode == "withdraw":
                         proposals[from_id].status = "withdrawn"
+
+                # Optional claim revision (evidence is optional; if present and revised_claim lacks source_ids, patch an Evidence line).
+                did_revise_claim = False
+                revised_claim_patched = False
+                patch_sids: List[str] = []
+                if validated.revised_claim and validated.revised_claim.strip():
+                    revised_claim_text = validated.revised_claim.strip()
+
+                    # Prefer source_ids the agent actually used as evidence; fall back to any retrieved ids.
+                    patch_candidates = [sid for sid in valid_evidence_sids if is_valid_chroma_source_id(sid)]
+                    if not patch_candidates:
+                        patch_candidates = [sid for sid in sorted(retrieved_ids) if is_valid_chroma_source_id(sid)]
+
+                    if patch_candidates and not any(sid in revised_claim_text for sid in patch_candidates):
+                        patch_sids = patch_candidates[:3]
+                        revised_claim_text = revised_claim_text.rstrip() + "\nEvidence: " + "; ".join(patch_sids)
+                        revised_claim_patched = True
+
+                    proposals[from_id].claim = revised_claim_text
+                    did_revise_claim = True
+
+                call_record["revised_claim_present"] = bool(validated.revised_claim and validated.revised_claim.strip())
+                call_record["revised_claim_patched"] = revised_claim_patched
+                call_record["revised_claim_patch_source_ids"] = patch_sids
 
                 logger.info(
                     "langgraph_rebuttal_call",
@@ -793,6 +947,8 @@ class LangGraphDebateCoordinator:
                         "time_elapsed": time.time() - call_starts.get(from_id, time.time()),
                         "error": err,
                         "retrieved_source_id_count": len(retrieved_ids),
+                        "parsed_ok": parsed_ok,
+                        "schema_ok": schema_ok,
                         "parsed_rebuttals": len(validated.rebuttals),
                         "valid_rebuttals": valid_count,
                         "invalid_rebuttals": invalid_count,
@@ -814,9 +970,19 @@ class LangGraphDebateCoordinator:
                         "raw_output": "",
                         "trajectory": None,
                         "retrieved_source_ids": [],
+                        "parsed_ok": False,
+                        "schema_ok": False,
                         "error": "timeout",
                         "time_elapsed": time.time() - call_starts.get(from_id, time.time()),
                     }
+                )
+                self._apply_auto_withdraw_policy(
+                    proposals=proposals,
+                    from_id=from_id,
+                    phase="rebuttal",
+                    err="timeout",
+                    round_number=round_number,
+                    call_history=call_history,
                 )
                 logger.warning(
                     "langgraph_rebuttal_timeout",
@@ -843,6 +1009,7 @@ class LangGraphDebateCoordinator:
         round_number: int,
         round_reviews: List[DebateReview],
         round_rebuttals: List[DebateRebuttal],
+        round_review_calls: List[Dict[str, Any]],
     ) -> Tuple[bool, bool]:
         """
         Returns:
@@ -852,10 +1019,15 @@ class LangGraphDebateCoordinator:
 
         active_ids = [pid for pid, p in proposals.items() if p.status == "active"]
 
-        valid_reviews_by_target: Dict[str, List[DebateReview]] = {}
+        # Valid reviews (with OR without evidence) affect consensus/penalties.
+        # Evidence remains OPTIONAL, but if present must be verifiable (validated elsewhere).
+        reviews_by_target: Dict[str, List[DebateReview]] = {}
         for r in round_reviews:
-            if r.valid and r.target_proposal_id in active_ids:
-                valid_reviews_by_target.setdefault(r.target_proposal_id, []).append(r)
+            if not r.valid:
+                continue
+            if r.target_proposal_id not in active_ids:
+                continue
+            reviews_by_target.setdefault(r.target_proposal_id, []).append(r)
 
         valid_rebuttals_by_review: Dict[str, List[DebateRebuttal]] = {}
         for reb in round_rebuttals:
@@ -863,13 +1035,19 @@ class LangGraphDebateCoordinator:
                 valid_rebuttals_by_review.setdefault(reb.target_review_id, []).append(reb)
 
         # Consensus: no valid reviews among active proposals
-        total_valid_reviews = sum(len(v) for v in valid_reviews_by_target.values())
+        total_valid_reviews = sum(len(v) for v in reviews_by_target.values())
         if total_valid_reviews == 0:
             # Reset streaks as nobody is being challenged this round.
             for pid in active_ids:
                 if proposals[pid].no_response_streak != 0:
                     proposals[pid].no_response_streak = 0
                     changed = True
+            # "0 valid reviews => consensus" ONLY if the review phase calls completed cleanly.
+            # Otherwise we can get false consensus due to timeouts,
+            # exceptions, or invalid JSON being interpreted as "no reviews".
+            review_call_has_error = any(str((c or {}).get("error") or "").strip() for c in (round_review_calls or []))
+            if review_call_has_error:
+                return changed, False
             return changed, True
 
         for pid in active_ids:
@@ -877,13 +1055,13 @@ class LangGraphDebateCoordinator:
             if p.status != "active":
                 continue
 
-            target_reviews = valid_reviews_by_target.get(pid, [])
+            target_reviews = reviews_by_target.get(pid, [])
             if not target_reviews:
                 if p.no_response_streak != 0:
                     p.no_response_streak = 0
                     changed = True
                 continue
-
+            # To record "no response" for a review
             unresolved = []
             for r in target_reviews:
                 responses = valid_rebuttals_by_review.get(r.review_id, [])
@@ -943,22 +1121,21 @@ class LangGraphDebateCoordinator:
                 invalid_reason = "target_step_not_found"
 
         evidence = [e.model_dump() for e in item.evidence]
-        if valid:
-            if not evidence:
+        if valid and evidence:
+            # If evidence is provided, it must be verifiable: cite at least ONE canonical source_id that was
+            # actually retrieved in THIS agent call's trajectory.
+            retrieved_norm = {
+                normalize_chroma_source_id(sid) for sid in (retrieved_source_ids or set()) if sid
+            }
+            sids = [e.get("source_id") for e in evidence if e.get("source_id")]
+            verifiable = []
+            for sid in sids:
+                sid_norm = normalize_chroma_source_id(sid)
+                if sid_norm in retrieved_norm and is_valid_chroma_source_id(sid_norm):
+                    verifiable.append(sid)
+            if not verifiable:
                 valid = False
-                invalid_reason = "missing_evidence"
-            else:
-                # Evidence must be verifiable: cite at least ONE canonical source_id that was
-                # actually retrieved in THIS agent call's trajectory.
-                sids = [e.get("source_id") for e in evidence if e.get("source_id")]
-                verifiable = [
-                    sid
-                    for sid in sids
-                    if sid in retrieved_source_ids and is_valid_chroma_source_id(sid)
-                ]
-                if not verifiable:
-                    valid = False
-                    invalid_reason = "evidence_not_verifiable_in_trajectory"
+                invalid_reason = "evidence_not_verifiable_in_trajectory"
 
         return DebateReview(
             review_id=review_id,
@@ -996,19 +1173,24 @@ class LangGraphDebateCoordinator:
 
         evidence = [e.model_dump() for e in item.evidence]
         if valid and mode in {"defend", "revise"}:
-            if not evidence:
+            if not str(item.response or "").strip():
                 valid = False
-                invalid_reason = "missing_evidence"
-            else:
-                sids = [e.get("source_id") for e in evidence if e.get("source_id")]
-                verifiable = [
-                    sid
-                    for sid in sids
-                    if sid in retrieved_source_ids and is_valid_chroma_source_id(sid)
-                ]
-                if not verifiable:
-                    valid = False
-                    invalid_reason = "evidence_not_verifiable_in_trajectory"
+                invalid_reason = "empty_response"
+
+        # Evidence is optional for rebuttals, but if provided it must be verifiable.
+        if valid and evidence:
+            retrieved_norm = {
+                normalize_chroma_source_id(sid) for sid in (retrieved_source_ids or set()) if sid
+            }
+            sids = [e.get("source_id") for e in evidence if e.get("source_id")]
+            verifiable = []
+            for sid in sids:
+                sid_norm = normalize_chroma_source_id(sid)
+                if sid_norm in retrieved_norm and is_valid_chroma_source_id(sid_norm):
+                    verifiable.append(sid)
+            if not verifiable:
+                valid = False
+                invalid_reason = "evidence_not_verifiable_in_trajectory"
 
         return DebateRebuttal(
             rebuttal_id=rebuttal_id,
@@ -1032,13 +1214,19 @@ class LangGraphDebateCoordinator:
         reviewer_id: str,
         proposals: Dict[str, ProposalState],
         target_ids: List[str],
+        reaction_type: Optional[str],
     ) -> str:
+        rt = (reaction_type or "UNKNOWN").strip() or "UNKNOWN"
         parts = [
             f"REVIEW phase (Round {round_number}).",
+            f"Target reaction: {rt}",
             "You are assigned to review ONLY the target proposal(s) listed below (do not review yourself).",
-            f"Write up to {self.max_reviews_per_target} review item(s) per target proposal, and include AT LEAST 1 item per target.",
+            f"Write up to {self.max_reviews_per_target} review item(s) per target proposal.",
+            "Evidence is preferred but OPTIONAL.",
+            "If you provide evidence, cite at least one verifiable source_id retrieved in THIS call.",
+            "If you critique from parametric knowledge, set evidence to an empty list: \"evidence\": [].",
+            "If you cannot find a useful critique within the step budget, return an empty reviews list.",
             "Target a specific step_number that exists in the target's trajectory.",
-            "Use `search_rag` and cite at least one verifiable source_id.",
             "Return STRICT JSON only (follow the schema in the system prompt).",
         ]
 
@@ -1049,7 +1237,7 @@ class LangGraphDebateCoordinator:
             parts.append(f"claim:\n{t.claim}\n")
             parts.append("trajectory_steps:")
             steps = t.propose_trajectory.steps if t.propose_trajectory else []
-            for s in steps[:8]:
+            for s in steps[:6]:
                 # Keep short; reviewer can target step_number.
                 obs = s.observation or ""
                 obs = obs[:300] + ("...(truncated)" if len(obs) > 300 else "")
@@ -1063,11 +1251,15 @@ class LangGraphDebateCoordinator:
         proposal_id: str,
         proposal: ProposalState,
         target_reviews: List[DebateReview],
+        reaction_type: Optional[str],
     ) -> str:
+        rt = (reaction_type or "UNKNOWN").strip() or "UNKNOWN"
         parts = [
             f"REBUTTAL phase (Round {round_number}).",
+            f"Target reaction: {rt}",
             "Respond to EACH review below by its review_id.",
-            "If you defend or revise, use `search_rag` and cite at least one verifiable source_id.",
+            "If you defend or revise, evidence is preferred but OPTIONAL. If you provide evidence, cite at least one verifiable source_id retrieved in THIS call.",
+            "If you revise and you retrieved verifiable evidence, you SHOULD cite at least one source_id (either in evidence or appended as an Evidence line in revised_claim).",
             "Return STRICT JSON only (follow the schema in the system prompt).",
             "\n--- YOUR PROPOSAL ---",
             f"proposal_id: {proposal.proposal_id}",
@@ -1187,19 +1379,24 @@ class LangGraphDebateCoordinator:
 # =========================
 
 
-def _parse_json_output(text: str, expected_key: str) -> Dict[str, Any]:
+def _parse_json_output(text: str, expected_key: str) -> Tuple[Dict[str, Any], bool]:
     """
     Best-effort extraction of a JSON object from LLM output.
+
+    Returns:
+        (parsed, parsed_ok)
     """
     if not text:
-        return {expected_key: []}
+        return {expected_key: []}, False
 
     # Prefer fenced ```json blocks
     fence_match = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
     if fence_match:
         candidate = fence_match.group(1)
         try:
-            return json.loads(candidate)
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed, True
         except Exception:
             pass
 
@@ -1207,11 +1404,13 @@ def _parse_json_output(text: str, expected_key: str) -> Dict[str, Any]:
     obj = _extract_first_json_object(text)
     if obj is not None:
         try:
-            return json.loads(obj)
+            parsed = json.loads(obj)
+            if isinstance(parsed, dict):
+                return parsed, True
         except Exception:
             pass
 
-    return {expected_key: []}
+    return {expected_key: []}, False
 
 
 def _extract_first_json_object(text: str) -> Optional[str]:
@@ -1230,19 +1429,19 @@ def _extract_first_json_object(text: str) -> Optional[str]:
     return None
 
 
-def _validate_review_output(parsed: Dict[str, Any]) -> ReviewOutput:
+def _validate_review_output(parsed: Dict[str, Any]) -> Tuple[ReviewOutput, bool]:
     try:
-        return ReviewOutput.model_validate(parsed)
+        return ReviewOutput.model_validate(parsed), True
     except ValidationError:
         # Accept empty on invalid format to avoid crashing the debate.
-        return ReviewOutput(reviews=[])
+        return ReviewOutput(reviews=[]), False
 
 
-def _validate_rebuttal_output(parsed: Dict[str, Any]) -> RebuttalOutput:
+def _validate_rebuttal_output(parsed: Dict[str, Any]) -> Tuple[RebuttalOutput, bool]:
     try:
-        return RebuttalOutput.model_validate(parsed)
+        return RebuttalOutput.model_validate(parsed), True
     except ValidationError:
-        return RebuttalOutput(rebuttals=[], revised_claim=None)
+        return RebuttalOutput(rebuttals=[], revised_claim=None), False
 
 
 def _collect_retrieved_source_ids(trajectory: Optional[ReActTrajectory]) -> Set[str]:
@@ -1252,7 +1451,7 @@ def _collect_retrieved_source_ids(trajectory: Optional[ReActTrajectory]) -> Set[
     for step in trajectory.steps:
         # New: one ACTION step can contain multiple tool calls.
         for call in getattr(step, "tool_calls", []) or []:
-            if getattr(call, "tool_name", "") != "search_rag":
+            if getattr(call, "tool_name", "") != "search_literature":
                 continue
             data = getattr(call, "observation_data", None) or []
             if not isinstance(data, list):
@@ -1263,7 +1462,7 @@ def _collect_retrieved_source_ids(trajectory: Optional[ReActTrajectory]) -> Set[
                     sids.add(sid)
 
         # Backward-compatible fallback (legacy single-tool steps).
-        if getattr(step, "action_name", "") == "search_rag" and isinstance(getattr(step, "observation_data", None), list):
+        if getattr(step, "action_name", "") == "search_literature" and isinstance(getattr(step, "observation_data", None), list):
             data = getattr(step, "observation_data", None) or []
             for item in data:
                 sid = item.get("source_id")

@@ -24,6 +24,11 @@ from utils.source_id import (
     parse_chroma_source_id,
     is_valid_chroma_source_id,
 )
+from utils.electrode_composition import (
+    parse_components_with_percent,
+    build_electrode_composition,
+    format_electrode_composition,
+)
 
 __all__ = [
     'Logger',
@@ -48,4 +53,7 @@ __all__ = [
     'build_chroma_source_id',
     'parse_chroma_source_id',
     'is_valid_chroma_source_id',
+    'parse_components_with_percent',
+    'build_electrode_composition',
+    'format_electrode_composition',
 ]
