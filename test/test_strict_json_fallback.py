@@ -58,6 +58,49 @@ class _DummyLLM:
 
 
 class StrictJsonFallbackTests(unittest.TestCase):
+    def test_propose_strict_json_fallback_emits_minimal_schema_json(self):
+        from agents.react_agent import ReActAgent
+        from prompts.debate_phase_prompts import DEBATE_PROPOSE_SYSTEM_PROMPT
+
+        dummy_llm = _DummyLLM()
+
+        with patch(
+            "agents.react_agent._lazy_langchain_imports",
+            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
+        ):
+            agent = ReActAgent(
+                agent_id="t_prop",
+                name="test",
+                model_config={"deadline_mode": True},
+                rag_system=None,
+                experience_store=None,
+                system_prompt="",
+                max_react_steps=10,
+                verbose=False,
+            )
+
+            with patch.object(agent, "_get_llm", return_value=dummy_llm), patch.object(
+                agent, "_build_tools", return_value=([], {})
+            ):
+                response, trajectory = agent.generate_response_with_react(
+                    query="STRICT JSON fallback test (propose).",
+                    components=["Ni", "Fe", "Co"],
+                    system_prompt_override=DEBATE_PROPOSE_SYSTEM_PROMPT,
+                    max_steps_override=1,
+                )
+
+        parsed = json.loads(response.content)
+        self.assertIsInstance(parsed, dict)
+        self.assertIn("reaction_type", parsed)
+        self.assertIn("electrode_composition", parsed)
+        self.assertIn("catalyst_metal_elements", parsed)
+        self.assertIn("performance_metrics", parsed)
+        self.assertIn("confidence", parsed)
+        self.assertIn("evidence", parsed)
+        self.assertIsInstance(parsed["evidence"], list)
+        self.assertEqual(len(getattr(trajectory, "steps", []) or []), 1)
+        self.assertIn("Strict JSON fallback", getattr(trajectory.steps[0], "thought", "") or "")
+
     def test_review_strict_json_fallback_emits_minimal_schema_json(self):
         from agents.react_agent import ReActAgent
         from prompts.debate_phase_prompts import DEBATE_REVIEW_SYSTEM_PROMPT

@@ -1,7 +1,7 @@
 """
 ===================================
-Agent配置模块
-功能：从配置文件加载和管理Agent配置
+Agent Configuration Management
+Functionality: Load and manage Agent configurations from a configuration file
 ===================================
 """
 
@@ -14,16 +14,16 @@ from agents.react_agent import ReActAgent
 
 class AgentConfig:
     """
-    Agent配置管理类
-    负责从配置文件加载Agent设置并创建Agent实例
+    Agent Configuration Management Class
+    Responsible for loading agent settings from a configuration file and creating agent instances.
     """
     
     def __init__(self, config: Union[str, Dict]):
         """
-        初始化Agent配置
+        Initialize Agent configuration
         
         Args:
-            config: 配置文件路径（str）或配置字典（Dict）
+            config: Path to configuration file (str) or configuration dictionary (Dict)
         """
         if isinstance(config, dict):
             self.config = config
@@ -34,10 +34,10 @@ class AgentConfig:
         
     def _load_config(self) -> Dict:
         """
-        加载配置文件
+        Load configuration file
         
         Returns:
-            Dict: 配置字典
+            Dict: Configuration dictionary
         """
         if not self.config_path.exists():
             raise FileNotFoundError(f"Config file not found: {self.config_path}")
@@ -49,7 +49,7 @@ class AgentConfig:
     
     def get_llm_config(self, agent_name: str) -> Dict:
         """
-        获取指定Agent的LLM配置
+        Get LLM configuration for a specific Agent
         
         Args:
             agent_name: Agent Name
@@ -71,14 +71,14 @@ class AgentConfig:
         experience_store = None
     ) -> List[ReActAgent]:
         """
-        创建所有配置的Agent
+        Create all configured Agents
         
         Args:
-            rag_systems: RAG系统字典 {agent_id: rag_system}
-            experience_store: 经验库实例
+            rag_systems: Dictionary of RAG systems {agent_id: rag_system}
+            experience_store: Instance of the experience store
         
         Returns:
-            List[ReActAgent]: Agent列表
+            List[ReActAgent]: List of created Agent instances
         """
         agents = []
         

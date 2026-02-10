@@ -35,8 +35,9 @@ _UNIFIED_CONSTRAINTS = PromptBlock(
         "- The provided metal catalyst elements are the ONLY allowed catalyst metals for this task.\n"
         "- Do NOT introduce or swap in other catalyst metals not in the provided list.\n"
         "- If relative percentages are provided for the metals, treat them as fixed (do NOT change them).\n"
-        "- If a retrieved source describes a different composition, you may use it ONLY as a loose trend/analogy, "
-        "and you MUST explicitly state it is NOT the requested catalyst.\n\n"
+        "- If a retrieved source uses different composition/ratio or test conditions, you may use it ONLY as an analogy AND you MUST include: "
+        "Mismatch: (what differs), Mechanism: (named mechanism + causal link), Adjustment: (how the metric shifts, or why no adjustment). "
+        "If you can't, say so and set confidence to low.\n\n"
         "Reaction-type fidelity (HARD CONSTRAINT):\n"
         "- Evidence and numeric metrics MUST correspond to the target reaction type.\n"
         "- If you retrieve evidence for another reaction type (e.g., HOR when the task is OER), treat it as irrelevant.\n\n"
@@ -90,4 +91,11 @@ UNIFIED_SYSTEM_PROMPT = compose(
     _UNIFIED_CONSTRAINTS,
     _UNIFIED_EVIDENCE_FIRST,
     _UNIFIED_OUTPUT_CONTRACT,
+)
+
+# Debate PROPOSE already defines a STRICT JSON output contract and retrieval protocol.
+# Keep a smaller domain-only variant to avoid prompt bloat / conflicting output contracts.
+UNIFIED_DOMAIN_PROMPT = compose(
+    _UNIFIED_ROLE_AND_GOAL,
+    _UNIFIED_CONSTRAINTS,
 )

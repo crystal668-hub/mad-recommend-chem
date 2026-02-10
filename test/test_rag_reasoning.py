@@ -17,12 +17,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from dotenv import load_dotenv
-import voyageai
+try:
+    import voyageai  # type: ignore
+except Exception:  # pragma: no cover
+    voyageai = None  # type: ignore
 
 from agents.agent_config import AgentConfig
 from agents.llm_agents import create_agent
 from database.embedder import MultiModelEmbedder
-from database.vector_store import VectorStore
+try:
+    from database.vector_store import VectorStore
+except Exception:  # pragma: no cover
+    VectorStore = None  # type: ignore
 
 
 def _resolve_env_var(value: Optional[str]) -> Optional[str]:
@@ -50,6 +56,8 @@ class Agent2RAGAdapter:
         self.top_k = top_k
 
     def retrieve(self, query: str, top_k: int = 5, where=None) -> List[Dict]:
+        if voyageai is None:
+            raise ModuleNotFoundError("voyageai is not installed. Install it to run this script.")
         client = voyageai.Client(api_key=self.voyage_api_key)
         result = client.embed(
             texts=[query],

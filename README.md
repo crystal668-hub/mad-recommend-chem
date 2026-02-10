@@ -30,7 +30,8 @@ VOYAGE_API_KEY=...
 
 Notes:
 - Agent 1/2/3 default to OpenRouter endpoints (`base_url: https://openrouter.ai/api/v1`).
-- Agent 4 uses DashScope compatible-mode (`base_url: https://dashscope.aliyuncs.com/compatible-mode/v1`).
+- Agent 4 chats via OpenRouter (`model: qwen/qwen3-max-thinking`, `base_url: https://openrouter.ai/api/v1`).
+- Agent 4 embeddings default to DashScope compatible-mode (`emb_url: https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings`), using `embedding_api_key` (typically `QWEN_API_KEY`).
 - See `config/config.yaml` for the exact mapping.
 
 ### 3) Prepare literature data
@@ -73,19 +74,49 @@ python build_vector_db.py
 Provide **exactly 5** metal elements (symbols only):
 
 ```bash
-python main.py --components "Pt,Pd,Ru,Ir,Rh" --reaction-type CO2RR --engine langgraph
+python main.py --components "Pt,Pd,Ru,Ir,Rh" --reaction-type CO2RR
 ```
 
 You may also provide relative percentages (the system will treat them as the electrode composition):
 
 ```bash
-python main.py --components "Ni(69.00%), Co(19.07%), Fe(11.48%), Cu(0.40%), Zn(0.05%)" --reaction-type OER --engine langgraph
+python main.py --components "Ni(69.00%), Co(19.07%), Fe(11.48%), Cu(0.40%), Zn(0.05%)" --reaction-type OER
 ```
 
 Arguments:
 - `--components`: comma-separated 5 metal elements
 - `--reaction-type`: one of `CO2RR/EOR/HER/HOR/HZOR/O5H/OER/ORR/UOR` (recommended)
-- `--engine`: `langgraph` (default) or `autogen` (optional; requires extra dependency installation)
+- `--engine`: `langgraph` (default; currently the only supported engine)
+
+### 6) Rank reaction types (auto-run debates for each reaction)
+If you want to **fix the composition** (5 metals + optional relative %) and let the system
+run debates for **all reaction types** and return the **Top-K** reactions by grade:
+
+```bash
+python main.py --components "Ni(69.00%), Co(19.07%), Fe(11.48%), Cu(0.40%), Zn(0.05%)" --rank-reactions
+```
+
+Optional controls:
+- Subset of reactions:
+  ```bash
+  python main.py --components "Pt,Pd,Ru,Ir,Rh" --rank-reactions --reaction-types "OER,HER,ORR"
+  ```
+- Top-K (default 2):
+  ```bash
+  python main.py --components "Pt,Pd,Ru,Ir,Rh" --rank-reactions --top-k-reactions 3
+  ```
+- Reaction-level parallelism (default 1; higher may trigger API rate limits):
+  ```bash
+  python main.py --components "Pt,Pd,Ru,Ir,Rh" --rank-reactions --max-parallel-reactions 2
+  ```
+- Also save each per-reaction `outputs/result_*.json` (off by default):
+  ```bash
+  python main.py --components "Pt,Pd,Ru,Ir,Rh" --rank-reactions --save-each-reaction
+  ```
+
+Outputs:
+- Ranking summary: `outputs/rank_<timestamp>.json`
+- Logs and per-debate artifacts: under `logs/runs/<run_id>/`
 
 ### Outputs
 - Results: `paths.outputs` (default `./outputs`) as `result_<timestamp>.json` (timestamp format: `YYYYMMDD_HHMMSS`)

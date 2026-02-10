@@ -154,6 +154,17 @@ def _missing_required_envs(config: AgentConfig, embedding_agents_needed: Set[str
             if not os.environ.get(env):
                 needed.append(env)
 
+    # Optional separate embedding API keys (e.g., agent chats via OpenRouter but embeds via Bailian).
+    for agent_id in (embedding_agents_needed or set()):
+        if agent_id == "agent2":
+            continue  # handled above (Voyage)
+        cfg_e = config.get_llm_config(agent_id)
+        ekey = cfg_e.get("embedding_api_key") or cfg_e.get("emb_api_key")
+        if ekey and ekey.startswith("${") and ekey.endswith("}"):
+            env = ekey[2:-1]
+            if not os.environ.get(env):
+                needed.append(env)
+
     # Deduplicate while preserving order
     seen: Set[str] = set()
     out: List[str] = []

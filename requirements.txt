@@ -8,16 +8,13 @@ llama-index-embeddings-openai>=0.1.0
 llama-index-vector-stores-chroma>=0.1.0
 llama-index>=0.10.0
 
-# Vector Store - ChromaDB
+# Vector Store 
 chromadb>=0.4.22
 
-# LangChain (tool-calling agent runtime)
+# LangChain 
 langchain>=0.2.0
 langchain-core>=0.2.0
 langchain-openai>=0.1.0
-
-# Multi-Agent Framework
-# pyautogen==0.2.30
 
 # LLM Providers
 openai>=1.10.0
@@ -42,7 +39,7 @@ tqdm>=4.66.0
 tenacity>=8.2.3  
 
 # [Optional]: Scientific Computing and Chemistry
-# rdkit>=2023.9.1  # Cheminformatics toolkit
+# rdkit>=2023.9.1  
 # scipy>=1.11.0
 
 # [Optional]: Development Tools

@@ -26,8 +26,8 @@ def create_agent(
     Create an agent using the 'config.yaml' model settings.
 
     The project uses OpenAI-compatible endpoints:
-    - OpenRouter for openai/deepseek/google 
-    - DashScope compatible-mode for Qwen
+    - OpenRouter for openai/deepseek/google/qwen(base model)
+    - DashScope compatible-mode for 'Qwen Embedding' (when provider is `qwen` and base_url is not overridden)
     """
 
     provider_defaults = {

@@ -27,6 +27,19 @@ class ConclusionGuardTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("missing required", (reason or "").lower())
 
+    def test_percentage_tokens_are_counted_as_mentions(self):
+        from agents.react_agent import _validate_conclusion_against_task
+
+        required = ["Ni", "Co", "Fe", "Cu", "Zn"]
+        conclusion = (
+            "Electrode composition (exactly as provided): "
+            "Ni(69.00%), Co(19.07%), Fe(11.48%), Cu(0.40%), Zn(0.05%)\n"
+        )
+
+        ok, reason = _validate_conclusion_against_task(conclusion, required)
+        self.assertTrue(ok)
+        self.assertEqual("", (reason or "").strip())
+
 
 if __name__ == "__main__":
     unittest.main()

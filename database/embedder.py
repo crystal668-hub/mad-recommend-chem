@@ -9,11 +9,15 @@ import os
 import time
 from typing import Dict, List, Optional
 
-import voyageai
-from openai import OpenAI
+try:
+    import voyageai  # type: ignore
+except Exception:  # pragma: no cover
+    voyageai = None  # type: ignore
+from openai import AsyncOpenAI, OpenAI
 from tqdm import tqdm
 
 from utils.logger import Logger
+from utils.request_limiter import get_global_limiter
 
 logger = Logger.create_module_logger("database.embedder")
 
@@ -44,6 +48,7 @@ class MultiModelEmbedder:
         # Lazy load Voyage AI clients and OpenAI clients
         self.voyage_clients: Dict[str, 'voyageai.Client'] = {}
         self.openai_clients: Dict[str, OpenAI] = {}
+        self.async_openai_clients: Dict[str, AsyncOpenAI] = {}
         
         # Get API Key from environment variable if needed
         if self.api_key and self.api_key.startswith('${') and self.api_key.endswith('}'):
@@ -98,7 +103,10 @@ class MultiModelEmbedder:
             embedding_model = cfg.get('embedding_model', self.default_model)
             emb_url = cfg.get('emb_url', self.base_url)
             openai_base_url = self._normalize_openai_base_url(emb_url)
-            api_key = self._resolve_env_var(cfg.get('api_key', self.api_key))
+            # Allow embeddings to use a different API key than the chat model.
+            # This is needed when an agent chats via OpenRouter but embeds via DashScope/Bailian.
+            embedding_api_key = cfg.get('embedding_api_key') or cfg.get('emb_api_key') or cfg.get('api_key', self.api_key)
+            api_key = self._resolve_env_var(embedding_api_key)
             voyage_api_key = self._resolve_env_var(cfg.get('voyage_api_key'))
             embedding_provider = self._infer_provider_by_agent(agent_name, cfg)
 
@@ -137,6 +145,10 @@ class MultiModelEmbedder:
         Returns:
             voyageai.Client或None
         """
+        if voyageai is None:
+            raise ModuleNotFoundError(
+                "voyageai is not installed. Install it to use embedding_provider='voyage'."
+            )
         if agent_name not in self.voyage_clients:
             profile = self.agent_embedding_profiles.get(agent_name, {})
             voyage_api_key = profile.get('voyage_api_key')
@@ -152,6 +164,11 @@ class MultiModelEmbedder:
         if agent_name not in self.openai_clients:
             self.openai_clients[agent_name] = OpenAI(api_key=api_key, base_url=base_url)
         return self.openai_clients[agent_name]
+
+    def _get_async_openai_client(self, agent_name: str, api_key: str, base_url: str) -> AsyncOpenAI:
+        if agent_name not in self.async_openai_clients:
+            self.async_openai_clients[agent_name] = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        return self.async_openai_clients[agent_name]
         
     def _is_voyage_model(self, agent_name: str = None) -> bool:
         """
@@ -250,11 +267,12 @@ class MultiModelEmbedder:
             model = self.get_model_for_agent(use_agent)
             for attempt in range(retry):
                 try:
-                    result = voyage_client.embed(
-                        texts=[text],
-                        model=model,
-                        input_type="query",
-                    )
+                    with get_global_limiter().slot(kind="embedding"):
+                        result = voyage_client.embed(
+                            texts=[text],
+                            model=model,
+                            input_type="query",
+                        )
 
                     if result and result.embeddings:
                         return result.embeddings[0]
@@ -290,11 +308,12 @@ class MultiModelEmbedder:
         for attempt in range(retry):
             try:
                 # Use Voyage AI SDK
-                result = voyage_client.embed(
-                    texts=[text],
-                    model=model,
-                    input_type="document"  # Can be "document" or "query"
-                )
+                with get_global_limiter().slot(kind="embedding"):
+                    result = voyage_client.embed(
+                        texts=[text],
+                        model=model,
+                        input_type="document",  # Can be "document" or "query"
+                    )
                 
                 if result and result.embeddings:
                     return result.embeddings[0]
@@ -331,7 +350,8 @@ class MultiModelEmbedder:
 
         for attempt in range(retry):
             try:
-                result = client.embeddings.create(model=model, input=text)
+                with get_global_limiter().slot(kind="embedding"):
+                    result = client.embeddings.create(model=model, input=text)
                 if result and result.data:
                     return result.data[0].embedding
                 raise Exception("Bailian returned empty result")
@@ -364,7 +384,8 @@ class MultiModelEmbedder:
         for attempt in range(retry):
             try:
                 client = self._get_openai_client(agent_name or 'default', api_key, base_url)
-                result = client.embeddings.create(model=model, input=text)
+                with get_global_limiter().slot(kind="embedding"):
+                    result = client.embeddings.create(model=model, input=text)
                 if result and result.data:
                     return result.data[0].embedding
                 raise Exception("OpenRouter returned empty result")
@@ -374,6 +395,69 @@ class MultiModelEmbedder:
                     time.sleep(2 ** attempt)
         
         raise Exception(f"Embedding failed, retried {retry} times")
+
+    async def embed_texts_openrouter_async(
+        self, texts: List[str], retry: int = 3, agent_name: str = None
+    ) -> List[List[float]]:
+        """
+        Async batch embedding for OpenRouter (OpenAI-compatible) provider.
+
+        Notes:
+        - Uses `input=[...]` to embed multiple texts in a single request.
+        - Blank inputs are mapped to deterministic zero vectors (provider-agnostic safety).
+        - On repeated failure, returns zero vectors for the whole batch to keep pipelines robust.
+        """
+        profile = self._get_agent_profile(agent_name)
+        model = profile.get("embedding_model", self.default_model)
+        base_url = profile.get("openai_base_url") or self._normalize_openai_base_url(profile.get("emb_url", self.base_url))
+        api_key = profile.get("api_key")
+        if not api_key:
+            raise ValueError("OpenRouter API Key not configured")
+
+        dim = self.get_embedding_dimension(model)
+
+        # Preserve order and handle blank inputs locally.
+        out: List[Optional[List[float]]] = [None] * len(texts)
+        non_blank: List[str] = []
+        non_blank_indices: List[int] = []
+        for idx, t in enumerate(texts):
+            if t is None or not str(t).strip():
+                out[idx] = [0.0] * dim
+            else:
+                non_blank.append(t)
+                non_blank_indices.append(idx)
+
+        if not non_blank:
+            return [x if x is not None else [0.0] * dim for x in out]
+
+        # Retry loop mirrors the sync OpenRouter path.
+        last_err: Optional[Exception] = None
+        for attempt in range(int(retry)):
+            try:
+                client = self._get_async_openai_client(agent_name or "default", api_key, base_url)
+                result = await client.embeddings.create(model=model, input=non_blank)
+                if not result or not getattr(result, "data", None):
+                    raise Exception("OpenRouter returned empty result")
+
+                # Result order should match input order.
+                if len(result.data) != len(non_blank):
+                    raise Exception(f"OpenRouter returned {len(result.data)} embeddings for {len(non_blank)} inputs")
+
+                for out_i, d in zip(non_blank_indices, result.data):
+                    out[out_i] = d.embedding
+
+                return [x if x is not None else [0.0] * dim for x in out]
+            except Exception as e:
+                last_err = e
+                logger.error(f"[ERROR] Async batch embedding failed (attempt {attempt + 1}/{retry}): {str(e)}")
+                if attempt < int(retry) - 1:
+                    # Exponential backoff, but don't block the event loop.
+                    import asyncio  # local import to keep sync import graph minimal
+
+                    await asyncio.sleep(2 ** attempt)
+
+        logger.error(f"[ERROR] Async batch embedding failed, retried {retry} times: {str(last_err)}")
+        return [[0.0] * dim for _ in texts]
     
     def embed_batch(self, texts: List[str], batch_size: int = 10, show_progress: bool = True, agent_name: str = None) -> List[List[float]]:
         """

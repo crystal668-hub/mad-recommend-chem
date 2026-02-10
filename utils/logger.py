@@ -424,7 +424,6 @@ class DebateLogger:
                 "debate_id": self.debate_id,
                 "components": components,
                 "max_rounds": (config or {}).get("max_rounds"),
-                "consensus_threshold": (config or {}).get("consensus_threshold"),
             },
         )
 

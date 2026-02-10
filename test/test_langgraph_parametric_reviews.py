@@ -61,6 +61,29 @@ class LangGraphParametricReviewTests(unittest.TestCase):
         self.assertTrue(review.valid)
         self.assertEqual(review.evidence, [])
 
+    def test_parametric_review_allows_llm_source_id(self):
+        from debate.langgraph_coordinator import ReviewItem
+
+        coord = self._coordinator()
+        proposals = self._proposals_with_step1()
+
+        item = ReviewItem(
+            target_proposal_id="agent1",
+            target_step_number=1,
+            flaw_type="other",
+            critique="Parametric critique; cite internal knowledge as llm.",
+            evidence=[{"source_id": "LLM"}],
+        )
+        review = coord._validate_review_item(
+            review_id="rev_r1_agent2_0",
+            round_number=1,
+            from_id="agent2",
+            item=item,
+            proposals=proposals,
+            retrieved_source_ids=set(),
+        )
+        self.assertTrue(review.valid)
+
     def test_parametric_reviews_block_consensus_and_require_response(self):
         from debate.langgraph_coordinator import DebateReview
 
@@ -104,6 +127,27 @@ class LangGraphParametricReviewTests(unittest.TestCase):
             response_mode="defend",
             response="I defend this claim based on parametric knowledge.",
             evidence=[],
+        )
+        rebuttal = coord._validate_rebuttal_item(
+            rebuttal_id="reb_r1_agent1_0",
+            round_number=1,
+            from_id="agent1",
+            item=item,
+            valid_review_ids={"rev_r1_agent2_0"},
+            retrieved_source_ids=set(),
+        )
+        self.assertTrue(rebuttal.valid)
+
+    def test_parametric_rebuttal_allows_llm_source_id(self):
+        from debate.langgraph_coordinator import RebuttalItem
+
+        coord = self._coordinator()
+
+        item = RebuttalItem(
+            target_review_id="rev_r1_agent2_0",
+            response_mode="defend",
+            response="Defend based on parametric knowledge.",
+            evidence=[{"source_id": "llm"}],
         )
         rebuttal = coord._validate_rebuttal_item(
             rebuttal_id="reb_r1_agent1_0",

@@ -8,6 +8,7 @@ Function: Build 4 Chroma collections (agent1~agent4) using each agent's embeddin
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import re
@@ -151,6 +152,7 @@ def build_vector_databases_batch(
     chunk_size: Optional[int] = None,
     chunk_overlap: Optional[int] = None,
     embedding_batch_size: int = 10,
+    embedding_concurrency: int = 1,
     max_workers: int = 4,
     sleep_between_batches: float = 0.5,
     resume: bool = True,
@@ -173,6 +175,7 @@ def build_vector_databases_batch(
         chunk_size: 分块大小（默认使用config.rag.chunk_size；CLI可显式覆盖）
         chunk_overlap: 分块重叠（默认使用config.rag.chunk_overlap；CLI可显式覆盖）
         embedding_batch_size: embedding批大小
+        embedding_concurrency: OpenRouter embedding异步并发的batch数量（默认1=关闭；>1启用）
         max_workers: 并发worker数量（默认4；设为1可退回串行）
         sleep_between_batches: 每个agent在embedding batch之间的sleep（秒），用于简单限速（默认0.5）
         resume: 断点续跑（默认True）；为True时会跳过已存在的chunk并补齐缺失部分
@@ -326,29 +329,21 @@ def build_vector_databases_batch(
                     vector_store.reset_collection()
                     logger.info("✓ Collection cleared (clear_existing=True)")
                 elif clear_existing is False:
-                    raise RuntimeError(
-                        f"Collection '{collection_name}' already has {current_count} documents. "
-                        f"Refusing to add duplicates (use --clear or --skip-if-exists)."
-                    )
+                    if resume:
+                        logger.info(
+                            f"Collection already has {current_count} documents; clear_existing=False but resume=True so will "
+                            "check chunk ids and only embed/add missing."
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"Collection '{collection_name}' already has {current_count} documents. "
+                            f"Refusing to add duplicates (enable --resume, or use --clear / --skip-if-exists)."
+                        )
                 else:
                     if resume:
                         # Default: resumable indexing (skip existing chunk ids and only add missing).
-                        if current_count >= total_chunks:
-                            logger.info(
-                                f"Collection already has {current_count} documents (>= total_chunks={total_chunks}); "
-                                "treating as complete and skipping."
-                            )
-                            results[agent_name] = {
-                                "status": "skipped",
-                                "reason": "already_complete",
-                                "collection_name": collection_name,
-                                "document_count": current_count,
-                                "embedding_model": embedding_model,
-                                "embedding_provider": embedding_provider,
-                            }
-                            continue
                         logger.info(
-                            f"Resume enabled: collection has {current_count} docs; will skip existing chunk ids and continue."
+                            f"Resume enabled: collection has {current_count} docs; will check chunk ids and only embed/add missing."
                         )
                     else:
                         # Legacy behaviour: ask whether to clear; if not, abort this agent.
@@ -402,6 +397,7 @@ def build_vector_databases_batch(
         total = len(texts)
         model_name = embedder.get_model_for_agent(agent_name)
         dim = embedder.get_embedding_dimension(model_name)
+        resolved_provider = (embedder.agent_embedding_profiles.get(agent_name, {}) or {}).get("embedding_provider", "")
 
         logger.info(
             f"[{agent_name}] Start embedding: total_chunks={total}, model={embedding_model}, provider={embedding_provider}, dim={dim}"
@@ -409,6 +405,59 @@ def build_vector_databases_batch(
 
         already_present = 0
         newly_added = 0
+
+        async_enabled = str(resolved_provider or "").lower() == "openrouter" and int(embedding_concurrency) > 1
+        pending: List[Dict[str, object]] = []
+        loop: Optional[asyncio.AbstractEventLoop] = None
+        if async_enabled:
+            # Keep a single event loop per agent to avoid cross-loop issues with async HTTP clients.
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        async def _embed_many(text_batches: List[List[str]]) -> List[object]:
+            tasks = [embedder.embed_texts_openrouter_async(b, agent_name=agent_name) for b in text_batches]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        def _flush_pending() -> None:
+            nonlocal newly_added
+            if not pending:
+                return
+
+            text_batches = [p["batch_texts"] for p in pending]  # type: ignore[index]
+            if loop is None:
+                raise RuntimeError("Async embedding loop is not initialized")
+            results = loop.run_until_complete(_embed_many(text_batches))
+
+            for p, r in zip(pending, results):
+                batch_texts = p["batch_texts"]  # type: ignore[assignment]
+                batch_ids = p["batch_ids"]  # type: ignore[assignment]
+                batch_metas = p["batch_metas"]  # type: ignore[assignment]
+                bend = int(p["end"])  # type: ignore[arg-type]
+
+                if isinstance(r, Exception):
+                    logger.error(f"[{agent_name}] Async batch embedding failed (end={bend}): {str(r)}")
+                    batch_embeddings = [[0.0] * dim for _ in batch_texts]  # type: ignore[arg-type]
+                else:
+                    batch_embeddings = r  # type: ignore[assignment]
+
+                # Chroma persistent backend isn't guaranteed to be safe for concurrent writers.
+                # Serialize writes to avoid sqlite "database is locked" issues.
+                with chroma_write_lock:
+                    vector_store.add_documents(
+                        documents=batch_texts,  # type: ignore[arg-type]
+                        embeddings=batch_embeddings,  # type: ignore[arg-type]
+                        metadatas=[m.copy() for m in batch_metas],  # type: ignore[arg-type]
+                        ids=batch_ids,  # type: ignore[arg-type]
+                    )
+                newly_added += len(batch_ids)  # type: ignore[arg-type]
+
+                if sleep_between_batches and bend < total:
+                    time.sleep(float(sleep_between_batches))
+
+                if bend % max(1, int(embedding_batch_size) * 50) == 0 or bend == total:
+                    logger.info(f"[{agent_name}] Progress: {bend}/{total}")
+
+            pending.clear()
 
         # Stream embeddings -> Chroma in small batches to keep memory bounded.
         for start in range(0, total, int(embedding_batch_size)):
@@ -431,6 +480,19 @@ def build_vector_databases_batch(
                 batch_texts = [batch_texts[i] for i in missing_indices]
                 batch_ids = [batch_ids[i] for i in missing_indices]
                 batch_metas = [batch_metas[i] for i in missing_indices]
+
+            if async_enabled:
+                pending.append(
+                    {
+                        "batch_texts": batch_texts,
+                        "batch_ids": batch_ids,
+                        "batch_metas": batch_metas,
+                        "end": end,
+                    }
+                )
+                if len(pending) >= int(embedding_concurrency) or end == total:
+                    _flush_pending()
+                continue
 
             batch_embeddings: List[List[float]] = []
             for text in batch_texts:
@@ -456,6 +518,29 @@ def build_vector_databases_batch(
 
             if end % max(1, int(embedding_batch_size) * 50) == 0 or end == total:
                 logger.info(f"[{agent_name}] Progress: {end}/{total}")
+
+        # Best-effort flush in case loop exits with pending batches.
+        if pending:
+            _flush_pending()
+
+        if loop is not None:
+            try:
+                # Best-effort close async clients (API depends on openai version).
+                close_awaitables = []
+                for c in getattr(embedder, "async_openai_clients", {}).values():
+                    close_fn = getattr(c, "close", None)
+                    if callable(close_fn):
+                        try:
+                            maybe_awaitable = close_fn()
+                            if asyncio.iscoroutine(maybe_awaitable):
+                                close_awaitables.append(maybe_awaitable)
+                        except Exception:
+                            pass
+                if close_awaitables:
+                    loop.run_until_complete(asyncio.gather(*close_awaitables, return_exceptions=True))
+            finally:
+                asyncio.set_event_loop(None)
+                loop.close()
 
         with chroma_write_lock:
             final_count = vector_store.get_collection_count()
@@ -555,6 +640,13 @@ def main() -> int:
         help="chunk overlap (default: config.rag.chunk_overlap or 50)",
     )
     parser.add_argument("--embedding-batch-size", dest="embedding_batch_size", type=int, default=10, help="embed batch size")
+    parser.add_argument(
+        "--embedding-concurrency",
+        dest="embedding_concurrency",
+        type=int,
+        default=1,
+        help="async OpenRouter embedding concurrency (default: 1; set >1 to enable per-agent async batching)",
+    )
     resume_group = parser.add_mutually_exclusive_group()
     resume_group.add_argument("--resume", dest="resume", action="store_true", help="resume from existing collection data")
     resume_group.add_argument("--no-resume", dest="resume", action="store_false", help="disable resume; require clear/skip")
@@ -605,6 +697,7 @@ def main() -> int:
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
         embedding_batch_size=args.embedding_batch_size,
+        embedding_concurrency=args.embedding_concurrency,
         max_workers=args.max_workers,
         sleep_between_batches=args.sleep_between_batches,
         resume=bool(args.resume),

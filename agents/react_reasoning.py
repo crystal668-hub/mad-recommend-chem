@@ -20,6 +20,7 @@ class ActionType(Enum):
 
     SEARCH_LITERATURE = "search_literature"
     SEARCH_EXPERIENCE = "search_experience"
+    FETCH_LITERATURE_CHUNK = "fetch_literature_chunk"
     ANALYZE = "analyze"
     CONCLUDE = "conclude"
 

@@ -18,12 +18,69 @@ YAML pack formats supported:
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import yaml
+
+
+_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+_TOKEN_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "can",
+    "could",
+    "do",
+    "does",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "may",
+    "must",
+    "no",
+    "not",
+    "of",
+    "on",
+    "only",
+    "or",
+    "our",
+    "should",
+    "so",
+    "that",
+    "the",
+    "their",
+    "then",
+    "these",
+    "this",
+    "those",
+    "to",
+    "use",
+    "using",
+    "we",
+    "when",
+    "will",
+    "with",
+    "without",
+    "you",
+    "your",
+}
 
 
 def _normalize_component(value: str) -> str:
@@ -61,10 +118,19 @@ class ExperienceStore:
         max_experiences: int = 1000,
         relevance_threshold: float = 0.8,
         packs_path: Optional[str] = None,
+        guideline_top_k: int = 3,
+        always_include_guidelines: bool = True,
+        guideline_search_mode: str = "keyword",
+        load_builtin_packs: bool = True,
     ) -> None:
         self.storage_path = Path(storage_path)
         self.max_experiences = int(max_experiences)
         self.relevance_threshold = float(relevance_threshold)
+        self.guideline_top_k = max(0, int(guideline_top_k))
+        self.always_include_guidelines = bool(always_include_guidelines)
+
+        gsm = str(guideline_search_mode or "").strip().lower() or "rank"
+        self.guideline_search_mode = gsm if gsm in {"keyword", "rank"} else "rank"
 
         self._json_path: Optional[Path] = None
         if self.storage_path.suffix.lower() == ".json":
@@ -78,8 +144,9 @@ class ExperienceStore:
         if self.storage_path.is_dir() or self.storage_path.suffix.lower() in {".yaml", ".yml"}:
             pack_roots.append(self.storage_path)
 
-        builtin_packs = Path(__file__).resolve().parent
-        pack_roots.append(builtin_packs)
+        if bool(load_builtin_packs):
+            builtin_packs = Path(__file__).resolve().parent
+            pack_roots.append(builtin_packs)
 
         if packs_path:
             pack_roots.append(Path(packs_path))
@@ -91,6 +158,11 @@ class ExperienceStore:
 
         # Public view (for compatibility with older code/docs).
         self.experiences: List[Dict[str, Any]] = self._pack_experiences + self._dynamic_experiences
+
+        # Guideline keyword index (for `guideline_search_mode="keyword"`).
+        self._guideline_tokens_by_id: Dict[str, set[str]] = {}
+        self._guideline_idf: Dict[str, float] = {}
+        self._build_guideline_index()
 
     # -------------------------
     # Loading
@@ -260,6 +332,119 @@ class ExperienceStore:
             return title, rest
         return "Guideline", text.strip()
 
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        """
+        Lightweight tokenizer for guideline keyword matching.
+
+        Notes:
+        - ASCII-focused: keeps a-z/0-9 tokens (e.g., "co2rr", "fe", "j0").
+        - Drops stopwords and purely-numeric tokens to reduce noise.
+        """
+        s = str(text or "").lower()
+        raw_tokens = [t for t in _TOKEN_SPLIT_RE.split(s) if t]
+        out: set[str] = set()
+        for tok in raw_tokens:
+            if tok in _TOKEN_STOPWORDS:
+                continue
+            if tok.isdigit():
+                continue
+            if len(tok) < 2:
+                continue
+            out.add(tok)
+        return out
+
+    def _build_guideline_index(self) -> None:
+        """
+        Precompute per-guideline token sets and corpus IDF weights.
+
+        This enables `guideline_search_mode="keyword"` to rank [G*] blocks
+        by overlap with the current task/query text.
+        """
+        guidelines = [e for e in (self.experiences or []) if (e.get("kind") == "guideline")]
+        tokens_by_id: Dict[str, set[str]] = {}
+        df: Dict[str, int] = {}
+
+        for g in guidelines:
+            gid = str(g.get("id") or "").strip()
+            if not gid:
+                continue
+            blob = " ".join(
+                [
+                    str(g.get("guideline_id") or ""),
+                    str(g.get("title") or ""),
+                    str(g.get("content") or ""),
+                ]
+            )
+            toks = self._tokenize(blob)
+            tokens_by_id[gid] = toks
+            for t in toks:
+                df[t] = int(df.get(t, 0)) + 1
+
+        n_docs = len(tokens_by_id)
+        idf: Dict[str, float] = {}
+        if n_docs:
+            for t, d in df.items():
+                try:
+                    idf[t] = 1.0 + math.log((float(n_docs) + 1.0) / (float(d) + 1.0))
+                except Exception:
+                    idf[t] = 1.0
+
+        self._guideline_tokens_by_id = tokens_by_id
+        self._guideline_idf = idf
+
+    def _rank_guidelines(self, guidelines: List[Dict[str, Any]], query_text: Optional[str]) -> List[Dict[str, Any]]:
+        if not guidelines:
+            return []
+
+        # Default: stable rank order (G0, G1, ...)
+        def _rank_key(x: Dict[str, Any]) -> int:
+            try:
+                return int(x.get("rank", 10_000))
+            except Exception:
+                return 10_000
+
+        if self.guideline_search_mode != "keyword" or not (query_text or "").strip():
+            out = [dict(g) for g in guidelines]
+            out.sort(key=_rank_key)
+            return out
+
+        q_tokens = self._tokenize(query_text or "")
+        if not q_tokens:
+            out = [dict(g) for g in guidelines]
+            out.sort(key=_rank_key)
+            return out
+
+        max_score = sum(float(self._guideline_idf.get(t, 1.0)) for t in q_tokens)
+        if max_score <= 0:
+            out = [dict(g) for g in guidelines]
+            out.sort(key=_rank_key)
+            return out
+
+        scored: List[Dict[str, Any]] = []
+        for g in guidelines:
+            gid = str(g.get("id") or "").strip()
+            g_tokens = self._guideline_tokens_by_id.get(gid)
+            if g_tokens is None:
+                blob = " ".join(
+                    [
+                        str(g.get("guideline_id") or ""),
+                        str(g.get("title") or ""),
+                        str(g.get("content") or ""),
+                    ]
+                )
+                g_tokens = self._tokenize(blob)
+
+            overlap = q_tokens.intersection(g_tokens)
+            score = sum(float(self._guideline_idf.get(t, 1.0)) for t in overlap)
+            sim = float(score) / float(max_score) if max_score else 0.0
+            g_out = dict(g)
+            g_out["similarity"] = sim
+            scored.append(g_out)
+
+        scored.sort(key=lambda x: (-float(x.get("similarity", 0.0)), _rank_key(x)))
+        return scored
+
     # -------------------------
     # CRUD (dynamic JSON only)
     # -------------------------
@@ -304,13 +489,16 @@ class ExperienceStore:
         components: List[str],
         top_k: int = 3,
         min_similarity: Optional[float] = None,
+        query_text: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Query experiences by component overlap (Jaccard similarity).
 
         Behavior:
-        - Returns component-matched experiences first (above threshold).
-        - If there are not enough matches, fills the remainder with global guideline experiences.
+        - Case experiences: matched by component overlap (above threshold).
+        - Guideline experiences: global [G*] blocks, optionally ranked by keyword overlap with `query_text`.
+        - If `always_include_guidelines` is enabled, we always mix in up to `guideline_top_k`
+          guidelines (bounded by `top_k`) before adding case experiences.
         """
         comps_norm = [_normalize_component(c) for c in (components or []) if _normalize_component(c)]
         top_k = max(1, int(top_k))
@@ -320,48 +508,84 @@ class ExperienceStore:
 
         threshold = float(min_similarity) if min_similarity is not None else self.relevance_threshold
 
-        matched: List[Dict[str, Any]] = []
+        matched_cases: List[Dict[str, Any]] = []
+        scored_cases_all: List[Dict[str, Any]] = []
         global_guides: List[Dict[str, Any]] = []
 
         for exp in self.experiences:
+            if exp.get("kind") == "guideline":
+                global_guides.append(dict(exp))
+                continue
+
             exp_components = _ensure_list_str(exp.get("components"))
-            if exp_components:
-                # If the model didn't provide query components, avoid returning arbitrary
-                # component-specific cases; fall back to global guideline experiences.
-                if not comps_norm:
-                    continue
-                similarity = self._calculate_similarity(comps_norm, exp_components)
-                exp_with_score = dict(exp)
-                exp_with_score["similarity"] = similarity
-                if similarity >= threshold:
-                    matched.append(exp_with_score)
-            else:
-                if exp.get("kind") == "guideline":
-                    global_guides.append(dict(exp))
+            if not exp_components:
+                continue
 
-        matched.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
-        global_guides.sort(key=lambda x: int(x.get("rank", 10_000)))
+            # If the model didn't provide query components, avoid returning arbitrary
+            # component-specific cases; fall back to global guideline experiences.
+            if not comps_norm:
+                continue
 
-        results: List[Dict[str, Any]] = matched[:top_k]
+            similarity = self._calculate_similarity(comps_norm, exp_components)
+            exp_with_score = dict(exp)
+            exp_with_score["similarity"] = similarity
+            scored_cases_all.append(exp_with_score)
+            if similarity >= threshold:
+                matched_cases.append(exp_with_score)
+
+        matched_cases.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
+        ranked_guides = self._rank_guidelines(global_guides, query_text=query_text)
+
+        # Strategy: optionally enforce a guideline prefix.
+        if self.always_include_guidelines and ranked_guides:
+            guide_k = min(int(self.guideline_top_k), int(top_k))
+            guide_k = max(0, guide_k)
+            case_k = max(0, int(top_k) - guide_k)
+
+            results: List[Dict[str, Any]] = []
+            results.extend(ranked_guides[:guide_k])
+            results.extend(matched_cases[:case_k])
+
+            # Fill remainder: prefer more guidelines, then more matched cases.
+            if len(results) < top_k:
+                for g in ranked_guides[guide_k:]:
+                    if len(results) >= top_k:
+                        break
+                    results.append(g)
+                for c in matched_cases[case_k:]:
+                    if len(results) >= top_k:
+                        break
+                    results.append(c)
+
+            # Last-resort: if we still haven't filled and we have scored cases (below threshold),
+            # use the best ones to fill remaining slots.
+            if len(results) < top_k and comps_norm and scored_cases_all:
+                scored_cases_all.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
+                seen_ids = {str(r.get("id") or "") for r in results}
+                for c in scored_cases_all:
+                    if len(results) >= top_k:
+                        break
+                    cid = str(c.get("id") or "")
+                    if cid and cid in seen_ids:
+                        continue
+                    results.append(c)
+                    if cid:
+                        seen_ids.add(cid)
+
+            return results[:top_k]
+
+        # Legacy behavior: matched cases first, then guidelines as fallback.
+        results = list(matched_cases[:top_k])
         if len(results) < top_k:
-            results.extend(global_guides[: (top_k - len(results))])
+            results.extend(ranked_guides[: (top_k - len(results))])
 
         # Last-resort fallback: if nothing passed threshold but we have scored candidates,
         # return the best matches anyway.
-        if not results and comps_norm:
-            scored_all: List[Dict[str, Any]] = []
-            for exp in self.experiences:
-                exp_components = _ensure_list_str(exp.get("components"))
-                if not exp_components:
-                    continue
-                similarity = self._calculate_similarity(comps_norm, exp_components)
-                exp_with_score = dict(exp)
-                exp_with_score["similarity"] = similarity
-                scored_all.append(exp_with_score)
-            scored_all.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
-            return scored_all[:top_k]
+        if not results and comps_norm and scored_cases_all:
+            scored_cases_all.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
+            return scored_cases_all[:top_k]
 
-        return results
+        return results[:top_k]
 
     @staticmethod
     def _calculate_similarity(components1: List[str], components2: List[str]) -> float:

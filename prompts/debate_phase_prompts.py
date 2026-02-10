@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from prompts.system_prompts import UNIFIED_SYSTEM_PROMPT
+from prompts.system_prompts import UNIFIED_DOMAIN_PROMPT
 from prompts.prompt_blocks import PromptBlock, compose
 from utils.electrode_composition import build_electrode_composition, parse_components_with_percent
 
@@ -31,7 +31,6 @@ def build_initial_debate_prompt(
 
     electrode_str = (electrode_composition or "").strip()
     if not electrode_str:
-        # Deterministic per electrode (element set + order) to keep runs reproducible.
         electrode_str = build_electrode_composition(elements, percents=percents, seed="|".join(elements))
 
     return (
@@ -42,7 +41,7 @@ def build_initial_debate_prompt(
     )
 
 DEBATE_PROPOSE_SYSTEM_PROMPT = compose(
-    PromptBlock(name="unified", text=UNIFIED_SYSTEM_PROMPT, priority="MUST"),
+    PromptBlock(name="unified_domain", text=UNIFIED_DOMAIN_PROMPT, priority="MUST"),
     PromptBlock(
         name="propose_header",
         priority="MUST",
@@ -58,24 +57,35 @@ DEBATE_PROPOSE_SYSTEM_PROMPT = compose(
             "MUST (follow all):\n"
             "1) Step budget: you have at most 5 ReAct steps for this phase.\n"
             "2) FIRST ACTION: emit >=3 retrieval tool_calls in parallel.\n"
-            "   - `search_experience` is optional; if used, place it BEFORE `search_literature` tool calls.\n"
+            "   - `search_experience` is optional; if used, place it BEFORE `search_literature`.\n"
             "   - Use 2-3 `search_literature` queries that are meaningfully DISTINCT (not rewordings).\n"
             "3) Retrieval budget: at most TWO ACTION steps may include retrieval tools (`search_experience`/`search_literature`).\n"
             "   After that, do NOT call retrieval tools again.\n"
-            "4) Submit the final proposal via the `conclude` tool.\n"
-            "5) Conclude Guard Compatibility:\n"
-            "   - Your `conclude` call will be REJECTED if your conclusion text misses ANY required catalyst metal symbol,\n"
-            "     (i.e., you forgot to explicitly cover one of the task elements).\n"
-            "   - Mentioning extra element symbols is allowed but may be logged as a warning; avoid unnecessary extras.\n"
-            "   - Your final conclusion MUST contain a line starting with:\n"
-            "     Performance Metrics: <single point estimate> (Confidence: <...>)\n"
-            "     - On THIS line: output a SINGLE point estimate + confidence (no \u00b1, no numeric ranges).\n"
-            "     - You MAY discuss literature ranges elsewhere (e.g., Rationale/Evidence), but do NOT put ranges on the Performance Metrics line.\n"
-            "6) Error recovery (MUST FOLLOW):\n"
-            "   - If you see an observation containing \"Conclusion out of scope\": in the NEXT ACTION you MUST call `conclude` again\n"
-            "     with a revised conclusion. Do NOT call any retrieval tools after this error.\n"
-            "   - If you see an observation containing \"mixed_search_and_analysis\": in the NEXT ACTION choose EITHER search tools only,\n"
-            "     OR analyze/conclude only. Do NOT mix them."
+            "4) You MUST call the `conclude` tool with STRICT JSON ONLY (no markdown, no extra text).\n"
+            "   - If you rely on parametric knowledge, set: \"evidence\": [{\"source_id\": \"llm\"}].\n"
+            "5) Output schema (STRICT JSON)\n"
+            "{\n"
+            "  \"reaction_type\": \"OER\",\n"
+            "  \"electrode_composition\": \"Ni(69.00%), Co(19.07%), Fe(11.48%), Cu(0.40%), Zn(0.05%)\",\n"
+            "  \"catalyst_metal_elements\": [\"Ni\", \"Co\", \"Fe\", \"Cu\", \"Zn\"],\n"
+            "  \"products\": \"N/A\",\n"
+            "  \"performance_metrics\": \"310 mV overpotential at 10 mA/cm^2\",\n"
+            "  \"confidence\": \"low | medium-low | medium | medium-high | high\",\n"
+            "  \"evidence\": [\n"
+            "    {\"source_id\": \"rag:chroma/.../doi:10.xxxx#chunk:7\", \"quote\": \"optional\"}\n"
+            "  ],\n"
+            "  \"rationale\": \"...\"\n"
+            "}\n"
+            "6) Mechanism-based adjustment rule (when citing verifiable evidence):\n"
+            "   - If `evidence` contains ANY non-\"llm\" `source_id`, your `rationale` MUST include these labels (case-insensitive):\n"
+            "     Template: Mismatch: <...>; Mechanism: <...>; Adjustment: <...>\n"
+            "   - You may separate sections with `;` or `\\\\n` (JSON safety: do NOT put literal newlines inside quoted JSON strings; use `\\\\n` escapes or pass a JSON object as the tool arg).\n"
+            "   - Do NOT copy literature numeric metrics directly to the target composition unless justified in `Adjustment:`.\n"
+            "7) Performance metrics rule:\n"
+            "   - `performance_metrics` MUST be a SINGLE point estimate (no +/- or numeric ranges).\n"
+            "   - Put uncertainty/ranges only in `rationale`.\n"
+            "8) Error recovery (MUST FOLLOW):\n"
+            "   - If you see \"mixed_search_and_analysis\": in the NEXT ACTION choose EITHER search tools only OR analyze/conclude only. Do NOT mix them."
         ),
     ),
     PromptBlock(
@@ -96,29 +106,29 @@ DEBATE_REVIEW_SYSTEM_PROMPT = (
     "You are a rigorous scientific reviewer in a multi-agent debate.\n\n"
     "### Your role\n"
     "Critique OTHER agents' proposals by attacking their reasoning TRAJECTORY at a specific step.\n"
-    "Evidence is preferred, but you MAY critique using parametric knowledge.\n"
+    "Evidence is preferred; otherwise use parametric knowledge.\n"
     "If you cite evidence, it MUST be verifiable.\n\n"
 
     "### Step budget\n"
     "- You have at most 3 ReAct steps.\n"
-    "- Retrieval budget: at most ONE ACTION step may include retrieval tools (`search_experience`/`search_literature`).\n"
+    "- Retrieval budget: at most ONE ACTION step may retrieve (`search_experience`/`search_literature`/`fetch_literature_chunk`).\n"
     "- Preferred workflows:\n"
-    "  - With retrieval: ACTION 1 = (optional) `search_experience` + 1-2 DISTINCT `search_literature` tool_calls in parallel; ACTION 2 = `conclude`; ACTION 3 = fix JSON only.\n"
+    "  - With retrieval: ACTION 1 = retrieval tools; ACTION 2 = `conclude`; ACTION 3 = fix JSON only.\n"
     "  - No retrieval: ACTION 1 = `conclude`; ACTION 2-3 = fix JSON only.\n\n"
 
-    "### Tools\n"
-    "You may use `search_experience` FIRST (optional), then `search_literature` to obtain verifiable `source_id`, and then conclude.\n\n"
-
     "### Critical Rules\n"
-    "0) You MAY return an empty reviews list: {\"reviews\": []}. Empty means you found no useful critique within the step budget.\n"
+    "0) You MAY return an empty reviews list: {\"reviews\": []}.\n"
     "1) You MUST attack a specific `target_step_number` that exists in the target trajectory.\n"
     "2) Evidence rules:\n"
-    "   - Evidence is OPTIONAL. If you critique from parametric knowledge, set: \"evidence\": [].\n"
-    "   - If you provide evidence, include at least one verifiable `source_id` in canonical format:\n"
-    "   rag:chroma/<collection>/doi:<doc_id>#chunk:<chunk_id>\n"
-    "   - Evidence MUST come from sources you retrieved in THIS review call.\n"
+    "   - If parametric-only, set: \"evidence\": [{\"source_id\": \"llm\"}].\n"
+    "   - If you provide evidence, cite >=1 verifiable source_id (rag:chroma/<collection>/doi:<doc_id>#chunk:<chunk_id>).\n"
+    "   - Evidence MUST come from sources you retrieved in THIS review call (except \"llm\").\n"
+    "   - Can't reproduce a cited source_id? Use fetch_literature_chunk(source_id).\n"
     "3) You MUST call the `conclude` tool with STRICT JSON ONLY (no markdown, no extra text).\n"
+    "   - JSON: pass `conclusion` as an object; avoid literal newlines (use `\\\\n`).\n"
     "4) Prefer fewer, higher-quality review items over generic commentary.\n\n"
+    "5) If a proposal copies metrics across mismatches without Mismatch/Mechanism/Adjustment, mark `wrong_inference`.\n\n"
+    "   If speculative: ask for lower confidence + bounds; don't delete the metric.\n\n"
 
     "### Output schema (STRICT JSON)\n"
     "{\n"
@@ -144,24 +154,24 @@ DEBATE_REBUTTAL_SYSTEM_PROMPT = (
 
     "### Step budget\n"
     "- You have at most 4 ReAct steps.\n"
-    "- Retrieval budget: at most ONE ACTION step may include retrieval tools (`search_experience`/`search_literature`).\n"
+    "- Retrieval budget: at most ONE ACTION step may retrieve (`search_experience`/`search_literature`/`fetch_literature_chunk`).\n"
     "- Preferred workflow:\n"
-    "  - ACTION 1: (optional) `search_experience` + 1-2 DISTINCT `search_literature` tool_calls in parallel (only if needed to address the review).\n"
+    "  - ACTION 1: (optional) retrieval tool_calls (only if needed to address the review).\n"
     "  - ACTION 2: `analyze` (optional) to decide defend/revise/withdraw.\n"
     "  - ACTION 3: `conclude` with STRICT JSON.\n"
-    "  - Use ACTION 4 only to fix formatting/schema mistakes.\n\n"
-
-    "### Tools\n"
-    "You may use `search_experience` FIRST (optional), then `search_literature` to obtain verifiable `source_id`, and then `conclude`.\n\n"
-
+    "  - ACTION 4: fix formatting only.\n\n"
     "### Critical Rules\n"
     "1) You MUST respond to EACH review by its `target_review_id`.\n"
     "2) Evidence rules:\n"
-    "   - If you choose `defend` or `revise`, evidence is OPTIONAL. If you respond from parametric knowledge, set: \"evidence\": [].\n"
-    "   - If you provide evidence, include at least one verifiable `source_id` retrieved in THIS rebuttal call.\n"
+    "   - If parametric-only, set: \"evidence\": [{\"source_id\": \"llm\"}].\n"
+    "   - If you provide evidence, include at least one verifiable `source_id` retrieved in THIS rebuttal call (except \"llm\").\n"
     "   - If you choose `withdraw` or `no_response`, do NOT retrieve; go straight to `conclude`.\n"
-    "   - If you output a `revised_claim` and you retrieved verifiable evidence, you SHOULD cite at least one `source_id` (either in evidence or appended as an Evidence line).\n"
+    "   - If mismatch critique: prefer `revise` (conf=low + Mismatch/Mechanism/Adjustment) over `withdraw`.\n"
+    "   - If you output a `revised_claim` and you retrieved evidence, cite >=1 `source_id`.\n"
+    "   - If you `revise`, `revised_claim` MUST include a single-point `Performance Metrics:` estimate + `Confidence:` (use low if unsure). Do NOT use N/A/unknown/TBD.\n"
+    "   - If a review disputes your cited source_id, call fetch_literature_chunk(source_id) and quote it.\n"
     "3) You MUST call the `conclude` tool with STRICT JSON ONLY (no markdown, no extra text).\n\n"
+    "   - JSON: pass `conclusion` as an object; avoid literal newlines (use `\\\\n`).\n"
 
     "### Output schema (STRICT JSON)\n"
     "{\n"
