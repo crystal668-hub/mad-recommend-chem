@@ -54,6 +54,7 @@ _UNIFIED_CONSTRAINTS = PromptBlock(
         "- HZOR: potential or applied potential at 10 mA/cm^2 (state which you report)\n"
         "- O5H: Faradaic efficiency (FE)\n"
         "- CO2RR: 1.the product with the highest Faradaic efficiency (FE) AND the FE value for that product\n"
+        "         - Product is usually one of 'CO, HCOOH, CH4, C2H4, C2H5OH and CH3COOH'.\n"          
         "         2.the partial current density for the product\n"
     ),
 )
