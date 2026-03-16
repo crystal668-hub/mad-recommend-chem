@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from qa.artifacts import QAArtifactStore
@@ -13,6 +14,9 @@ from qa.retrieval_state import RetrievalDiagnosticRecord, RetrievalState
 from qa.state import EntityPack, GroundingState, TaskSpec
 
 
+logger = logging.getLogger("MAD.qa.retrieval")
+
+
 class HeterogeneousRetrievalPipeline:
     def __init__(
         self,
@@ -24,6 +28,7 @@ class HeterogeneousRetrievalPipeline:
         claim_miner: Optional[ClaimMiner] = None,
         ledger_builder: Optional[EvidenceLedgerBuilder] = None,
         peer_review_pipeline: Optional[StructuredPeerReviewPipeline] = None,
+        progress_log_every: int = 10,
     ) -> None:
         self.query_planner = query_planner or QueryPlannerNode()
         self.retriever = retriever or RetrieverNode()
@@ -33,6 +38,7 @@ class HeterogeneousRetrievalPipeline:
         self.claim_miner = claim_miner or ClaimMiner()
         self.ledger_builder = ledger_builder or EvidenceLedgerBuilder()
         self.peer_review_pipeline = peer_review_pipeline
+        self.progress_log_every = max(1, int(progress_log_every))
 
     def run(
         self,
@@ -44,23 +50,32 @@ class HeterogeneousRetrievalPipeline:
         artifact_dir: Optional[str] = None,
     ) -> RetrievalState:
         store = QAArtifactStore(base_dir=artifact_dir)
+        logger.info("qa_retrieval_start question=%s", question)
         query_plans = self.query_planner.run(task_spec=task_spec, entity_pack=entity_pack)
+        logger.info("qa_query_planning_complete query_plans=%s", len(query_plans))
         paper_candidates = self.retriever.run(
             task_spec=task_spec,
             entity_pack=entity_pack,
             query_plans=query_plans,
             artifact_store=store,
         )
+        logger.info("qa_retrieval_candidates_complete paper_candidates=%s", len(paper_candidates))
         provider_health: dict[str, dict] = dict(getattr(self.retriever, "last_provider_health", {}) or {})
         retrieval_diagnostics: list[RetrievalDiagnosticRecord] = list(getattr(self.retriever, "last_diagnostics", []) or [])
         paper_records, section_indices = self.document_acquirer.run(
             candidates=paper_candidates,
             artifact_store=store,
         )
+        logger.info(
+            "qa_document_acquisition_complete paper_records=%s indexed_fulltexts=%s",
+            len(paper_records),
+            sum(1 for item in section_indices if item.fulltext_status == "fulltext_indexed"),
+        )
         provider_health.update(dict(getattr(self.document_acquirer, "last_provider_health", {}) or {}))
         retrieval_diagnostics.extend(list(getattr(self.document_acquirer, "last_diagnostics", []) or []))
         evidence_items = []
-        for paper_record, section_index in zip(paper_records, section_indices):
+        total_papers = len(paper_records)
+        for index, (paper_record, section_index) in enumerate(zip(paper_records, section_indices), start=1):
             evidence_items.extend(
                 self.evidence_extractor.run(
                     task_spec=task_spec,
@@ -69,7 +84,16 @@ class HeterogeneousRetrievalPipeline:
                     section_index=section_index,
                 )
             )
+            if index == total_papers or index % self.progress_log_every == 0:
+                logger.info(
+                    "qa_evidence_extraction_progress completed=%s/%s evidence_items=%s",
+                    index,
+                    total_papers,
+                    len(evidence_items),
+                )
+        logger.info("qa_claim_mining_start evidence_items=%s", len(evidence_items))
         claims = self.claim_miner.run(evidence_items=evidence_items, task_spec=task_spec)
+        logger.info("qa_claim_mining_complete claims=%s", len(claims))
         evidence_ledger = self.ledger_builder.run(claims=claims, evidence_items=evidence_items)
         if self.peer_review_pipeline is not None:
             evidence_ledger = self.peer_review_pipeline.run(evidence_ledger, task_spec=task_spec)

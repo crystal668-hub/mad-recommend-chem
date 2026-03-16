@@ -9,6 +9,30 @@ from typing import Any, Iterable, List, Optional
 DOI_PREFIX_PATTERN = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", re.I)
 WHITESPACE_PATTERN = re.compile(r"\s+")
 TITLE_NORMALIZE_PATTERN = re.compile(r"[^a-z0-9]+")
+PLACEHOLDER_TEXT_PATTERNS = (
+    re.compile(r"^\s*redirecting\s*$", re.I),
+    re.compile(r"^\s*loading\s*$", re.I),
+    re.compile(r"\benable javascript\b", re.I),
+    re.compile(r"\baccess denied\b", re.I),
+    re.compile(r"\btemporarily unavailable\b", re.I),
+)
+GARBLED_TEXT_MARKERS = ("JFIF", "ICC_PROFILE", "8BIM")
+TEXTUAL_CONTENT_TYPE_PREFIXES = ("text/",)
+TEXTUAL_CONTENT_TYPES = {
+    "application/json",
+    "application/ld+json",
+    "application/xml",
+    "application/xhtml+xml",
+    "application/javascript",
+    "application/x-javascript",
+}
+CONTENT_TYPE_EXTENSIONS = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "application/octet-stream": "bin",
+}
 
 
 def normalize_doi(value: Optional[str]) -> Optional[str]:
@@ -62,6 +86,50 @@ def slugify(value: str, max_length: int = 80) -> str:
     if not normalized:
         return "artifact"
     return normalized[:max_length].strip("_") or "artifact"
+
+
+def is_textual_content_type(content_type: Optional[str]) -> bool:
+    normalized = normalize_text(content_type).lower()
+    if not normalized:
+        return False
+    if normalized in TEXTUAL_CONTENT_TYPES:
+        return True
+    return any(normalized.startswith(prefix) for prefix in TEXTUAL_CONTENT_TYPE_PREFIXES)
+
+
+def guess_binary_extension(content_type: Optional[str]) -> str:
+    normalized = normalize_text(content_type).lower()
+    return CONTENT_TYPE_EXTENSIONS.get(normalized, "bin")
+
+
+def printable_text_ratio(value: Optional[str]) -> float:
+    text = str(value or "")
+    if not text:
+        return 0.0
+    printable = sum(1 for char in text if char.isprintable() or char in "\n\r\t")
+    return printable / float(len(text))
+
+
+def looks_like_placeholder_text(value: Optional[str]) -> bool:
+    text = normalize_text(value)
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in PLACEHOLDER_TEXT_PATTERNS)
+
+
+def looks_like_garbled_text(value: Optional[str]) -> bool:
+    text = str(value or "")
+    if not text:
+        return False
+    if any(marker in text for marker in GARBLED_TEXT_MARKERS):
+        return True
+    if "\x00" in text:
+        return True
+    if printable_text_ratio(text) < 0.85:
+        alpha_words = re.findall(r"[A-Za-z]{3,}", text)
+        if len(text) > 200 and len(alpha_words) < 8:
+            return True
+    return False
 
 
 def flatten_author_names(raw_authors: Any) -> List[str]:

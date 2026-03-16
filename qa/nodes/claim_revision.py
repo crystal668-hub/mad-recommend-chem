@@ -34,6 +34,7 @@ class ClaimRevisionNode:
         task_spec: Optional[TaskSpec] = None,
         review_flags: Sequence[ReviewFlag] = (),
         conflict_edges: Sequence[ConflictEdge] = (),
+        use_llm: bool = True,
     ) -> Tuple[ClaimRecord, ClaimRevisionRecord, bool]:
         evidence_lookup = build_evidence_lookup(evidence_ledger)
         valid_support = traceable_evidence_items(claim.supporting_evidence_ids, evidence_lookup=evidence_lookup)
@@ -116,6 +117,7 @@ class ClaimRevisionNode:
             supporting_items=revised_support_items,
             allowed_condition_scope=updated_scope,
             fallback_claim_text=revised_text,
+            use_llm=use_llm,
         )
         if llm_revision is not None:
             llm_scope = llm_revision["condition_scope"]
@@ -195,8 +197,9 @@ class ClaimRevisionNode:
         supporting_items: Sequence[object],
         allowed_condition_scope: Dict[str, str],
         fallback_claim_text: str,
+        use_llm: bool,
     ) -> Optional[Dict[str, Any]]:
-        if self.llm is None:
+        if self.llm is None or not use_llm:
             return None
         messages = [
             {"role": "system", "content": CLAIM_REVISION_SYSTEM_PROMPT},

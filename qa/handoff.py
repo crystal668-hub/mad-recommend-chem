@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 from qa.retrieval_state import PaperRecord, Section, SectionIndex, SectionTextView
+from qa.retrieval_utils import looks_like_garbled_text, looks_like_placeholder_text
 from qa.state import SourceSpan, TaskSpec
 
 
@@ -15,6 +16,8 @@ FULLTEXT_SECTION_POLICY = {
     "comparison": ("results", "discussion", "methods"),
 }
 FULLTEXT_FALLBACK_SECTIONS = ("results", "discussion", "methods")
+UNKNOWN_FULLTEXT_MIN_CHARS = 800
+UNKNOWN_FULLTEXT_MIN_ALPHA_TOKENS = 80
 
 
 class EvidenceExtractorHandoff:
@@ -100,6 +103,15 @@ class EvidenceExtractorHandoff:
             view = self.read_section_text(paper_record=paper_record, section_index=section_index, section_id=section.section_id)
             if view is not None:
                 section_views.append(view)
+        if section_views:
+            return section_views
+        for section in section_index.sections:
+            if section.section_type != "unknown":
+                continue
+            view = self.read_section_text(paper_record=paper_record, section_index=section_index, section_id=section.section_id)
+            if view is None or not self._allow_unknown_fulltext_view(view.text):
+                continue
+            section_views.append(view)
         return section_views
 
     def fulltext_span_to_section_span(self, section: Section, fulltext_span: SourceSpan) -> SourceSpan:
@@ -109,3 +121,12 @@ class EvidenceExtractorHandoff:
             start=start - section.fulltext_char_start,
             end=end - section.fulltext_char_start,
         )
+
+    def _allow_unknown_fulltext_view(self, text: str) -> bool:
+        cleaned = str(text or "")
+        if len(cleaned) < UNKNOWN_FULLTEXT_MIN_CHARS:
+            return False
+        if looks_like_placeholder_text(cleaned) or looks_like_garbled_text(cleaned):
+            return False
+        alpha_tokens = sum(1 for token in cleaned.split() if any(char.isalpha() for char in token))
+        return alpha_tokens >= UNKNOWN_FULLTEXT_MIN_ALPHA_TOKENS

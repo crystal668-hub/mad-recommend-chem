@@ -43,6 +43,7 @@ class MethodologyReviewer:
         task_spec: Optional[TaskSpec] = None,
         review_round: int = 1,
         focus_flag_types: Optional[Sequence[str]] = None,
+        use_llm: bool = True,
     ) -> List[ReviewFlag]:
         focus = set(focus_flag_types or [])
         evidence_lookup = build_evidence_lookup(evidence_ledger)
@@ -133,6 +134,7 @@ class MethodologyReviewer:
                 supporting_items=supporting_items,
                 review_round=review_round,
                 focus_flag_types=sorted(focus) if focus else None,
+                use_llm=use_llm,
             )
         )
         if focus:
@@ -180,8 +182,9 @@ class MethodologyReviewer:
         supporting_items: Sequence[object],
         review_round: int,
         focus_flag_types: Optional[Sequence[str]],
+        use_llm: bool,
     ) -> List[ReviewFlag]:
-        if self.llm is None:
+        if self.llm is None or not use_llm:
             return []
         evidence_payload = [
             {

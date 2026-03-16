@@ -50,12 +50,22 @@ INFERENCE_NODE_MODEL_KEYS = (
 
 DEFAULT_QA_MODEL_ALIASES = {node_name: "agent1" for node_name in INFERENCE_NODE_MODEL_KEYS}
 
+DEFAULT_QA_PEER_REVIEW_CONFIG: Dict[str, Any] = {
+    "max_claims_for_llm_review": 40,
+    "max_second_round_claims": 15,
+    "disable_llm_review_when_abstract_only": True,
+    "fallback_mode": "deterministic_only",
+}
+
 DEFAULT_QA_CONFIG: Dict[str, Any] = {
     "save_output": True,
     "outputs_dir": None,
     "artifact_subdir": "qa_artifacts",
     "enable_peer_review": True,
+    "model_timeout_seconds": 45.0,
+    "progress_log_every_claims": 10,
     "models": copy.deepcopy(DEFAULT_QA_MODEL_ALIASES),
+    "peer_review": copy.deepcopy(DEFAULT_QA_PEER_REVIEW_CONFIG),
     "providers": {
         "openalex_mailto": None,
         "crossref_mailto": None,
@@ -84,6 +94,7 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     qa_config = copy.deepcopy(DEFAULT_QA_CONFIG)
     raw_qa_config = dict((config or {}).get("qa", {}) or {})
     raw_models = dict(raw_qa_config.pop("models", {}) or {})
+    raw_peer_review = dict(raw_qa_config.pop("peer_review", {}) or {})
     raw_providers = dict(raw_qa_config.pop("providers", {}) or {})
     qa_config.update(raw_qa_config)
 
@@ -98,6 +109,8 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
     provider_config = copy.deepcopy(DEFAULT_QA_CONFIG["providers"])
     provider_config.update(raw_providers)
+    peer_review_config = copy.deepcopy(DEFAULT_QA_PEER_REVIEW_CONFIG)
+    peer_review_config.update(raw_peer_review)
 
     qa_config["save_output"] = bool(qa_config.get("save_output", DEFAULT_QA_CONFIG["save_output"]))
     qa_config["outputs_dir"] = str(outputs_dir)
@@ -105,7 +118,36 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     qa_config["enable_peer_review"] = bool(
         qa_config.get("enable_peer_review", DEFAULT_QA_CONFIG["enable_peer_review"])
     )
+    qa_config["model_timeout_seconds"] = _coerce_positive_float(
+        qa_config.get("model_timeout_seconds"),
+        fallback=45.0,
+    )
+    qa_config["progress_log_every_claims"] = _coerce_positive_int(
+        qa_config.get("progress_log_every_claims"),
+        fallback=10,
+    )
     qa_config["models"] = model_aliases
+    qa_config["peer_review"] = {
+        "max_claims_for_llm_review": _coerce_positive_int(
+            peer_review_config.get("max_claims_for_llm_review"),
+            fallback=DEFAULT_QA_PEER_REVIEW_CONFIG["max_claims_for_llm_review"],
+        ),
+        "max_second_round_claims": _coerce_positive_int(
+            peer_review_config.get("max_second_round_claims"),
+            fallback=DEFAULT_QA_PEER_REVIEW_CONFIG["max_second_round_claims"],
+        ),
+        "disable_llm_review_when_abstract_only": bool(
+            peer_review_config.get(
+                "disable_llm_review_when_abstract_only",
+                DEFAULT_QA_PEER_REVIEW_CONFIG["disable_llm_review_when_abstract_only"],
+            )
+        ),
+        "fallback_mode": _coerce_allowed_text(
+            peer_review_config.get("fallback_mode"),
+            allowed={"deterministic_only"},
+            fallback=DEFAULT_QA_PEER_REVIEW_CONFIG["fallback_mode"],
+        ),
+    }
     qa_config["providers"] = {
         "openalex_mailto": _resolve_provider_text(provider_config.get("openalex_mailto")),
         "crossref_mailto": _resolve_provider_text(provider_config.get("crossref_mailto")),
@@ -142,6 +184,9 @@ def build_qa_runtime(
     warnings: list[str] = []
     llm_manifest: Dict[str, Any] = {}
     llm_cache: Dict[str, Any] = {}
+    default_model_timeout = qa_config["model_timeout_seconds"]
+    progress_log_every_claims = qa_config["progress_log_every_claims"]
+    peer_review_config = dict(qa_config.get("peer_review", {}) or {})
 
     def get_node_llm(node_name: str) -> Any:
         requested_alias = str(qa_config["models"].get(node_name) or "").strip()
@@ -151,6 +196,7 @@ def build_qa_runtime(
             "provider": None,
             "model": None,
             "fallback": "deterministic",
+            "timeout_seconds": None,
         }
         llm_manifest[node_name] = entry
 
@@ -185,12 +231,21 @@ def build_qa_runtime(
             entry["error"] = "missing_api_key"
             return None
 
+        configured_timeout = model_config.get("timeout") or model_config.get("request_timeout") or default_model_timeout
+        entry["timeout_seconds"] = configured_timeout
         if requested_alias in llm_cache:
             entry["enabled"] = True
             return llm_cache[requested_alias]
 
+        effective_model_config = dict(model_config)
+        configured_timeout = effective_model_config.get("timeout") or effective_model_config.get("request_timeout")
+        if configured_timeout in (None, "") and default_model_timeout is not None:
+            effective_model_config["timeout"] = default_model_timeout
+            configured_timeout = default_model_timeout
+        entry["timeout_seconds"] = configured_timeout
+
         try:
-            llm = build_chat_model_from_config(model_config)
+            llm = build_chat_model_from_config(effective_model_config)
         except Exception as exc:
             message = (
                 f"Failed to build chat model for qa.models.{node_name} -> llm.{requested_alias}: {exc}; "
@@ -257,6 +312,9 @@ def build_qa_runtime(
             "outputs_dir": qa_config["outputs_dir"],
             "artifact_subdir": qa_config["artifact_subdir"],
             "enable_peer_review": qa_config["enable_peer_review"],
+            "model_timeout_seconds": qa_config["model_timeout_seconds"],
+            "progress_log_every_claims": qa_config["progress_log_every_claims"],
+            "peer_review": qa_config["peer_review"],
         },
         "models": llm_manifest,
         "providers": {
@@ -339,6 +397,7 @@ def build_qa_runtime(
             claim_miner=ClaimMiner(llm=get_node_llm("claim_miner")),
             ledger_builder=EvidenceLedgerBuilder(),
             peer_review_pipeline=None,
+            progress_log_every=progress_log_every_claims,
         )
 
     if not qa_config["enable_peer_review"]:
@@ -350,11 +409,17 @@ def build_qa_runtime(
             contradiction_reviewer=ContradictionReviewer(llm=get_node_llm("contradiction_reviewer")),
             claim_revision_node=ClaimRevisionNode(llm=get_node_llm("claim_revision")),
             review_merge_node=ReviewMergeNode(llm=get_node_llm("review_merge")),
+            max_claims_for_llm_review=peer_review_config["max_claims_for_llm_review"],
+            max_second_round_claims=peer_review_config["max_second_round_claims"],
+            disable_llm_review_when_abstract_only=peer_review_config["disable_llm_review_when_abstract_only"],
+            fallback_mode=peer_review_config["fallback_mode"],
+            progress_log_every_claims=progress_log_every_claims,
         )
 
     if synthesis_pipeline is None:
         synthesis_pipeline = VerifiedSynthesisPipeline(
             synthesizer=SynthesizerNode(llm=get_node_llm("synthesizer")),
+            progress_log_every=progress_log_every_claims,
         )
 
     return QARuntime(
@@ -395,3 +460,16 @@ def _coerce_non_negative_int(value: Any, *, fallback: int) -> int:
     except (TypeError, ValueError):
         return fallback
     return number if number >= 0 else fallback
+
+
+def _coerce_positive_int(value: Any, *, fallback: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return number if number > 0 else fallback
+
+
+def _coerce_allowed_text(value: Any, *, allowed: set[str], fallback: str) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in allowed else fallback

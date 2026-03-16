@@ -9,7 +9,7 @@ from urllib.parse import quote
 import requests
 
 from qa.retrieval_state import QueryPlan
-from qa.retrieval_utils import normalize_doi
+from qa.retrieval_utils import is_textual_content_type, normalize_doi
 
 
 _RETRYABLE_STATUS_CODES = {408, 429}
@@ -476,4 +476,10 @@ class HttpTextFetcher(_HttpTransportMixin):
         content_type = str(response.headers.get("content-type") or "").split(";")[0].strip().lower()
         if content_type == "application/pdf" or url.lower().endswith(".pdf"):
             return FetchedDocument(url=url, content_type="application/pdf", binary=response.content)
-        return FetchedDocument(url=url, content_type=content_type or "text/plain", text=response.text)
+        if is_textual_content_type(content_type):
+            return FetchedDocument(url=url, content_type=content_type or "text/plain", text=response.text)
+        return FetchedDocument(
+            url=url,
+            content_type=content_type or "application/octet-stream",
+            binary=response.content,
+        )

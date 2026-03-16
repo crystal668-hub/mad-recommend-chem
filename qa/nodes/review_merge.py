@@ -22,6 +22,7 @@ class ReviewMergeNode:
         active_flags: Sequence[ReviewFlag],
         active_conflict_edges: Sequence[ConflictEdge],
         revision_records: Sequence[ClaimRevisionRecord],
+        use_llm: bool = True,
     ) -> Tuple[str, str]:
         evidence_lookup = build_evidence_lookup(evidence_ledger)
         supporting_items = traceable_evidence_items(claim.supporting_evidence_ids, evidence_lookup=evidence_lookup)
@@ -44,7 +45,7 @@ class ReviewMergeNode:
 
         warnings = [flag for flag in active_flags if flag.severity == "warning"]
         if warnings:
-            if self._should_use_llm(active_flags=active_flags, active_conflict_edges=active_conflict_edges):
+            if use_llm and self._should_use_llm(active_flags=active_flags, active_conflict_edges=active_conflict_edges):
                 adjudicated = self._adjudicate_with_llm(
                     claim=claim,
                     active_flags=active_flags,

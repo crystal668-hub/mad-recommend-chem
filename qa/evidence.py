@@ -23,7 +23,12 @@ from qa.retrieval_state import (
     SectionIndex,
     SectionTextView,
 )
-from qa.retrieval_utils import normalize_text, slugify
+from qa.retrieval_utils import (
+    looks_like_garbled_text,
+    looks_like_placeholder_text,
+    normalize_text,
+    slugify,
+)
 from qa.state import EntityPack, TaskSpec
 
 
@@ -197,6 +202,32 @@ PREFIXED_CONDITION_PATTERNS: Dict[str, Sequence[re.Pattern[str]]] = {
     ),
 }
 SOURCE_LAYER_BY_SECTION = {"abstract": "abstract"}
+ENTITY_STOPWORDS = {
+    "abstract",
+    "advanced",
+    "at",
+    "background",
+    "besides",
+    "body",
+    "conclusion",
+    "conclusions",
+    "discussion",
+    "especially",
+    "experimental",
+    "finally",
+    "for",
+    "in",
+    "introduction",
+    "materials",
+    "methods",
+    "on",
+    "results",
+    "the",
+    "this",
+    "these",
+    "those",
+    "with",
+}
 ENTITY_TYPE_TO_AXIS = {
     "catalyst": "catalyst",
     "material": "material",
@@ -402,6 +433,8 @@ class EvidenceExtractor:
             snippet = raw_snippet.strip()
             if len(snippet) < 12:
                 continue
+            if not self._is_usable_snippet(snippet):
+                continue
             lead_trim = len(raw_snippet) - len(raw_snippet.lstrip())
             start = match.start() + lead_trim
             end = start + len(snippet)
@@ -447,7 +480,7 @@ class EvidenceExtractor:
         return _RoleDecision(
             roles=ordered_roles,
             claim_polarity=claim_polarity,
-            entity_mentions=entity_mentions,
+            entity_mentions=self._sanitize_entity_mentions(entity_mentions),
             metric_mentions=metric_mentions,
             notes=note,
         )
@@ -531,13 +564,13 @@ class EvidenceExtractor:
                     mentions.append(entity.canonical_name or candidate_name)
                     break
         if mentions:
-            return self._merge_unique([], mentions)
+            return self._sanitize_entity_mentions(self._merge_unique([], mentions))
         fallback_tokens = [
             token
             for token in CHEMICAL_TOKEN_PATTERN.findall(snippet)
             if len(token) > 1 and not token.isupper()
         ]
-        return self._merge_unique([], fallback_tokens[:3])
+        return self._sanitize_entity_mentions(self._merge_unique([], fallback_tokens[:3]))
 
     def _extract_metric_mentions(self, snippet: str) -> List[str]:
         mentions: List[str] = []
@@ -753,6 +786,45 @@ class EvidenceExtractor:
             merged.append(text)
         return merged
 
+    def _sanitize_entity_mentions(self, mentions: Sequence[str]) -> List[str]:
+        cleaned: List[str] = []
+        seen = set()
+        for mention in mentions:
+            text = normalize_text(mention)
+            if not self._is_valid_entity_text(text):
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(text)
+        return cleaned
+
+    def _is_valid_entity_text(self, text: str) -> bool:
+        cleaned = normalize_text(text)
+        if not cleaned or len(cleaned) < 2:
+            return False
+        if cleaned.lower() in ENTITY_STOPWORDS:
+            return False
+        if not any(char.isalpha() for char in cleaned):
+            return False
+        if len(cleaned.split()) == 1 and cleaned.islower() and cleaned.lower() in ENTITY_STOPWORDS:
+            return False
+        return True
+
+    def _is_usable_snippet(self, snippet: str) -> bool:
+        cleaned = normalize_text(snippet)
+        if not cleaned:
+            return False
+        if looks_like_placeholder_text(cleaned) or looks_like_garbled_text(cleaned):
+            return False
+        if "Traceback (most recent call last)" in cleaned or "UnicodeEncodeError" in cleaned:
+            return False
+        alpha_tokens = re.findall(r"[A-Za-z]{3,}", cleaned)
+        if len(cleaned) > 200 and len(alpha_tokens) < 6:
+            return False
+        return True
+
 
 class ClaimMiner:
     def __init__(self, llm: Any = None) -> None:
@@ -770,8 +842,12 @@ class ClaimMiner:
                 continue
             if item.extraction_confidence <= 0.0:
                 continue
+            if not self._is_usable_claim_evidence(item):
+                continue
             question_type = task_spec.question_type if task_spec is not None else self._infer_question_type(item)
             main_entity = self._derive_main_entity(item=item, question_type=question_type)
+            if not main_entity:
+                continue
             relation_type = self._derive_relation_type(item=item)
             metric_family = self._derive_metric_family(item=item)
             condition_signature = build_condition_signature(item.conditions)
@@ -793,7 +869,7 @@ class ClaimMiner:
             )
             claim_record = self._build_claim(cluster_key=cluster_key, evidence_items=cluster_items, prefix_counts=prefix_counts)
             claim_records.append(claim_record)
-        return claim_records
+        return self._prune_claim_records(claim_records)
 
     __call__ = run
 
@@ -863,16 +939,18 @@ class ClaimMiner:
         )
 
     def _derive_main_entity(self, *, item: EvidenceItem, question_type: str) -> str:
-        mentions = item.entity_mentions or []
+        mentions = self._sanitize_entity_mentions(item.entity_mentions or [])
         if question_type == "comparison" and len(mentions) >= 2:
             return " vs ".join(mentions[:2])
         if mentions:
             return mentions[0]
-        if item.conditions.get("catalyst"):
-            return item.conditions["catalyst"]
-        if item.conditions.get("material"):
-            return item.conditions["material"]
-        return slugify(item.paper_id, max_length=32)
+        catalyst = normalize_text(item.conditions.get("catalyst"))
+        if self._is_valid_entity_text(catalyst):
+            return catalyst
+        material = normalize_text(item.conditions.get("material"))
+        if self._is_valid_entity_text(material):
+            return material
+        return ""
 
     def _derive_relation_type(self, *, item: EvidenceItem) -> str:
         snippet = item.snippet
@@ -1023,6 +1101,57 @@ class ClaimMiner:
         if opposing_count:
             confidence -= 0.08
         return round(max(0.05, min(confidence, 0.95)), 2)
+
+    def _sanitize_entity_mentions(self, mentions: Sequence[str]) -> List[str]:
+        cleaned: List[str] = []
+        seen = set()
+        for mention in mentions:
+            text = normalize_text(mention)
+            if not self._is_valid_entity_text(text):
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(text)
+        return cleaned
+
+    def _is_valid_entity_text(self, text: str) -> bool:
+        cleaned = normalize_text(text)
+        if not cleaned or len(cleaned) < 2:
+            return False
+        if cleaned.lower() in ENTITY_STOPWORDS:
+            return False
+        if not any(char.isalpha() for char in cleaned):
+            return False
+        return True
+
+    def _is_usable_claim_evidence(self, item: EvidenceItem) -> bool:
+        snippet = normalize_text(item.snippet)
+        if not snippet:
+            return False
+        if looks_like_placeholder_text(snippet) or looks_like_garbled_text(snippet):
+            return False
+        return bool(self._sanitize_entity_mentions(item.entity_mentions or [])) or bool(item.conditions.get("catalyst")) or bool(item.conditions.get("material"))
+
+    def _prune_claim_records(self, claim_records: Sequence[ClaimRecord]) -> List[ClaimRecord]:
+        deduped: List[ClaimRecord] = []
+        seen = set()
+        for claim in claim_records:
+            if not self._is_valid_entity_text(claim.main_entity):
+                continue
+            key = (
+                claim.claim_type,
+                claim.main_entity.lower(),
+                claim.relation_type.lower(),
+                claim.metric_family.lower(),
+                claim.condition_signature,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(claim)
+        return deduped
 
 
 class EvidenceLedgerBuilder:

@@ -9,7 +9,12 @@ from typing import Any, List, Optional, Sequence, Tuple
 from qa.artifacts import QAArtifactStore
 from qa.providers import HttpTextFetcher, ProviderRequestError, ProviderUnavailableError
 from qa.retrieval_state import PaperCandidate, PaperRecord, RetrievalDiagnosticRecord, Section, SectionIndex
-from qa.retrieval_utils import normalize_text
+from qa.retrieval_utils import (
+    guess_binary_extension,
+    looks_like_garbled_text,
+    looks_like_placeholder_text,
+    normalize_text,
+)
 
 
 logger = logging.getLogger("MAD.qa.document_acquirer")
@@ -161,6 +166,13 @@ class DocumentAcquirerNode:
                     )
                     fulltext_available = True
                     fulltext_status = "binary_only"
+                elif fetched.binary is not None:
+                    fulltext_artifact_path = store.write_bytes(
+                        f"fulltext/{candidate.paper_id}.{guess_binary_extension(fetched.content_type)}",
+                        fetched.binary,
+                    )
+                    fulltext_available = True
+                    fulltext_status = "binary_only"
                 else:
                     raw_text = fetched.text or ""
                     fulltext = self._normalize_fulltext(raw_text, fetched.content_type)
@@ -207,7 +219,14 @@ class DocumentAcquirerNode:
             raw_text = self._html_to_text(raw_text)
         normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
         normalized = re.sub(r"\n{3,}", "\n\n", normalized)
-        return normalized.strip()
+        normalized = normalized.strip()
+        if not normalized:
+            return ""
+        if looks_like_placeholder_text(normalized):
+            return ""
+        if looks_like_garbled_text(normalized):
+            return ""
+        return normalized
 
     def _html_to_text(self, raw_html: str) -> str:
         without_scripts = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw_html)

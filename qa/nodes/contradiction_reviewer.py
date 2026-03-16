@@ -35,6 +35,7 @@ class ContradictionReviewer:
         review_round: int = 1,
         focus_claim_ids: Optional[Sequence[str]] = None,
         candidate_pair_keys: Optional[Set[Tuple[str, str]]] = None,
+        use_llm: bool = True,
     ) -> Tuple[List[ReviewFlag], List[ConflictEdge], Set[Tuple[str, str]]]:
         claim_list = list(claims)
         evidence_lookup = build_evidence_lookup(evidence_ledger)
@@ -80,6 +81,7 @@ class ContradictionReviewer:
                     right_support=right_support,
                     shared_axes=shared_axes,
                     differing_axes=differing_axes,
+                    use_llm=use_llm,
                 )
                 if conflict_type is None:
                     continue
@@ -165,13 +167,14 @@ class ContradictionReviewer:
         right_support: Sequence[object],
         shared_axes: Sequence[str],
         differing_axes: Sequence[str],
+        use_llm: bool,
     ) -> Tuple[Optional[str], str, str, str]:
         default = self._deterministic_conflict_type(
             left_claim=left_claim,
             right_claim=right_claim,
             differing_axes=differing_axes,
         )
-        if self.llm is None:
+        if self.llm is None or not use_llm:
             return default
 
         messages = [

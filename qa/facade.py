@@ -52,7 +52,9 @@ class QASystem:
     ) -> QAResult:
         resolved_artifact_dir = self._resolve_artifact_dir(artifact_dir)
         runtime_manifest_path = self._write_runtime_manifest(resolved_artifact_dir)
+        logger.info("qa_run_start artifact_dir=%s", resolved_artifact_dir)
         grounding_state = self.grounding_pipeline.run(question=question, context=context)
+        logger.info("qa_grounding_complete question_type=%s", grounding_state.task_spec.question_type)
         retrieval_state = self.retrieval_pipeline.run_from_grounding(
             grounding_state,
             artifact_dir=resolved_artifact_dir,
@@ -62,17 +64,24 @@ class QASystem:
             raise ValueError("Retrieval pipeline must return an evidence ledger before synthesis.")
 
         review_artifacts: Dict[str, str] = {}
+        execution_warnings: list[str] = []
         if self.peer_review_pipeline is not None:
+            logger.info("qa_peer_review_dispatch claims=%s", len(retrieval_state.evidence_ledger.claims))
             reviewed_ledger = self.peer_review_pipeline.run(
                 retrieval_state.evidence_ledger,
                 task_spec=grounding_state.task_spec,
             )
             retrieval_state = retrieval_state.model_copy(update={"evidence_ledger": reviewed_ledger})
             review_artifacts = self._write_review_artifacts(retrieval_state)
+            execution_warnings = self._merge_execution_warnings(
+                execution_warnings,
+                getattr(self.peer_review_pipeline, "last_execution_warnings", None),
+            )
 
         result = self.synthesis_pipeline.run_from_retrieval(
             retrieval_state,
             artifact_dir=retrieval_state.artifact_dir,
+            execution_warnings=execution_warnings,
         )
 
         artifact_paths = dict(result.artifact_paths)
@@ -102,6 +111,11 @@ class QASystem:
         qa_result_path = artifact_paths.get("qa_result")
         if qa_result_path:
             save_json(finalized_result.model_dump(exclude_none=True), qa_result_path)
+        logger.info(
+            "qa_run_complete artifact_dir=%s warnings=%s",
+            resolved_artifact_dir,
+            len(finalized_result.execution_warnings),
+        )
         return finalized_result
 
     __call__ = run_qa

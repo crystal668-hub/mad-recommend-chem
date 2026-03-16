@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from typing import Optional, Sequence
 
@@ -12,6 +13,9 @@ from qa.state import TaskSpec
 from qa.synthesis_state import QAResult
 
 
+logger = logging.getLogger("MAD.qa.synthesis")
+
+
 class VerifiedSynthesisPipeline:
     def __init__(
         self,
@@ -19,10 +23,12 @@ class VerifiedSynthesisPipeline:
         pack_builder: Optional[SynthesisPackBuilder] = None,
         synthesizer: Optional[SynthesizerNode] = None,
         answer_validator: Optional[AnswerValidator] = None,
+        progress_log_every: int = 10,
     ) -> None:
         self.pack_builder = pack_builder or SynthesisPackBuilder()
         self.synthesizer = synthesizer or SynthesizerNode()
         self.answer_validator = answer_validator or AnswerValidator()
+        self.progress_log_every = max(1, int(progress_log_every))
 
     def run(
         self,
@@ -37,6 +43,12 @@ class VerifiedSynthesisPipeline:
     ) -> QAResult:
         started_at = time.perf_counter()
         store = QAArtifactStore(base_dir=artifact_dir)
+        logger.info(
+            "qa_synthesis_start accepted_claims=%s contested_claims=%s papers=%s",
+            sum(1 for claim in evidence_ledger.claims if claim.status == "accepted"),
+            sum(1 for claim in evidence_ledger.claims if claim.status == "contested"),
+            len(paper_records),
+        )
 
         input_pack = self.pack_builder.run(
             task_spec=task_spec,
@@ -47,9 +59,16 @@ class VerifiedSynthesisPipeline:
             execution_warnings=execution_warnings,
         )
         synthesis_pack_path = store.write_json("synthesis_input_pack.json", input_pack.model_dump(exclude_none=True))
+        logger.info(
+            "qa_synthesis_pack_complete sections=%s citations=%s warnings=%s",
+            len(input_pack.section_claims),
+            len(input_pack.citation_catalog),
+            len(input_pack.execution_warnings),
+        )
 
         fallback_result = self.synthesizer.build_deterministic_result(input_pack)
         draft_result = self.synthesizer.run(input_pack)
+        logger.info("qa_synthesis_draft_complete sections=%s", len(draft_result.sections))
         validated_result = self.answer_validator.run(
             input_pack=input_pack,
             draft_result=draft_result,
@@ -71,6 +90,12 @@ class VerifiedSynthesisPipeline:
             }
         )
         store.write_json("qa_result.json", finalized_result.model_dump(exclude_none=True))
+        logger.info(
+            "qa_synthesis_complete sections=%s citations=%s elapsed=%.3f",
+            len(finalized_result.sections),
+            len(finalized_result.citations),
+            elapsed,
+        )
         return finalized_result
 
     def run_from_retrieval(
