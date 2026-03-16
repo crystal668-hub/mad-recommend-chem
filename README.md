@@ -26,6 +26,10 @@ DEEPSEEK_API_KEY=...
 GOOGLE_API_KEY=...
 QWEN_API_KEY=...
 VOYAGE_API_KEY=...
+OPENALEX_MAILTO=you@example.org
+CROSSREF_MAILTO=you@example.org
+SEMANTIC_SCHOLAR_API_KEY=...
+UNPAYWALL_EMAIL=you@example.org
 ```
 
 Notes:
@@ -33,6 +37,8 @@ Notes:
 - Agent 4 chats via OpenRouter (`model: qwen/qwen3-max-thinking`, `base_url: https://openrouter.ai/api/v1`).
 - Agent 4 embeddings default to DashScope compatible-mode (`emb_url: https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings`), using `embedding_api_key` (typically `QWEN_API_KEY`).
 - See `config/config.yaml` for the exact mapping.
+- `OPENALEX_MAILTO` and `CROSSREF_MAILTO` are recommended for polite external API usage.
+- `UNPAYWALL_EMAIL` is required if you want ChemQA to perform Unpaywall OA lookup.
 
 ### 3) Prepare literature data
 Place Markdown papers under:
@@ -118,8 +124,32 @@ Outputs:
 - Ranking summary: `outputs/rank_<timestamp>.json`
 - Logs and per-debate artifacts: under `logs/runs/<run_id>/`
 
+### 7) Run ChemQA
+
+Ask a literature-grounded chemistry research question through the standalone QA entrypoint:
+
+```bash
+python -m chemqa --question "Does Pt/C improve HER activity in 1 M KOH?" --save-output
+```
+
+Optional controls:
+- `--context`: attach extra constraints or task framing
+- `--artifact-dir`: override the run artifact directory
+- `--config`: load a non-default config file
+
+Outputs:
+- Run artifacts: `logs/runs/<run_id>/qa_artifacts/`
+- User-facing result: `outputs/qa_result_<timestamp>.json`
+
+ChemQA degraded-mode behavior:
+- If literature providers are reachable, ChemQA uses external search/enrichment/fetch as usual.
+- If a provider times out or hits a retry-exhausted network failure, ChemQA marks that provider unavailable for the current run and skips later calls to it.
+- The final answer and CLI output explicitly surface these failures instead of only saying "insufficient evidence".
+- Detailed run-time diagnostics are saved in `retrieval_diagnostics.json` and `provider_health.json` under the QA artifact directory.
+
 ### Outputs
 - Results: `paths.outputs` (default `./outputs`) as `result_<timestamp>.json` (timestamp format: `YYYYMMDD_HHMMSS`)
+- ChemQA results: `qa.outputs_dir` (default `./outputs`) as `qa_result_<timestamp>.json`
 - Logs:
   - rolling: `./logs/system.log`
   - per-run: `./logs/runs/<run_id>/run.log` (plus `events.jsonl`, `db.log`, `debate.log`)
@@ -130,7 +160,23 @@ All runtime configuration lives in `config/config.yaml`:
 - `vector_store.*`: Chroma persistence + base collection name
 - `rag.*`: chunking + retrieval parameters
 - `debate.*`: debate protocol parameters
+- `qa.*`: standalone ChemQA output + peer-review integration controls
 - `paths.outputs`: output directory for saved results
+
+Important ChemQA knobs in `qa.providers`:
+- `openalex_mailto` / `crossref_mailto`: optional contact email passed to provider APIs
+- `semantic_scholar_api_key`: optional Semantic Scholar API key
+- `unpaywall_email`: required to enable Unpaywall lookup
+- `http_timeout`: timeout for provider API requests
+- `fetch_timeout`: timeout for OA full-text fetches
+- `retry_attempts`: retry budget for transient provider/network failures; total attempts = `1 + retry_attempts`
+- `backoff_base_seconds`: initial exponential backoff delay
+- `backoff_max_seconds`: upper bound for exponential backoff delay
+
+Retry policy:
+- Retries apply only to timeouts, connection failures, HTTP `408`, HTTP `429`, and HTTP `5xx`.
+- Other HTTP `4xx` responses are treated as non-retryable request failures.
+- `oa_fetch` retries per URL, but does not globally disable the fetcher for the rest of the run.
 
 ## How it works (high level)
 - `database/text_processor.py`: load + chunk Markdown documents (LlamaIndex parsers)

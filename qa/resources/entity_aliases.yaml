@@ -1,0 +1,80 @@
+molecule:
+  carbon_dioxide:
+    canonical_name: carbon dioxide
+    formula: CO2
+    aliases: [CO2, carbon dioxide]
+  water:
+    canonical_name: water
+    formula: H2O
+    aliases: [H2O, water]
+solvent:
+  water:
+    canonical_name: water
+    formula: H2O
+    aliases: [water, aqueous water]
+  acetonitrile:
+    canonical_name: acetonitrile
+    formula: C2H3N
+    smiles: CC#N
+    aliases: [acetonitrile, MeCN, CH3CN]
+  ethanol:
+    canonical_name: ethanol
+    formula: C2H6O
+    smiles: CCO
+    aliases: [ethanol, EtOH]
+ligand:
+  triphenylphosphine:
+    canonical_name: triphenylphosphine
+    formula: C18H15P
+    aliases: [triphenylphosphine, PPh3]
+reagent:
+  potassium_hydroxide:
+    canonical_name: potassium hydroxide
+    formula: KOH
+    aliases: [KOH, potassium hydroxide]
+  sulfuric_acid:
+    canonical_name: sulfuric acid
+    formula: H2SO4
+    aliases: [H2SO4, sulfuric acid]
+  hydrochloric_acid:
+    canonical_name: hydrochloric acid
+    formula: HCl
+    aliases: [HCl, hydrochloric acid]
+material:
+  nmc811:
+    canonical_name: lithium nickel manganese cobalt oxide
+    entity_subtype: layered oxide cathode
+    formula: LiNi0.8Mn0.1Co0.1O2
+    aliases: [NMC811, LiNi0.8Mn0.1Co0.1O2]
+  graphene:
+    canonical_name: graphene
+    entity_subtype: carbon material
+    aliases: [graphene]
+catalyst:
+  pt_on_c:
+    canonical_name: platinum on carbon
+    entity_subtype: supported catalyst
+    aliases: [Pt/C, platinum on carbon, pt on carbon]
+  nife_ldh:
+    canonical_name: nickel iron layered double hydroxide
+    entity_subtype: layered double hydroxide catalyst
+    aliases: [NiFe-LDH, nickel iron layered double hydroxide]
+substrate:
+  co2:
+    canonical_name: carbon dioxide
+    formula: CO2
+    aliases: [CO2, carbon dioxide]
+metric:
+  faradaic_efficiency:
+    canonical_name: Faradaic efficiency
+    aliases: [Faradaic efficiency, FE]
+  selectivity:
+    canonical_name: selectivity
+    aliases: [selectivity]
+  yield:
+    canonical_name: yield
+    aliases: [yield]
+condition:
+  alkaline:
+    canonical_name: alkaline condition
+    aliases: [alkaline]

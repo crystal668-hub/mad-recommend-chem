@@ -1,0 +1,18 @@
+co2rr:
+  canonical_name: carbon dioxide reduction reaction
+  aliases: [CO2RR, carbon dioxide reduction reaction, CO2 reduction reaction, CO2 reduction]
+her:
+  canonical_name: hydrogen evolution reaction
+  aliases: [HER, hydrogen evolution reaction]
+oer:
+  canonical_name: oxygen evolution reaction
+  aliases: [OER, oxygen evolution reaction]
+orr:
+  canonical_name: oxygen reduction reaction
+  aliases: [ORR, oxygen reduction reaction]
+eor:
+  canonical_name: ethanol oxidation reaction
+  aliases: [EOR, ethanol oxidation reaction]
+uor:
+  canonical_name: urea oxidation reaction
+  aliases: [UOR, urea oxidation reaction]

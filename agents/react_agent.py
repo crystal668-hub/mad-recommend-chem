@@ -19,14 +19,13 @@ Notes:
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
+from agents.chat_models import build_chat_model_from_config
 from agents.react_reasoning import ReActTrajectory, ReActStep, ActionType, ToolCallRecord
 from utils.source_id import build_chroma_source_id, normalize_doc_id, parse_chroma_source_id
 from utils.request_limiter import get_global_limiter
@@ -56,12 +55,6 @@ class ToolResult:
         return self.observation
 
 
-def _resolve_env_var(value: Optional[str]) -> Optional[str]:
-    if value and value.startswith("${") and value.endswith("}"):
-        return os.getenv(value[2:-1])
-    return value
-
-
 def _lazy_langchain_imports():
     try:
         from langchain_openai import ChatOpenAI  
@@ -78,52 +71,6 @@ def _lazy_langchain_imports():
         ) from e
 
     return ChatOpenAI, SystemMessage, HumanMessage, AIMessage, ToolMessage, StructuredTool
-
-
-def _build_chat_model_from_config(model_config: Dict[str, Any]):
-    ChatOpenAI, *_rest = _lazy_langchain_imports()
-
-    api_key = _resolve_env_var(model_config.get("api_key"))
-    if not api_key:
-        raise ValueError("API key not provided (or env var not set) in model_config")
-
-    base_url = model_config.get("base_url") 
-    model = model_config.get("model") 
-    temperature = float(model_config.get("temperature", 0.9))
-    max_tokens = int(model_config.get("max_tokens", 2000))
-
-    sig = inspect.signature(ChatOpenAI)
-    kwargs: Dict[str, Any] = {
-        "model": model,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-
-    # Support both old/new param names across langchain_openai versions.
-    if "api_key" in sig.parameters:
-        kwargs["api_key"] = api_key
-    elif "openai_api_key" in sig.parameters:
-        kwargs["openai_api_key"] = api_key
-
-    if "base_url" in sig.parameters:
-        kwargs["base_url"] = base_url
-    elif "openai_api_base" in sig.parameters:
-        kwargs["openai_api_base"] = base_url
-
-    # Best-effort request timeout support (varies across langchain_openai versions).
-    timeout_s = model_config.get("timeout") or model_config.get("request_timeout")
-    if timeout_s is not None:
-        try:
-            timeout_s = float(timeout_s)
-        except Exception:
-            timeout_s = None
-    if timeout_s is not None:
-        if "timeout" in sig.parameters:
-            kwargs["timeout"] = timeout_s
-        elif "request_timeout" in sig.parameters:
-            kwargs["request_timeout"] = timeout_s
-
-    return ChatOpenAI(**kwargs)
 
 
 class ReActAgent:
@@ -602,7 +549,7 @@ class ReActAgent:
 
     def _get_llm(self):
         if self._llm is None:
-            self._llm = _build_chat_model_from_config(self.model_config)
+            self._llm = build_chat_model_from_config(self.model_config)
         return self._llm
 
     @staticmethod
@@ -711,7 +658,7 @@ class ReActAgent:
         if llm_timeout_seconds is not None:
             llm_cfg = dict(self.model_config or {})
             llm_cfg["timeout"] = float(llm_timeout_seconds)
-            llm = _build_chat_model_from_config(llm_cfg)
+            llm = build_chat_model_from_config(llm_cfg)
         else:
             llm = self._get_llm()
         tools, tools_by_name = self._build_tools()

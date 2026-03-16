@@ -98,6 +98,40 @@ debate:
   # LangGraph-style debate parameters 
   no_response_threshold: 1  # consecutive rounds failing to rebut valid reviews => defeated
   max_reviews_per_target: 2  # per reviewer per target proposal per round
+
+# ===== QA Integration Configuration =====
+qa:
+  save_output: true
+  outputs_dir: "./outputs"
+  artifact_subdir: "qa_artifacts"
+  enable_peer_review: true
+  models:
+    router: "agent1"
+    entity_resolver: "agent1"
+    query_planner: "agent1"
+    evidence_extractor: "agent1"
+    claim_miner: "agent1"
+    methodology_reviewer: "agent1"
+    citation_reviewer: "agent1"
+    contradiction_reviewer: "agent1"
+    claim_revision: "agent1"
+    review_merge: "agent1"
+    synthesizer: "agent1"
+  providers:
+    # Optional contact emails passed to literature APIs.
+    openalex_mailto: "${OPENALEX_MAILTO}"
+    crossref_mailto: "${CROSSREF_MAILTO}"
+    # Optional API/auth settings for enrichment and OA lookup.
+    semantic_scholar_api_key: "${SEMANTIC_SCHOLAR_API_KEY}"
+    unpaywall_email: "${UNPAYWALL_EMAIL}"
+    # Transport timeouts in seconds.
+    http_timeout: 10.0
+    fetch_timeout: 15.0
+    # Retry policy for transient provider/network failures.
+    # Total attempts = 1 + retry_attempts.
+    retry_attempts: 2
+    backoff_base_seconds: 1.0
+    backoff_max_seconds: 8.0
   
 # ===== Experience Store Configuration =====
 experience:
