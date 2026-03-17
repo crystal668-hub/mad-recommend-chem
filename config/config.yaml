@@ -112,6 +112,22 @@ qa:
     max_second_round_claims: 15
     disable_llm_review_when_abstract_only: true
     fallback_mode: "deterministic_only"
+  pdf_extraction:
+    enabled: true
+    primary_backend: "pymupdf"
+    secondary_backend: "docling"
+    ocr_backend: "ocrmypdf"
+    enable_ocr_fallback: true
+    min_total_chars: 800
+    min_chars_per_text_page: 80
+    min_text_page_ratio: 0.5
+    min_printable_ratio: 0.95
+    snippet_target_chars: 1000
+    snippet_overlap_chars: 120
+    preserve_page_blocks: true
+    max_ocr_pages: 40
+    ocr_timeout_seconds: 300
+    skip_ocr_when_text_already_usable: true
   models:
     router: "agent1"
     entity_resolver: "agent1"

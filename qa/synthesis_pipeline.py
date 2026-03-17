@@ -107,13 +107,22 @@ class VerifiedSynthesisPipeline:
     ) -> QAResult:
         if retrieval_state.evidence_ledger is None:
             raise ValueError("RetrievalState must contain an evidence ledger before synthesis can run.")
+        merged_warnings: list[str] = []
+        seen = set()
+        for warning in [*(retrieval_state.execution_warnings or []), *(execution_warnings or [])]:
+            text = str(warning or "").strip()
+            key = text.lower()
+            if not text or key in seen:
+                continue
+            seen.add(key)
+            merged_warnings.append(text)
         return self.run(
             task_spec=retrieval_state.task_spec,
             evidence_ledger=retrieval_state.evidence_ledger,
             paper_records=retrieval_state.paper_records,
             review_summaries=retrieval_state.evidence_ledger.review_summaries,
             retrieval_diagnostics=retrieval_state.retrieval_diagnostics,
-            execution_warnings=execution_warnings,
+            execution_warnings=merged_warnings,
             artifact_dir=artifact_dir or retrieval_state.artifact_dir,
         )
 

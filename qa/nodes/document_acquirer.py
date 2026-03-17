@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
 
 from qa.artifacts import QAArtifactStore
+from qa.pdf_extraction import PDFExtractionPipeline
 from qa.providers import HttpTextFetcher, ProviderRequestError, ProviderUnavailableError
 from qa.retrieval_state import PaperCandidate, PaperRecord, RetrievalDiagnosticRecord, Section, SectionIndex
 from qa.retrieval_utils import (
@@ -46,11 +47,14 @@ class DocumentAcquirerNode:
         self,
         unpaywall_client: Optional[Any] = None,
         fetcher: Optional[Any] = None,
+        pdf_extractor: Optional[PDFExtractionPipeline] = None,
     ) -> None:
         self.unpaywall_client = unpaywall_client
         self.fetcher = fetcher or HttpTextFetcher()
+        self.pdf_extractor = pdf_extractor or PDFExtractionPipeline()
         self.last_diagnostics: List[RetrievalDiagnosticRecord] = []
         self.last_provider_health: dict[str, dict[str, Any]] = {}
+        self.last_execution_warnings: list[str] = []
         self._diagnostic_map: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._provider_health_fallback: dict[str, dict[str, Any]] = {}
 
@@ -64,6 +68,7 @@ class DocumentAcquirerNode:
         section_indices: List[SectionIndex] = []
         self._diagnostic_map = {}
         self._provider_health_fallback = self._init_provider_health()
+        self.last_execution_warnings = []
 
         if self.unpaywall_client is None:
             skipped_candidates = sum(1 for candidate in candidates if candidate.doi)
@@ -99,7 +104,15 @@ class DocumentAcquirerNode:
         fulltext_available = False
         fulltext_format: Optional[str] = None
         fulltext_artifact_path: Optional[str] = None
+        source_artifact_path: Optional[str] = None
+        extraction_report_path: Optional[str] = None
+        sections_artifact_path: Optional[str] = None
+        snippets_artifact_path: Optional[str] = None
+        extraction_warnings: list[str] = []
+        fulltext_extractor: Optional[str] = None
+        ocr_applied = False
         fulltext_status = "abstract_only"
+        indexed_sections: Optional[list[Section]] = None
 
         if self.unpaywall_client and candidate.doi:
             try:
@@ -160,17 +173,43 @@ class DocumentAcquirerNode:
                 self._record_diagnostic(provider="oa_fetch", stage="fetch", outcome="hit")
                 fulltext_format = fetched.content_type
                 if fetched.content_type == "application/pdf" and fetched.binary is not None:
-                    fulltext_artifact_path = store.write_bytes(
-                        f"fulltext/{candidate.paper_id}.pdf",
-                        fetched.binary,
+                    pdf_result = self.pdf_extractor.process(
+                        paper_id=candidate.paper_id,
+                        pdf_bytes=fetched.binary,
+                        artifact_store=store,
                     )
+                    source_artifact_path = pdf_result.source_artifact_path
+                    fulltext_artifact_path = pdf_result.fulltext_artifact_path
+                    extraction_report_path = pdf_result.extraction_report_path
+                    sections_artifact_path = pdf_result.sections_artifact_path
+                    snippets_artifact_path = pdf_result.snippets_artifact_path
+                    extraction_warnings = list(pdf_result.warnings)
+                    fulltext_extractor = pdf_result.extractor
+                    ocr_applied = bool(pdf_result.ocr_applied)
                     fulltext_available = True
-                    fulltext_status = "binary_only"
+                    fulltext_status = pdf_result.fulltext_status
+                    if pdf_result.sections:
+                        indexed_sections = [
+                            Section.model_validate(
+                                {
+                                    "section_id": section_payload.get("section_id"),
+                                    "section_type": section_payload.get("section_type"),
+                                    "heading": section_payload.get("heading"),
+                                    "page_start": section_payload.get("page_start"),
+                                    "page_end": section_payload.get("page_end"),
+                                    "fulltext_char_start": section_payload.get("fulltext_char_start"),
+                                    "fulltext_char_end": section_payload.get("fulltext_char_end"),
+                                }
+                            )
+                            for section_payload in pdf_result.sections
+                        ]
+                    self.last_execution_warnings.extend(extraction_warnings)
                 elif fetched.binary is not None:
                     fulltext_artifact_path = store.write_bytes(
                         f"fulltext/{candidate.paper_id}.{guess_binary_extension(fetched.content_type)}",
                         fetched.binary,
                     )
+                    source_artifact_path = fulltext_artifact_path
                     fulltext_available = True
                     fulltext_status = "binary_only"
                 else:
@@ -181,6 +220,7 @@ class DocumentAcquirerNode:
                             f"fulltext/{candidate.paper_id}.txt",
                             fulltext,
                         )
+                        source_artifact_path = fulltext_artifact_path
                         fulltext_available = True
                         fulltext_status = "fulltext_indexed"
 
@@ -188,6 +228,7 @@ class DocumentAcquirerNode:
             paper_id=candidate.paper_id,
             fulltext_status=fulltext_status,
             fulltext_artifact_path=fulltext_artifact_path,
+            sections=indexed_sections,
         )
         index_artifact_path = store.write_json(
             f"indices/{candidate.paper_id}.json",
@@ -206,9 +247,17 @@ class DocumentAcquirerNode:
             provider_artifacts=provider_artifacts,
             oa_url=oa_url,
             fulltext_available=fulltext_available,
+            fulltext_status=fulltext_status,
             fulltext_format=fulltext_format,
             fulltext_artifact_path=fulltext_artifact_path,
+            source_artifact_path=source_artifact_path,
             index_artifact_path=index_artifact_path,
+            extraction_report_path=extraction_report_path,
+            sections_artifact_path=sections_artifact_path,
+            snippets_artifact_path=snippets_artifact_path,
+            extraction_warnings=extraction_warnings,
+            fulltext_extractor=fulltext_extractor,
+            ocr_applied=ocr_applied,
         )
         return paper_record, section_index
 
@@ -239,9 +288,12 @@ class DocumentAcquirerNode:
         paper_id: str,
         fulltext_status: str,
         fulltext_artifact_path: Optional[str],
+        sections: Optional[Sequence[Section]] = None,
     ) -> SectionIndex:
         if fulltext_status != "fulltext_indexed" or not fulltext_artifact_path:
             return SectionIndex(paper_id=paper_id, fulltext_status=fulltext_status, sections=[])
+        if sections is not None:
+            return SectionIndex(paper_id=paper_id, fulltext_status=fulltext_status, sections=list(sections))
 
         fulltext = Path(fulltext_artifact_path).read_text(encoding="utf-8")
         matches = list(SECTION_HEADING_PATTERN.finditer(fulltext))

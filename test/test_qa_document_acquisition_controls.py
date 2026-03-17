@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import shutil
 import unittest
 import uuid
 from pathlib import Path
+
+import pymupdf as fitz
 
 from qa.artifacts import QAArtifactStore
 from qa.handoff import EvidenceExtractorHandoff
@@ -19,6 +22,17 @@ class _StaticFetcher:
 
     def fetch(self, url: str) -> FetchedDocument:
         return self._fetched
+
+
+def _make_pdf_bytes(pages: list[str]) -> bytes:
+    document = fitz.open()
+    try:
+        for page_text in pages:
+            page = document.new_page()
+            page.insert_textbox(fitz.Rect(40, 40, 555, 800), page_text, fontsize=11)
+        return document.tobytes()
+    finally:
+        document.close()
 
 
 def _candidate() -> PaperCandidate:
@@ -121,6 +135,80 @@ class DocumentAcquisitionTests(unittest.TestCase):
             self.assertTrue(str(records[0].fulltext_artifact_path).endswith(".jpg"))
             self.assertTrue(Path(records[0].fulltext_artifact_path).exists())
             self.assertEqual("binary_only", indices[0].fulltext_status)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_document_acquirer_extracts_real_pdf_into_fulltext_artifacts(self):
+        pdf_bytes = _make_pdf_bytes(
+            [
+                (
+                    "Abstract\n"
+                    + " ".join(["Pt/C improves HER activity in 1 M KOH with stable current density."] * 30)
+                    + "\n\nResults\n"
+                    + " ".join(["The catalyst maintained high activity over repeated cycles in alkaline media."] * 25)
+                )
+            ]
+        )
+        node = DocumentAcquirerNode(
+            unpaywall_client=None,
+            fetcher=_StaticFetcher(
+                FetchedDocument(
+                    url="https://example.test/paper.pdf",
+                    content_type="application/pdf",
+                    binary=pdf_bytes,
+                )
+            ),
+        )
+
+        tmpdir = _workspace_tmpdir()
+        try:
+            records, indices = node.run([_candidate()], artifact_store=QAArtifactStore(base_dir=tmpdir))
+            record = records[0]
+            self.assertTrue(record.fulltext_available)
+            self.assertEqual("fulltext_indexed", record.fulltext_status)
+            self.assertEqual("application/pdf", record.fulltext_format)
+            self.assertIn(record.fulltext_extractor, {"pymupdf", "docling"})
+            self.assertTrue(str(record.source_artifact_path).endswith(".pdf"))
+            self.assertTrue(str(record.fulltext_artifact_path).endswith(".fulltext.txt"))
+            self.assertTrue(str(record.sections_artifact_path).endswith(".sections.json"))
+            self.assertTrue(str(record.snippets_artifact_path).endswith(".snippets.jsonl"))
+            self.assertTrue(Path(record.fulltext_artifact_path).exists())
+            self.assertTrue(Path(record.snippets_artifact_path).exists())
+            self.assertEqual("fulltext_indexed", indices[0].fulltext_status)
+            self.assertTrue(indices[0].sections)
+
+            snippet_lines = [
+                json.loads(line)
+                for line in Path(record.snippets_artifact_path).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertTrue(snippet_lines)
+            self.assertEqual("paper-1", snippet_lines[0]["paper_id"])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_document_acquirer_marks_invalid_pdf_payload_unusable(self):
+        node = DocumentAcquirerNode(
+            unpaywall_client=None,
+            fetcher=_StaticFetcher(
+                FetchedDocument(
+                    url="https://example.test/paper.pdf",
+                    content_type="application/pdf",
+                    binary=b"<html><body>Redirecting</body></html>",
+                )
+            ),
+        )
+
+        tmpdir = _workspace_tmpdir()
+        try:
+            records, indices = node.run([_candidate()], artifact_store=QAArtifactStore(base_dir=tmpdir))
+            record = records[0]
+            self.assertTrue(record.fulltext_available)
+            self.assertEqual("fulltext_unusable", record.fulltext_status)
+            self.assertTrue(record.extraction_warnings)
+            self.assertTrue(Path(record.extraction_report_path).exists())
+            self.assertEqual("fulltext_unusable", indices[0].fulltext_status)
+            self.assertEqual([], indices[0].sections)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 

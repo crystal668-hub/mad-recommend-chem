@@ -68,6 +68,8 @@ class EvidenceExtractorHandoff:
             section_type=section.section_type,
             heading=section.heading,
             text=text,
+            page_start=section.page_start,
+            page_end=section.page_end,
             fulltext_char_start=section.fulltext_char_start,
             fulltext_char_end=section.fulltext_char_end,
         )

@@ -23,7 +23,7 @@ SectionType = Literal[
     "limitations",
     "unknown",
 ]
-FulltextStatus = Literal["abstract_only", "fulltext_indexed", "binary_only", "missing", "error"]
+FulltextStatus = Literal["abstract_only", "fulltext_indexed", "binary_only", "fulltext_unusable", "missing", "error"]
 EvidenceRole = Literal["observation", "condition", "limitation", "mechanism"]
 SourceLayer = Literal["abstract", "fulltext"]
 ClaimPolarity = Literal["support", "oppose", "neutral"]
@@ -111,11 +111,19 @@ class PaperRecord(StrictModel):
     provider_artifacts: Dict[str, str] = Field(default_factory=dict)
     oa_url: Optional[str] = None
     fulltext_available: bool = False
+    fulltext_status: FulltextStatus = "missing"
     fulltext_format: Optional[str] = None
     fulltext_artifact_path: Optional[str] = None
+    source_artifact_path: Optional[str] = None
     index_artifact_path: Optional[str] = None
+    extraction_report_path: Optional[str] = None
+    sections_artifact_path: Optional[str] = None
+    snippets_artifact_path: Optional[str] = None
+    extraction_warnings: List[str] = Field(default_factory=list)
+    fulltext_extractor: Optional[str] = None
+    ocr_applied: bool = False
 
-    @field_validator("authors", "provider_sources", mode="before")
+    @field_validator("authors", "provider_sources", "extraction_warnings", mode="before")
     @classmethod
     def coerce_list(cls, value):
         if value is None:
@@ -129,6 +137,8 @@ class Section(StrictModel):
     section_id: str
     section_type: SectionType
     heading: str
+    page_start: Optional[int] = Field(default=None, ge=1)
+    page_end: Optional[int] = Field(default=None, ge=1)
     fulltext_char_start: int = Field(ge=0)
     fulltext_char_end: int = Field(ge=0)
 
@@ -136,6 +146,8 @@ class Section(StrictModel):
     def validate_offsets(self) -> "Section":
         if self.fulltext_char_end < self.fulltext_char_start:
             raise ValueError("section end must be >= section start")
+        if self.page_start is not None and self.page_end is not None and self.page_end < self.page_start:
+            raise ValueError("section page_end must be >= page_start")
         return self
 
 
@@ -151,6 +163,8 @@ class SectionTextView(StrictModel):
     section_type: SectionType
     heading: str
     text: str
+    page_start: Optional[int] = Field(default=None, ge=1)
+    page_end: Optional[int] = Field(default=None, ge=1)
     fulltext_char_start: int = Field(ge=0)
     fulltext_char_end: int = Field(ge=0)
 
@@ -430,4 +444,15 @@ class RetrievalState(StrictModel):
     retrieval_diagnostics: List[RetrievalDiagnosticRecord] = Field(default_factory=list)
     evidence_items: List[EvidenceItem] = Field(default_factory=list)
     evidence_ledger: Optional[EvidenceLedger] = None
+    execution_warnings: List[str] = Field(default_factory=list)
     artifact_dir: str
+
+    @field_validator("execution_warnings", mode="before")
+    @classmethod
+    def coerce_execution_warnings(cls, value):
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        text = str(value).strip()
+        return [text] if text else []

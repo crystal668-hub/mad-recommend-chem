@@ -39,6 +39,7 @@ class HeterogeneousRetrievalPipeline:
         self.ledger_builder = ledger_builder or EvidenceLedgerBuilder()
         self.peer_review_pipeline = peer_review_pipeline
         self.progress_log_every = max(1, int(progress_log_every))
+        self.last_execution_warnings: list[str] = []
 
     def run(
         self,
@@ -62,6 +63,7 @@ class HeterogeneousRetrievalPipeline:
         logger.info("qa_retrieval_candidates_complete paper_candidates=%s", len(paper_candidates))
         provider_health: dict[str, dict] = dict(getattr(self.retriever, "last_provider_health", {}) or {})
         retrieval_diagnostics: list[RetrievalDiagnosticRecord] = list(getattr(self.retriever, "last_diagnostics", []) or [])
+        execution_warnings: list[str] = []
         paper_records, section_indices = self.document_acquirer.run(
             candidates=paper_candidates,
             artifact_store=store,
@@ -73,6 +75,8 @@ class HeterogeneousRetrievalPipeline:
         )
         provider_health.update(dict(getattr(self.document_acquirer, "last_provider_health", {}) or {}))
         retrieval_diagnostics.extend(list(getattr(self.document_acquirer, "last_diagnostics", []) or []))
+        execution_warnings.extend(list(getattr(self.document_acquirer, "last_execution_warnings", []) or []))
+        self.last_execution_warnings = list(dict.fromkeys(execution_warnings))
         evidence_items = []
         total_papers = len(paper_records)
         for index, (paper_record, section_index) in enumerate(zip(paper_records, section_indices), start=1):
@@ -119,6 +123,7 @@ class HeterogeneousRetrievalPipeline:
             retrieval_diagnostics=retrieval_diagnostics,
             evidence_items=evidence_items,
             evidence_ledger=evidence_ledger,
+            execution_warnings=self.last_execution_warnings,
             artifact_dir=str(store.root_dir),
         )
 

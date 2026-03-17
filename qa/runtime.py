@@ -20,6 +20,7 @@ from qa.nodes.review_merge import ReviewMergeNode
 from qa.nodes.router import RouterNode
 from qa.nodes.synthesizer import SynthesizerNode
 from qa.pipeline import QueryGroundingPipeline
+from qa.pdf_extraction import PDFExtractionPipeline
 from qa.providers import (
     CrossrefClient,
     HttpTextFetcher,
@@ -57,6 +58,24 @@ DEFAULT_QA_PEER_REVIEW_CONFIG: Dict[str, Any] = {
     "fallback_mode": "deterministic_only",
 }
 
+DEFAULT_QA_PDF_EXTRACTION_CONFIG: Dict[str, Any] = {
+    "enabled": True,
+    "primary_backend": "pymupdf",
+    "secondary_backend": "docling",
+    "ocr_backend": "ocrmypdf",
+    "enable_ocr_fallback": True,
+    "min_total_chars": 800,
+    "min_chars_per_text_page": 80,
+    "min_text_page_ratio": 0.5,
+    "min_printable_ratio": 0.95,
+    "snippet_target_chars": 1000,
+    "snippet_overlap_chars": 120,
+    "preserve_page_blocks": True,
+    "max_ocr_pages": 40,
+    "ocr_timeout_seconds": 300,
+    "skip_ocr_when_text_already_usable": True,
+}
+
 DEFAULT_QA_CONFIG: Dict[str, Any] = {
     "save_output": True,
     "outputs_dir": None,
@@ -66,6 +85,7 @@ DEFAULT_QA_CONFIG: Dict[str, Any] = {
     "progress_log_every_claims": 10,
     "models": copy.deepcopy(DEFAULT_QA_MODEL_ALIASES),
     "peer_review": copy.deepcopy(DEFAULT_QA_PEER_REVIEW_CONFIG),
+    "pdf_extraction": copy.deepcopy(DEFAULT_QA_PDF_EXTRACTION_CONFIG),
     "providers": {
         "openalex_mailto": None,
         "crossref_mailto": None,
@@ -95,6 +115,7 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     raw_qa_config = dict((config or {}).get("qa", {}) or {})
     raw_models = dict(raw_qa_config.pop("models", {}) or {})
     raw_peer_review = dict(raw_qa_config.pop("peer_review", {}) or {})
+    raw_pdf_extraction = dict(raw_qa_config.pop("pdf_extraction", {}) or {})
     raw_providers = dict(raw_qa_config.pop("providers", {}) or {})
     qa_config.update(raw_qa_config)
 
@@ -111,6 +132,8 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     provider_config.update(raw_providers)
     peer_review_config = copy.deepcopy(DEFAULT_QA_PEER_REVIEW_CONFIG)
     peer_review_config.update(raw_peer_review)
+    pdf_extraction_config = copy.deepcopy(DEFAULT_QA_PDF_EXTRACTION_CONFIG)
+    pdf_extraction_config.update(raw_pdf_extraction)
 
     qa_config["save_output"] = bool(qa_config.get("save_output", DEFAULT_QA_CONFIG["save_output"]))
     qa_config["outputs_dir"] = str(outputs_dir)
@@ -146,6 +169,74 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
             peer_review_config.get("fallback_mode"),
             allowed={"deterministic_only"},
             fallback=DEFAULT_QA_PEER_REVIEW_CONFIG["fallback_mode"],
+        ),
+    }
+    qa_config["pdf_extraction"] = {
+        "enabled": bool(pdf_extraction_config.get("enabled", DEFAULT_QA_PDF_EXTRACTION_CONFIG["enabled"])),
+        "primary_backend": _coerce_allowed_text(
+            pdf_extraction_config.get("primary_backend"),
+            allowed={"pymupdf"},
+            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["primary_backend"],
+        ),
+        "secondary_backend": _coerce_allowed_text(
+            pdf_extraction_config.get("secondary_backend"),
+            allowed={"docling"},
+            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["secondary_backend"],
+        ),
+        "ocr_backend": _coerce_allowed_text(
+            pdf_extraction_config.get("ocr_backend"),
+            allowed={"ocrmypdf"},
+            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["ocr_backend"],
+        ),
+        "enable_ocr_fallback": bool(
+            pdf_extraction_config.get(
+                "enable_ocr_fallback",
+                DEFAULT_QA_PDF_EXTRACTION_CONFIG["enable_ocr_fallback"],
+            )
+        ),
+        "min_total_chars": _coerce_non_negative_int(
+            pdf_extraction_config.get("min_total_chars"),
+            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["min_total_chars"],
+        ),
+        "min_chars_per_text_page": _coerce_positive_int(
+            pdf_extraction_config.get("min_chars_per_text_page"),
+            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["min_chars_per_text_page"],
+        ),
+        "min_text_page_ratio": _coerce_probability(
+            pdf_extraction_config.get("min_text_page_ratio"),
+            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["min_text_page_ratio"],
+        ),
+        "min_printable_ratio": _coerce_probability(
+            pdf_extraction_config.get("min_printable_ratio"),
+            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["min_printable_ratio"],
+        ),
+        "snippet_target_chars": _coerce_positive_int(
+            pdf_extraction_config.get("snippet_target_chars"),
+            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["snippet_target_chars"],
+        ),
+        "snippet_overlap_chars": _coerce_non_negative_int(
+            pdf_extraction_config.get("snippet_overlap_chars"),
+            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["snippet_overlap_chars"],
+        ),
+        "preserve_page_blocks": bool(
+            pdf_extraction_config.get(
+                "preserve_page_blocks",
+                DEFAULT_QA_PDF_EXTRACTION_CONFIG["preserve_page_blocks"],
+            )
+        ),
+        "max_ocr_pages": _coerce_positive_int(
+            pdf_extraction_config.get("max_ocr_pages"),
+            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["max_ocr_pages"],
+        ),
+        "ocr_timeout_seconds": _coerce_positive_int(
+            pdf_extraction_config.get("ocr_timeout_seconds"),
+            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["ocr_timeout_seconds"],
+        ),
+        "skip_ocr_when_text_already_usable": bool(
+            pdf_extraction_config.get(
+                "skip_ocr_when_text_already_usable",
+                DEFAULT_QA_PDF_EXTRACTION_CONFIG["skip_ocr_when_text_already_usable"],
+            )
         ),
     }
     qa_config["providers"] = {
@@ -315,6 +406,7 @@ def build_qa_runtime(
             "model_timeout_seconds": qa_config["model_timeout_seconds"],
             "progress_log_every_claims": qa_config["progress_log_every_claims"],
             "peer_review": qa_config["peer_review"],
+            "pdf_extraction": qa_config["pdf_extraction"],
         },
         "models": llm_manifest,
         "providers": {
@@ -388,6 +480,7 @@ def build_qa_runtime(
             document_acquirer=DocumentAcquirerNode(
                 unpaywall_client=unpaywall_client,
                 fetcher=HttpTextFetcher(timeout=fetch_timeout, **retry_kwargs),
+                pdf_extractor=PDFExtractionPipeline(config=qa_config["pdf_extraction"]),
             ),
             handoff=handoff,
             evidence_extractor=EvidenceExtractor(
@@ -460,6 +553,16 @@ def _coerce_non_negative_int(value: Any, *, fallback: int) -> int:
     except (TypeError, ValueError):
         return fallback
     return number if number >= 0 else fallback
+
+
+def _coerce_probability(value: Any, *, fallback: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if number < 0.0 or number > 1.0:
+        return fallback
+    return number
 
 
 def _coerce_positive_int(value: Any, *, fallback: int) -> int:
