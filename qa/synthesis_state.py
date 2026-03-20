@@ -4,6 +4,7 @@ from typing import Dict, List, Literal, Optional
 
 from pydantic import Field, field_validator
 
+from qa.react_reviewed_state import ReviewCompletionStatus, SubmissionTraceItem, WorkflowMode
 from qa.state import StrictModel, TaskSpec
 
 
@@ -142,10 +143,14 @@ class AnswerSectionOutput(StrictModel):
 class QAResult(StrictModel):
     question: str
     language: str = "en"
+    workflow_mode: WorkflowMode = "ledger"
+    acceptance_status: Literal["accepted", "rejected"] = "accepted"
     final_answer: str
     sections: List[AnswerSectionOutput] = Field(default_factory=list)
     citations: List[CitationRecord] = Field(default_factory=list)
     claim_trace: List[ClaimTraceItem] = Field(default_factory=list)
+    submission_trace: List[SubmissionTraceItem] = Field(default_factory=list)
+    review_completion_status: ReviewCompletionStatus = "completed"
     overall_confidence: ConfidenceRating
     section_confidence: List[SectionConfidenceRecord] = Field(default_factory=list)
     insufficient_evidence: bool = False

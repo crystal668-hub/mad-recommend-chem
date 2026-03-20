@@ -9,6 +9,7 @@ This module intentionally contains only trajectory/step records used by:
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -100,6 +101,7 @@ class ReActTrajectory:
     """Records the complete reasoning process for one agent call."""
 
     query: str
+    trajectory_id: str = field(default_factory=lambda: f"traj_{uuid.uuid4().hex[:12]}")
     steps: List[ReActStep] = field(default_factory=list)
     final_answer: Optional[str] = None
     total_steps: int = 0
@@ -117,6 +119,7 @@ class ReActTrajectory:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "query": self.query,
+            "trajectory_id": self.trajectory_id,
             "steps": [step.to_dict() for step in self.steps],
             "final_answer": self.final_answer,
             "total_steps": self.total_steps,

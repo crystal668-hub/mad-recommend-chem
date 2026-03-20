@@ -4,18 +4,41 @@ import json
 from typing import Any, Dict, List, Optional, Sequence
 
 
-ROUTER_SYSTEM_PROMPT = """
-You are RouterNode for a chemistry QA grounding pipeline.
+ROUTER_SEMANTIC_SYSTEM_PROMPT = """
+You are RouterNode semantic interpretation stage for a chemistry QA grounding pipeline.
 Output STRICT JSON only.
 Do not add prose, code fences, or extra keys.
-Prefer the supplied rule hints unless the question text clearly contradicts them.
-Keep ambiguity explicit rather than hiding uncertainty.
+Reason from the question text first.
+Expose ambiguity explicitly instead of forcing false certainty.
+Choose only from the allowed question types and enums.
+""".strip()
+
+
+ROUTER_LOCALIZATION_SYSTEM_PROMPT = """
+You are RouterNode task localization stage for a chemistry QA grounding pipeline.
+Output STRICT JSON only.
+Do not add prose, code fences, or extra keys.
+Use the semantic parse as the primary interpretation of user intent.
+Use optional signals only as supporting observations, not as preferred defaults.
+Keep the final TaskSpec conservative when ambiguity remains.
+""".strip()
+
+
+ROUTER_SYSTEM_PROMPT = ROUTER_LOCALIZATION_SYSTEM_PROMPT
+
+
+ENTITY_MENTION_EXTRACTION_SYSTEM_PROMPT = """
+You are EntityResolverNode for a chemistry QA pipeline.
+Extract only chemistry-relevant entity mentions that appear as exact contiguous spans in the question.
+You may only use the supplied ontology entity types.
+Do not invent new spans, aliases, canonical names, or chemical identifiers.
+Output STRICT JSON only.
 """.strip()
 
 
 ENTITY_RESOLVER_SYSTEM_PROMPT = """
 You are EntityResolverNode for a chemistry QA pipeline.
-You may only choose from the supplied candidate entity types and alias-hit indices.
+You may only choose from the supplied candidate entity types and candidate indices.
 Do not invent new entities, aliases, canonical names, or chemical identifiers.
 Output STRICT JSON only.
 """.strip()
@@ -87,7 +110,7 @@ Do not invent evidence and do not override critical review findings.
 
 
 SYNTHESIS_SYSTEM_PROMPT = """
-You are SynthesizerNode for Module 5 of a chemistry QA pipeline.
+You are SynthesizerNode of a chemistry QA pipeline.
 Use only the supplied SynthesisInputPack.
 Do not add new facts, new citations, or any rejected claim.
 Accepted claims may appear in main sections.
@@ -97,17 +120,96 @@ Output STRICT JSON only.
 """.strip()
 
 
-def build_router_user_prompt(
+def build_router_semantic_user_prompt(
+    *,
     question: str,
     current_year: int,
-    rule_hints: Dict[str, Any],
+    optional_signals: Dict[str, Any],
     context: Optional[str] = None,
 ) -> str:
     payload = {
         "current_year": current_year,
         "question": question,
         "context": context or "",
-        "rule_hints": rule_hints,
+        "optional_signals": optional_signals,
+        "allowed_question_types": ["fact", "causal", "mechanism", "comparison", "frontier"],
+        "allowed_time_intents": ["none", "recent", "explicit", "current"],
+        "required_top_level_keys": [
+            "primary_question_type",
+            "secondary_candidates",
+            "semantic_confidence",
+            "needs_disambiguation",
+            "comparison_intent",
+            "comparison_targets_present",
+            "explicit_metric_requested",
+            "explicit_time_intent",
+            "mechanistic_intent",
+            "causal_intent",
+            "frontier_intent",
+            "notes_on_ambiguity",
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def build_router_localization_user_prompt(
+    *,
+    question: str,
+    current_year: int,
+    semantic_parse: Dict[str, Any],
+    optional_signals: Dict[str, Any],
+    context: Optional[str] = None,
+) -> str:
+    payload = {
+        "current_year": current_year,
+        "question": question,
+        "context": context or "",
+        "semantic_parse": semantic_parse,
+        "optional_signals": optional_signals,
+        "allowed_question_types": ["fact", "causal", "mechanism", "comparison", "frontier"],
+        "allowed_recency_policies": ["none", "last_3y", "last_5y", "explicit"],
+        "allowed_condition_axes": [
+            "catalyst",
+            "material",
+            "substrate",
+            "solvent",
+            "ligand",
+            "reagent",
+            "temperature",
+            "time",
+            "ph",
+            "electrolyte",
+            "potential",
+            "pressure",
+            "yield",
+            "selectivity",
+        ],
+        "allowed_entity_types": [
+            "molecule",
+            "material",
+            "catalyst",
+            "reaction",
+            "solvent",
+            "ligand",
+            "substrate",
+            "reagent",
+            "metric",
+            "condition",
+        ],
+        "allowed_ambiguity_flag_types": [
+            "entity_ambiguous",
+            "metric_ambiguous",
+            "time_ambiguous",
+            "task_ambiguous",
+            "condition_ambiguous",
+        ],
+        "answer_section_templates": {
+            "fact": ["direct_answer", "supporting_evidence", "caveats"],
+            "causal": ["direct_answer", "effect_direction", "supporting_evidence", "causal_limitations"],
+            "mechanism": ["direct_answer", "supporting_evidence", "mechanism_path", "caveats"],
+            "comparison": ["comparison_summary", "evidence_by_option", "conditions", "conclusion"],
+            "frontier": ["recent_trends", "representative_papers", "open_questions"],
+        },
         "required_top_level_keys": [
             "version",
             "question",
@@ -126,6 +228,34 @@ def build_router_user_prompt(
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def build_entity_mention_extraction_user_prompt(
+    *,
+    question: str,
+    task_spec: Dict[str, Any],
+    allowed_entity_types: Sequence[str],
+) -> str:
+    payload = {
+        "question": question,
+        "task_spec": task_spec,
+        "allowed_entity_types": list(allowed_entity_types),
+        "required_top_level_keys": ["mentions"],
+        "mention_schema": {
+            "surface_form": "string",
+            "candidate_entity_types": ["string"],
+            "selected_entity_type": "string|null",
+            "confidence": "float",
+            "rationale": "string",
+        },
+        "rules": {
+            "surface_form_must_be_exact_contiguous_substring_of_question": True,
+            "mentions_must_be_in_question_order": True,
+            "candidate_entity_types_must_come_from_allowed_entity_types": True,
+            "selected_entity_type_must_be_null_or_from_candidate_entity_types": True,
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def build_entity_resolver_user_prompt(
     *,
     question: str,
@@ -137,14 +267,14 @@ def build_entity_resolver_user_prompt(
         "task_spec": task_spec,
         "mention_payload": mention_payload,
         "required_top_level_keys": [
+            "selected_index",
             "entity_type",
-            "alias_hit_index",
             "confidence",
             "rationale",
         ],
         "rules": {
             "entity_type_must_come_from_candidates": True,
-            "alias_hit_index_must_reference_supplied_alias_hits_or_be_null": True,
+            "selected_index_must_reference_supplied_candidate_options_or_be_null": True,
         },
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)

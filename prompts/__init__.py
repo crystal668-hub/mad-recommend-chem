@@ -17,6 +17,8 @@ from prompts.qa_prompts import (
     METHODOLOGY_REVIEWER_SYSTEM_PROMPT,
     QUERY_PLANNER_SYSTEM_PROMPT,
     REVIEW_MERGE_SYSTEM_PROMPT,
+    ROUTER_LOCALIZATION_SYSTEM_PROMPT,
+    ROUTER_SEMANTIC_SYSTEM_PROMPT,
     ROUTER_SYSTEM_PROMPT,
     SYNTHESIS_SYSTEM_PROMPT,
     build_claim_miner_user_prompt,
@@ -26,8 +28,9 @@ from prompts.qa_prompts import (
     build_evidence_extractor_user_prompt,
     build_query_planner_user_prompt,
     build_reviewer_user_prompt,
+    build_router_localization_user_prompt,
+    build_router_semantic_user_prompt,
     build_review_merge_user_prompt,
-    build_router_user_prompt,
     build_synthesizer_user_prompt,
 )
 
@@ -46,6 +49,8 @@ __all__ = [
     "CONTRADICTION_REVIEWER_SYSTEM_PROMPT",
     "CLAIM_REVISION_SYSTEM_PROMPT",
     "REVIEW_MERGE_SYSTEM_PROMPT",
+    "ROUTER_SEMANTIC_SYSTEM_PROMPT",
+    "ROUTER_LOCALIZATION_SYSTEM_PROMPT",
     "ROUTER_SYSTEM_PROMPT",
     "SYNTHESIS_SYSTEM_PROMPT",
     "build_entity_resolver_user_prompt",
@@ -56,6 +61,7 @@ __all__ = [
     "build_contradiction_reviewer_user_prompt",
     "build_claim_revision_user_prompt",
     "build_review_merge_user_prompt",
-    "build_router_user_prompt",
+    "build_router_semantic_user_prompt",
+    "build_router_localization_user_prompt",
     "build_synthesizer_user_prompt",
 ]

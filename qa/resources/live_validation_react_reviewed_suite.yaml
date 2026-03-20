@@ -1,0 +1,92 @@
+cases:
+  - case_id: fact_ethanol_formula
+    tier: core
+    question_type: fact
+    question: What is the molecular formula of ethanol?
+    expected_category: PASS_REAL_EVIDENCE
+    require_protocol_ok: true
+    require_review_completion: true
+    allow_provider_degraded: false
+    require_real_evidence: true
+    max_open_blocking_review_items: 0
+    require_grounding_ok: true
+    require_router_no_fallback: true
+    require_router_question_type_match: true
+    require_entity_not_all_unresolved: true
+    require_pubchem_call: true
+
+  - case_id: causal_ptc_her_alkaline
+    tier: core
+    question_type: causal
+    question: Why does Pt/C generally improve HER activity in alkaline electrolyte compared with bare carbon?
+    expected_category: PASS_REAL_EVIDENCE
+    require_protocol_ok: true
+    require_review_completion: true
+    allow_provider_degraded: false
+    require_real_evidence: true
+    max_open_blocking_review_items: 0
+    require_grounding_ok: true
+    require_router_no_fallback: true
+    require_router_question_type_match: true
+    require_entity_not_all_unresolved: true
+
+  - case_id: mechanism_ptc_her_koh
+    tier: core
+    question_type: mechanism
+    question: What mechanism is commonly proposed for Pt/C-catalyzed HER in 1 M KOH?
+    expected_category: PASS_REAL_EVIDENCE
+    require_protocol_ok: true
+    require_review_completion: true
+    allow_provider_degraded: false
+    require_real_evidence: true
+    max_open_blocking_review_items: 0
+    require_grounding_ok: true
+    require_router_no_fallback: true
+    require_router_question_type_match: true
+    require_entity_not_all_unresolved: true
+
+  - case_id: comparison_ptc_vs_nimo_her
+    tier: core
+    question_type: comparison
+    question: How does Pt/C compare with NiMo catalysts for HER activity in alkaline media?
+    expected_category: PASS_REAL_EVIDENCE
+    require_protocol_ok: true
+    require_review_completion: true
+    allow_provider_degraded: false
+    require_real_evidence: true
+    max_open_blocking_review_items: 0
+    require_grounding_ok: true
+    require_router_no_fallback: true
+    require_router_question_type_match: true
+    require_entity_not_all_unresolved: true
+
+  - case_id: comparison_ambiguous_ptc_or_nimo_her
+    tier: extended
+    question_type: comparison
+    question: For alkaline HER, is Pt/C or NiMo usually more active?
+    expected_category:
+      - PASS_REAL_EVIDENCE
+      - PASS_DEGRADED
+    require_protocol_ok: true
+    require_review_completion: true
+    allow_provider_degraded: true
+    require_real_evidence: false
+    require_grounding_ok: true
+    require_router_no_fallback: true
+    require_router_question_type_match: true
+
+  - case_id: frontier_recent_progress_alkaline_her
+    tier: extended
+    question_type: frontier
+    question: What has been the recent progress in alkaline HER catalysts beyond Pt/C?
+    expected_category:
+      - PASS_REAL_EVIDENCE
+      - PASS_DEGRADED
+    require_protocol_ok: true
+    require_review_completion: true
+    allow_provider_degraded: true
+    require_real_evidence: false
+    require_grounding_ok: true
+    require_router_no_fallback: true
+    require_router_question_type_match: true
+    require_router_non_none_recency: true

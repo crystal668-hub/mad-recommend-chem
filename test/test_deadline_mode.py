@@ -57,6 +57,134 @@ class _DummyLLM:
         return _AIMessage(content="Thought.")
 
 
+class _ReactiveLLMBackend:
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    def invoke(self, messages, *, tool_choice: str | None = None):
+        self.call_count += 1
+        last_content = str(getattr(messages[-1], "content", "") or "")
+        if "CURRENT PHASE: THOUGHT" in last_content:
+            return _AIMessage(content="Use conclude.")
+        if "CURRENT PHASE: ACTION" in last_content:
+            return _AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_conclude_1",
+                        "name": "conclude",
+                        "args": {"conclusion": "Final answer."},
+                    }
+                ],
+            )
+        if tool_choice == "conclude":
+            return _AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_conclude_1",
+                        "name": "conclude",
+                        "args": {"conclusion": "Final answer."},
+                    }
+                ],
+            )
+        if self.call_count >= 2:
+            return _AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_conclude_1",
+                        "name": "conclude",
+                        "args": {"conclusion": "Final answer."},
+                    }
+                ],
+            )
+        return _AIMessage(content="Thought.")
+
+
+class _ReactiveLLM:
+    def __init__(self, backend: _ReactiveLLMBackend, tool_choice: str | None = None):
+        self._backend = backend
+        self._tool_choice = tool_choice
+
+    def bind_tools(self, tools, tool_choice: str | None = None):
+        return _ReactiveLLM(self._backend, tool_choice=tool_choice)
+
+    def bind(self, tools=None, tool_choice: str | None = None):  # pragma: no cover
+        return self.bind_tools(tools, tool_choice=tool_choice)
+
+    def invoke(self, messages):
+        return self._backend.invoke(messages, tool_choice=self._tool_choice)
+
+
+class _StructuredDummyLLM:
+    def __init__(self, tool_choice: str | None = None, *, emit_tool_call: bool = True):
+        self._tool_choice = tool_choice
+        self._emit_tool_call = emit_tool_call
+
+    def bind_tools(self, tools, tool_choice: str | None = None):
+        return _StructuredDummyLLM(tool_choice=tool_choice, emit_tool_call=self._emit_tool_call)
+
+    def bind(self, tools=None, tool_choice: str | None = None):  # pragma: no cover
+        return self.bind_tools(tools, tool_choice=tool_choice)
+
+    def invoke(self, messages):
+        if self._tool_choice == "conclude" and self._emit_tool_call:
+            return _AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_conclude_structured",
+                        "name": "conclude",
+                        "args": {"submission": {"submission_id": "submission_cycle_1"}},
+                    }
+                ],
+            )
+        return _AIMessage(content="Thought.")
+
+
+class _DeadlineStructuredBackend:
+    def __init__(self) -> None:
+        self.action_calls = 0
+
+    def invoke(self, messages, *, tool_choice: str | None = None):
+        last_content = str(getattr(messages[-1], "content", "") or "")
+        if "CURRENT PHASE: THOUGHT" in last_content:
+            return _AIMessage(content="Search first, then conclude.")
+        if tool_choice == "conclude":
+            return _AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_conclude_structured",
+                        "name": "conclude",
+                        "args": {"submission": {"submission_id": "submission_cycle_1"}},
+                    }
+                ],
+            )
+        if "CURRENT PHASE: ACTION" in last_content:
+            self.action_calls += 1
+            return _AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_search_1",
+                        "name": "search_papers",
+                        "args": {"query": "pt/c her"},
+                    }
+                ],
+            )
+        return _AIMessage(content="Thought.")
+
+
+class _InvokeTool:
+    def __init__(self, fn):
+        self._fn = fn
+
+    def invoke(self, payload):
+        return self._fn(payload)
+
+
 class DeadlineModeTests(unittest.TestCase):
     def test_deadline_mode_forces_conclude_on_last_step(self):
         from agents.react_agent import ReActAgent
@@ -93,6 +221,208 @@ class DeadlineModeTests(unittest.TestCase):
         self.assertTrue((response.content or "").strip())
         # The forced conclude helper should patch missing required components if absent.
         self.assertIn("Ni, Fe, Co", response.content)
+
+    def test_real_conclude_tool_sets_structured_output(self):
+        from agents.react_agent import ReActAgent, ToolResult
+
+        backend = _ReactiveLLMBackend()
+        llm = _ReactiveLLM(backend)
+
+        def _conclude(_payload):
+            return ToolResult(
+                observation='{"submission_id":"submission_cycle_1"}',
+                data={"__conclude_valid__": True, "submission": {"submission_id": "submission_cycle_1"}},
+            )
+
+        conclude_tool = _InvokeTool(_conclude)
+
+        with patch(
+            "agents.react_agent._lazy_langchain_imports",
+            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
+        ):
+            agent = ReActAgent(
+                agent_id="t2",
+                name="test",
+                model_config={"deadline_mode": False},
+                rag_system=None,
+                experience_store=None,
+                system_prompt="",
+                max_react_steps=2,
+                verbose=False,
+            )
+
+            with patch.object(agent, "_get_llm", return_value=llm), patch.object(
+                agent,
+                "_build_tools",
+                return_value=([conclude_tool], {"conclude": conclude_tool}),
+            ):
+                response, _trajectory = agent.generate_response_with_react(
+                    query="Return a structured submission.",
+                )
+
+        self.assertEqual(
+            {"kind": "submission", "payload": {"submission_id": "submission_cycle_1"}},
+            response.structured_output,
+        )
+
+    def test_forced_conclude_free_text_keeps_structured_output_empty(self):
+        from agents.react_agent import ReActAgent
+
+        dummy_llm = _DummyLLM()
+
+        with patch(
+            "agents.react_agent._lazy_langchain_imports",
+            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
+        ):
+            agent = ReActAgent(
+                agent_id="t3",
+                name="test",
+                model_config={"deadline_mode": True},
+                rag_system=None,
+                experience_store=None,
+                system_prompt="",
+                max_react_steps=10,
+                verbose=False,
+            )
+
+            with patch.object(agent, "_get_llm", return_value=dummy_llm), patch.object(
+                agent, "_build_tools", return_value=([], {})
+            ):
+                response, _trajectory = agent.generate_response_with_react(
+                    query="Forced conclude unit test.",
+                    components=["Ni", "Fe", "Co"],
+                    max_steps_override=1,
+                )
+
+        self.assertIsNone(response.structured_output)
+
+    def test_structured_deadline_force_conclude_invokes_real_tool(self):
+        from agents.react_agent import ReActAgent, ToolResult
+
+        llm = _StructuredDummyLLM()
+
+        def _conclude(_payload):
+            return ToolResult(
+                observation='{"submission_id":"submission_cycle_1"}',
+                data={"__conclude_valid__": True, "submission": {"submission_id": "submission_cycle_1"}},
+            )
+
+        conclude_tool = _InvokeTool(_conclude)
+
+        with patch(
+            "agents.react_agent._lazy_langchain_imports",
+            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
+        ):
+            agent = ReActAgent(
+                agent_id="t4",
+                name="test",
+                model_config={"deadline_mode": True},
+                rag_system=None,
+                experience_store=None,
+                system_prompt="",
+                max_react_steps=10,
+                verbose=False,
+                conclude_argument_name="submission",
+                conclude_output_kind="submission",
+            )
+
+            with patch.object(agent, "_get_llm", return_value=llm), patch.object(
+                agent,
+                "_build_tools",
+                return_value=([conclude_tool], {"conclude": conclude_tool}),
+            ):
+                response, trajectory = agent.generate_response_with_react(
+                    query="Return a structured submission.",
+                    max_steps_override=1,
+                )
+
+        self.assertEqual({"kind": "submission", "payload": {"submission_id": "submission_cycle_1"}}, response.structured_output)
+        self.assertEqual("conclude", trajectory.steps[0].action)
+
+    def test_structured_deadline_retrieval_attempt_is_forced_to_conclude_same_step(self):
+        from agents.react_agent import ReActAgent, ToolResult
+
+        backend = _DeadlineStructuredBackend()
+        llm = _ReactiveLLM(backend)
+
+        def _search(_payload):
+            return ToolResult(observation="[]", data=[])
+
+        def _conclude(_payload):
+            return ToolResult(
+                observation='{"submission_id":"submission_cycle_1"}',
+                data={"__conclude_valid__": True, "submission": {"submission_id": "submission_cycle_1"}},
+            )
+
+        search_tool = _InvokeTool(_search)
+        conclude_tool = _InvokeTool(_conclude)
+
+        with patch(
+            "agents.react_agent._lazy_langchain_imports",
+            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
+        ):
+            agent = ReActAgent(
+                agent_id="t5",
+                name="test",
+                model_config={"deadline_mode": True},
+                rag_system=None,
+                experience_store=None,
+                system_prompt="",
+                max_react_steps=10,
+                verbose=False,
+                tools=[search_tool, conclude_tool],
+                search_tool_names=["search_papers"],
+                analysis_tool_names=["conclude"],
+                conclude_argument_name="submission",
+                conclude_output_kind="submission",
+            )
+
+            with patch.object(agent, "_get_llm", return_value=llm), patch.object(
+                agent,
+                "_build_tools",
+                return_value=([search_tool, conclude_tool], {"search_papers": search_tool, "conclude": conclude_tool}),
+            ):
+                response, trajectory = agent.generate_response_with_react(
+                    query="Return a structured submission.",
+                    max_steps_override=2,
+                )
+
+        self.assertEqual("conclude", trajectory.steps[-1].action)
+        self.assertFalse(
+            any(call.tool_name == "search_papers" for step in trajectory.steps for call in step.tool_calls)
+        )
+        self.assertEqual({"kind": "submission", "payload": {"submission_id": "submission_cycle_1"}}, response.structured_output)
+
+    def test_structured_force_conclude_without_tool_call_raises(self):
+        from agents.react_agent import ReActAgent
+
+        llm = _StructuredDummyLLM(emit_tool_call=False)
+
+        with patch(
+            "agents.react_agent._lazy_langchain_imports",
+            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
+        ):
+            agent = ReActAgent(
+                agent_id="t6",
+                name="test",
+                model_config={"deadline_mode": True},
+                rag_system=None,
+                experience_store=None,
+                system_prompt="",
+                max_react_steps=10,
+                verbose=False,
+                conclude_argument_name="submission",
+                conclude_output_kind="submission",
+            )
+
+            with patch.object(agent, "_get_llm", return_value=llm), patch.object(
+                agent, "_build_tools", return_value=([], {})
+            ):
+                with self.assertRaises(RuntimeError):
+                    agent.generate_response_with_react(
+                        query="Forced conclude must fail without a structured tool call.",
+                        max_steps_override=1,
+                    )
 
 
 if __name__ == "__main__":

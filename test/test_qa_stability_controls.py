@@ -63,6 +63,18 @@ class QARuntimeConfigTests(unittest.TestCase):
         self.assertEqual(15, resolved["peer_review"]["max_second_round_claims"])
         self.assertTrue(resolved["peer_review"]["disable_llm_review_when_abstract_only"])
         self.assertEqual("deterministic_only", resolved["peer_review"]["fallback_mode"])
+        self.assertEqual("./qa/resources/entity_seeds.yaml", resolved["entity_resolution"]["seed_file"])
+        self.assertTrue(resolved["entity_resolution"]["emit_seed_suggestions"])
+        self.assertTrue(resolved["entity_resolution"]["pubchem_enabled"])
+        self.assertEqual(
+            ["molecule", "solvent", "reagent", "ligand", "substrate"],
+            resolved["entity_resolution"]["pubchem_entity_types"],
+        )
+        self.assertEqual(5, resolved["entity_resolution"]["max_pubchem_candidates"])
+        self.assertEqual(0.7, resolved["entity_resolution"]["mention_extraction_min_confidence"])
+        self.assertTrue(resolved["entity_resolution"]["llm_disambiguation_enabled"])
+        self.assertEqual(0.7, resolved["entity_resolution"]["disambiguation_min_confidence"])
+        self.assertTrue(resolved["entity_resolution"]["fail_open_on_provider_error"])
 
     @patch("qa.runtime.build_chat_model_from_config")
     def test_build_runtime_injects_default_timeout_when_alias_has_none(self, mock_build_model):
@@ -84,6 +96,15 @@ class QARuntimeConfigTests(unittest.TestCase):
         first_config = mock_build_model.call_args_list[0].args[0]
         self.assertEqual(45.0, first_config["timeout"])
         self.assertEqual(45.0, runtime.runtime_manifest["models"]["router"]["timeout_seconds"])
+        self.assertEqual(
+            "./qa/resources/entity_seeds.yaml",
+            runtime.runtime_manifest["qa"]["entity_resolution"]["seed_file"],
+        )
+        self.assertTrue(runtime.runtime_manifest["providers"]["pubchem"]["enabled"])
+        self.assertEqual(
+            ["molecule", "solvent", "reagent", "ligand", "substrate"],
+            runtime.runtime_manifest["providers"]["pubchem"]["entity_types"],
+        )
 
 
 class PeerReviewBudgetTests(unittest.TestCase):

@@ -25,6 +25,7 @@ class QASystem:
         retrieval_pipeline: Optional[Any] = None,
         peer_review_pipeline: Optional[Any] = None,
         synthesis_pipeline: Optional[Any] = None,
+        react_reviewed_workflow: Optional[Any] = None,
     ) -> None:
         loaded_config = copy.deepcopy(config) if config is not None else load_config(config_path)
         self.config = loaded_config
@@ -36,6 +37,7 @@ class QASystem:
             retrieval_pipeline=retrieval_pipeline,
             peer_review_pipeline=peer_review_pipeline,
             synthesis_pipeline=synthesis_pipeline,
+            react_reviewed_workflow=react_reviewed_workflow,
         )
         self.runtime: QARuntime = runtime
         self.runtime_manifest = copy.deepcopy(runtime.runtime_manifest)
@@ -43,6 +45,7 @@ class QASystem:
         self.retrieval_pipeline = self._configure_retrieval_pipeline(runtime.retrieval_pipeline)
         self.peer_review_pipeline = runtime.peer_review_pipeline
         self.synthesis_pipeline = runtime.synthesis_pipeline
+        self.react_reviewed_workflow = runtime.react_reviewed_workflow
 
     def run_qa(
         self,
@@ -53,7 +56,55 @@ class QASystem:
         resolved_artifact_dir = self._resolve_artifact_dir(artifact_dir)
         runtime_manifest_path = self._write_runtime_manifest(resolved_artifact_dir)
         logger.info("qa_run_start artifact_dir=%s", resolved_artifact_dir)
-        grounding_state = self.grounding_pipeline.run(question=question, context=context)
+        if self.qa_config["workflow_mode"] == "react_reviewed":
+            if self.react_reviewed_workflow is None:
+                raise ValueError("react_reviewed workflow mode requires a react_reviewed_workflow runtime.")
+            result = self.react_reviewed_workflow.run(
+                question=question,
+                context=context,
+                artifact_dir=resolved_artifact_dir,
+            )
+            artifact_paths = dict(result.artifact_paths)
+            artifact_paths["runtime_manifest"] = runtime_manifest_path
+            execution_warnings = self._merge_execution_warnings(
+                result.execution_warnings,
+                self.runtime_manifest.get("warnings"),
+            )
+            if self.qa_config["save_output"]:
+                public_result_path = self._public_result_path()
+                artifact_paths["public_result"] = str(public_result_path)
+            finalized_result = result.model_copy(
+                update={
+                    "artifact_paths": artifact_paths,
+                    "execution_warnings": execution_warnings,
+                }
+            )
+            if self.qa_config["save_output"]:
+                self._write_public_result(
+                    result=finalized_result,
+                    artifact_paths=artifact_paths,
+                    destination=public_result_path,
+                )
+            qa_result_path = artifact_paths.get("qa_result")
+            if qa_result_path:
+                save_json(finalized_result.model_dump(exclude_none=True), qa_result_path)
+            logger.info(
+                "qa_run_complete artifact_dir=%s warnings=%s",
+                resolved_artifact_dir,
+                len(finalized_result.execution_warnings),
+            )
+            return finalized_result
+
+        run_detailed = getattr(self.grounding_pipeline, "run_detailed", None)
+        if callable(run_detailed):
+            grounding_state, resolution_result = run_detailed(question=question, context=context)
+        else:
+            grounding_state = self.grounding_pipeline.run(question=question, context=context)
+            resolution_result = None
+        entity_artifacts = self._write_entity_resolution_artifacts(
+            artifact_dir=resolved_artifact_dir,
+            resolution_result=resolution_result,
+        )
         logger.info("qa_grounding_complete question_type=%s", grounding_state.task_spec.question_type)
         retrieval_state = self.retrieval_pipeline.run_from_grounding(
             grounding_state,
@@ -85,6 +136,7 @@ class QASystem:
         )
 
         artifact_paths = dict(result.artifact_paths)
+        artifact_paths.update(entity_artifacts)
         artifact_paths.update(review_artifacts)
         artifact_paths["runtime_manifest"] = runtime_manifest_path
         execution_warnings = self._merge_execution_warnings(
@@ -127,6 +179,7 @@ class QASystem:
         retrieval_pipeline: Optional[Any],
         peer_review_pipeline: Optional[Any],
         synthesis_pipeline: Optional[Any],
+        react_reviewed_workflow: Optional[Any],
     ) -> QARuntime:
         return build_qa_runtime(
             config=self.config,
@@ -135,6 +188,7 @@ class QASystem:
             retrieval_pipeline=retrieval_pipeline,
             peer_review_pipeline=peer_review_pipeline,
             synthesis_pipeline=synthesis_pipeline,
+            react_reviewed_workflow=react_reviewed_workflow,
         )
 
     def _configure_retrieval_pipeline(
@@ -178,6 +232,20 @@ class QASystem:
             "reviewed_evidence_ledger": reviewed_ledger_path,
             "review_summaries": review_summaries_path,
         }
+
+    def _write_entity_resolution_artifacts(
+        self,
+        *,
+        artifact_dir: str,
+        resolution_result: Optional[Any],
+    ) -> Dict[str, str]:
+        if resolution_result is None or not hasattr(resolution_result, "artifact_payloads"):
+            return {}
+        store = QAArtifactStore(base_dir=artifact_dir)
+        artifact_paths: Dict[str, str] = {}
+        for relative_path, payload in dict(resolution_result.artifact_payloads()).items():
+            artifact_paths[Path(relative_path).stem] = store.write_json(relative_path, payload)
+        return artifact_paths
 
     def _public_result_path(self) -> Path:
         output_dir = ensure_dir(self.qa_config["outputs_dir"])

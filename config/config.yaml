@@ -10,7 +10,7 @@ llm:
     model: "openai/gpt-5.2"
     api_key: "${OPENAI_API_KEY}"  
     base_url: "https://openrouter.ai/api/v1"
-    temperature: 1.0
+    temperature: 0.5
     max_tokens: 2000
     embedding_model: "openai/text-embedding-3-large"
     emb_url: "https://openrouter.ai/api/v1/embeddings"
@@ -101,6 +101,7 @@ debate:
 
 # ===== QA Integration Configuration =====
 qa:
+  workflow_mode: "react_reviewed"
   save_output: true
   outputs_dir: "./outputs"
   artifact_subdir: "qa_artifacts"
@@ -112,6 +113,40 @@ qa:
     max_second_round_claims: 15
     disable_llm_review_when_abstract_only: true
     fallback_mode: "deterministic_only"
+
+  entity_resolution:
+    seed_file: "./qa/resources/entity_seeds.yaml"
+    emit_seed_suggestions: true
+    pubchem_enabled: true
+    pubchem_entity_types: ["molecule", "solvent", "reagent", "ligand", "substrate"]
+    max_pubchem_candidates: 5
+    mention_extraction_min_confidence: 0.7
+    llm_disambiguation_enabled: true
+    disambiguation_min_confidence: 0.7
+    fail_open_on_provider_error: true
+
+  react_reviewed:
+    max_propose_steps_initial: 6
+    max_propose_steps_revision: 4
+    proposer_fallback_mode: "fail_fast_only"
+    proposer_repair_attempts: 1
+    proposer_evidence_policy: "prefer_fulltext"
+    max_review_cycles: 3
+    reviewer_max_steps: 3
+    reviewer_max_concurrency: 4
+    reviewer_max_retrieval_actions: 1
+    reviewer_retrieval_budget_by_role:
+      search_coverage: 1
+      evidence_trace: 0
+      reasoning_consistency: 0
+      counterevidence: 2
+    max_review_items_per_reviewer: 3
+    max_review_items_per_step_section: 1
+    stop_on_no_blocking_items: true
+    require_all_reviewers: true
+    review_call_retry_limit: 1
+    review_failure_blocks_acceptance: true
+
   pdf_extraction:
     enabled: true
     primary_backend: "pymupdf"
@@ -128,7 +163,9 @@ qa:
     max_ocr_pages: 40
     ocr_timeout_seconds: 300
     skip_ocr_when_text_already_usable: true
+
   models:
+    # mode:ledger
     router: "agent1"
     entity_resolver: "agent1"
     query_planner: "agent1"
@@ -140,18 +177,27 @@ qa:
     claim_revision: "agent1"
     review_merge: "agent1"
     synthesizer: "agent1"
+
+    # mode:react_reviewer
+    react_proposer: "agent1"
+    react_reviewer_search_coverage: "agent1"
+    react_reviewer_evidence_trace: "agent1"
+    react_reviewer_reasoning_consistency: "agent1"
+    react_reviewer_counterevidence: "agent1"
+    
   providers:
-    # Optional contact emails passed to literature APIs.
+    
     openalex_mailto: "${OPENALEX_MAILTO}"
     crossref_mailto: "${CROSSREF_MAILTO}"
-    # Optional API/auth settings for enrichment and OA lookup.
+
     semantic_scholar_api_key: "${SEMANTIC_SCHOLAR_API_KEY}"
     unpaywall_email: "${UNPAYWALL_EMAIL}"
+
     # Transport timeouts in seconds.
     http_timeout: 10.0
     fetch_timeout: 15.0
+
     # Retry policy for transient provider/network failures.
-    # Total attempts = 1 + retry_attempts.
     retry_attempts: 2
     backoff_base_seconds: 1.0
     backoff_max_seconds: 8.0

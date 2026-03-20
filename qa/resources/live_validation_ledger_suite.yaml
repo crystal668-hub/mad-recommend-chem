@@ -1,0 +1,54 @@
+cases:
+  - case_id: ledger_fact_ptc_her
+    tier: core
+    question_type: fact
+    question: How does Pt/C affect HER activity in 1 M KOH?
+    expected_category: PASS_REAL_EVIDENCE
+    require_protocol_ok: false
+    require_review_completion: false
+    allow_provider_degraded: false
+    require_real_evidence: true
+
+  - case_id: ledger_causal_ptc_her
+    tier: core
+    question_type: causal
+    question: Why does Pt/C improve HER activity in alkaline electrolyte?
+    expected_category: PASS_REAL_EVIDENCE
+    require_protocol_ok: false
+    require_review_completion: false
+    allow_provider_degraded: false
+    require_real_evidence: true
+
+  - case_id: ledger_comparison_ptc_vs_carbon
+    tier: core
+    question_type: comparison
+    question: How does Pt/C compare with bare carbon for HER activity in alkaline media?
+    expected_category: PASS_REAL_EVIDENCE
+    require_protocol_ok: false
+    require_review_completion: false
+    allow_provider_degraded: false
+    require_real_evidence: true
+
+  - case_id: ledger_ambiguous_comparison_ptc_or_nimo
+    tier: extended
+    question_type: comparison
+    question: For alkaline HER, is Pt/C or NiMo usually more active?
+    expected_category:
+      - PASS_REAL_EVIDENCE
+      - PASS_DEGRADED
+    require_protocol_ok: false
+    require_review_completion: false
+    allow_provider_degraded: true
+    require_real_evidence: false
+
+  - case_id: ledger_ambiguous_frontier_recent_progress
+    tier: extended
+    question_type: frontier
+    question: What has been the recent progress in alkaline HER catalysts beyond Pt/C?
+    expected_category:
+      - PASS_REAL_EVIDENCE
+      - PASS_DEGRADED
+    require_protocol_ok: false
+    require_review_completion: false
+    allow_provider_degraded: true
+    require_real_evidence: false

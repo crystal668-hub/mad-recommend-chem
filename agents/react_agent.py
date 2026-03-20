@@ -23,7 +23,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agents.chat_models import build_chat_model_from_config
 from agents.react_reasoning import ReActTrajectory, ReActStep, ActionType, ToolCallRecord
@@ -39,6 +39,7 @@ class AgentResponse:
     reasoning: Optional[str] = None
     confidence: Optional[float] = None
     sources: Optional[List[Dict[str, Any]]] = None
+    structured_output: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -53,6 +54,18 @@ class ToolResult:
 
     def __str__(self) -> str:  # ToolMessage content
         return self.observation
+
+
+def _extract_structured_conclude_output(data: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(data, dict) or data.get("__conclude_valid__") is not True:
+        return None
+    submission = data.get("submission")
+    if isinstance(submission, dict):
+        return {"kind": "submission", "payload": submission}
+    review_items = data.get("review_items")
+    if isinstance(review_items, list):
+        return {"kind": "review_items", "payload": review_items}
+    return None
 
 
 def _lazy_langchain_imports():
@@ -92,6 +105,13 @@ class ReActAgent:
         system_prompt: Optional[str] = None,
         max_react_steps: int = 10,
         verbose: bool = True,
+        tools: Optional[Sequence[Any]] = None,
+        thought_phase_instruction: Optional[str] = None,
+        action_phase_instruction: Optional[str] = None,
+        search_tool_names: Optional[Sequence[str]] = None,
+        analysis_tool_names: Optional[Sequence[str]] = None,
+        conclude_argument_name: Optional[str] = None,
+        conclude_output_kind: Optional[str] = None,
     ) -> None:
         self.agent_id = agent_id
         self.name = name
@@ -101,6 +121,13 @@ class ReActAgent:
         self.system_prompt = system_prompt or ""
         self.max_react_steps = int(max_react_steps)
         self.verbose = bool(verbose)
+        self._custom_tools = list(tools or [])
+        self._custom_thought_phase_instruction = str(thought_phase_instruction or "").strip() or None
+        self._custom_action_phase_instruction = str(action_phase_instruction or "").strip() or None
+        self._search_tool_names = [str(name).strip() for name in (search_tool_names or []) if str(name).strip()]
+        self._analysis_tool_names = [str(name).strip() for name in (analysis_tool_names or []) if str(name).strip()]
+        self._conclude_argument_name = str(conclude_argument_name or "").strip() or None
+        self._conclude_output_kind = str(conclude_output_kind or "").strip() or None
 
         self.logger = logging.getLogger(f"MAD.agent.{self.agent_id}")
 
@@ -507,6 +534,11 @@ class ReActAgent:
     def _build_tools(self):
         _ChatOpenAI, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, StructuredTool = _lazy_langchain_imports()
 
+        if self._custom_tools:
+            tools = list(self._custom_tools)
+            tools_by_name = {t.name: t for t in tools}
+            return tools, tools_by_name
+
         tools = [
             StructuredTool.from_function(
                 func=self._tool_search_literature,
@@ -552,8 +584,9 @@ class ReActAgent:
             self._llm = build_chat_model_from_config(self.model_config)
         return self._llm
 
-    @staticmethod
-    def _get_thought_phase_instruction() -> str:
+    def _get_thought_phase_instruction(self) -> str:
+        if self._custom_thought_phase_instruction:
+            return self._custom_thought_phase_instruction
         return (
             "CURRENT PHASE: THOUGHT\n"
             "Output ONLY a brief reasoning in plain text (1-3 short sentences).\n"
@@ -563,8 +596,9 @@ class ReActAgent:
             "- Avoid filler/self-talk (e.g. 'ok', 'sorry', repeating 'I will call tool').\n"
         )
 
-    @staticmethod
-    def _get_action_phase_instruction() -> str:
+    def _get_action_phase_instruction(self) -> str:
+        if self._custom_action_phase_instruction:
+            return self._custom_action_phase_instruction
         return (
             "CURRENT PHASE: ACTION\n"
             "You MUST call one or more tools.\n"
@@ -674,6 +708,7 @@ class ReActAgent:
 
         step_number = 0
         final_answer: Optional[str] = None
+        structured_output: Optional[Dict[str, Any]] = None
         no_tool_call_streak = 0
 
         # Many debate phases (REVIEW/REBUTTAL/PROPOSE) may require STRICT JSON.
@@ -682,6 +717,9 @@ class ReActAgent:
         self._current_requires_strict_json = bool(requires_strict_json)
         # PROPOSE can now be STRICT JSON too; we still want full-fidelity retrieval in PROPOSE.
         self._current_is_propose_phase = bool(_is_propose_phase(system_prompt or ""))
+        structured_conclude_argument_name = self._conclude_argument_name
+        structured_conclude_output_kind = self._conclude_output_kind
+        structured_conclude_required = bool(structured_conclude_argument_name and structured_conclude_output_kind)
         task_components, task_reaction = _infer_task_constraints(
             full_query, fallback_components=components, fallback_reaction=None
         )
@@ -781,8 +819,8 @@ class ReActAgent:
             except Exception:
                 pass
 
-        def _run_forced_conclude(messages_: List[Any]) -> Tuple[str, str, bool, str]:
-            """Generate a final answer draft and a tool_call_id via a forced conclude attempt (best-effort)."""
+        def _run_forced_conclude(messages_: List[Any]) -> Tuple[str, str, bool, str, Optional[Dict[str, Any]], Dict[str, Any]]:
+            """Generate a forced conclude result, invoking the real conclude tool when structured output is required."""
             retrieved_ = _collect_retrieved_source_ids_from_trajectory(trajectory)
             sid_hint_ = ""
             if retrieved_:
@@ -802,6 +840,8 @@ class ReActAgent:
             forced_conclude_tool_call_id_ = "forced_conclude"
             strict_json_fallback_used_ = False
             schema_detected_ = "unknown"
+            structured_output_ = None
+            forced_action_input_: Dict[str, Any] = {}
 
             # Best-effort: force a specific tool if the backend supports it; otherwise fall back to "required".
             force_conclude_llm_ = llm_with_tools_forced
@@ -824,8 +864,13 @@ class ReActAgent:
                             content=(
                                 (
                                     "FINAL ACTION: You MUST call ONLY the `conclude` tool now.\n"
-                                    "Set the `conclusion` argument to STRICT JSON ONLY that follows the schema in the system prompt EXACTLY.\n"
-                                    "- No markdown, no extra text.\n"
+                                    + (
+                                        f"Use exactly the `{structured_conclude_argument_name}` argument with a JSON object payload.\n"
+                                        "Do not use `conclusion` or any other argument name.\n"
+                                        if structured_conclude_required
+                                        else "Set the `conclusion` argument to STRICT JSON ONLY that follows the schema in the system prompt EXACTLY.\n"
+                                    )
+                                    + "- No markdown, no extra text.\n"
                                     "- If evidence is required, cite at least one verifiable source_id.\n"
                                     + sid_hint_
                                     + elements_hint_
@@ -833,11 +878,22 @@ class ReActAgent:
                                 if requires_strict_json
                                 else (
                                     "FINAL ACTION: You MUST call ONLY the `conclude` tool now.\n"
-                                    "Set the `conclusion` argument to the best possible final answer.\n"
-                                    "- Include the reaction type explicitly.\n"
-                                    "- Explicitly restate the catalyst metal elements exactly as provided.\n"
-                                    "- Provide a single speculated value + confidence for key performance metric(s) (no numeric range).\n"
-                                    "- If you used literature evidence, cite source_id exactly as provided.\n"
+                                    + (
+                                        f"Use exactly the `{structured_conclude_argument_name}` argument with the final structured payload.\n"
+                                        "Do not use `conclusion` or any other argument name.\n"
+                                        if structured_conclude_required
+                                        else "Set the `conclusion` argument to the best possible final answer.\n"
+                                    )
+                                    + (
+                                        ""
+                                        if structured_conclude_required
+                                        else (
+                                            "- Include the reaction type explicitly.\n"
+                                            "- Explicitly restate the catalyst metal elements exactly as provided.\n"
+                                            "- Provide a single speculated value + confidence for key performance metric(s) (no numeric range).\n"
+                                            "- If you used literature evidence, cite source_id exactly as provided.\n"
+                                        )
+                                    )
                                     + sid_hint_
                                     + elements_hint_
                                 )
@@ -867,6 +923,31 @@ class ReActAgent:
                         continue
                     if call_id:
                         forced_conclude_tool_call_id_ = call_id
+                    forced_action_input_ = args if isinstance(args, dict) else {}
+                    if structured_conclude_required:
+                        tool = tools_by_name.get(ActionType.CONCLUDE.value)
+                        if tool is None:
+                            raise RuntimeError("Forced conclude could not find the conclude tool.")
+                        try:
+                            result_ = tool.invoke(forced_action_input_)
+                            if not isinstance(result_, ToolResult):
+                                result_ = ToolResult(observation=str(result_), data=result_)
+                        except Exception as exc:
+                            raise RuntimeError(f"Forced conclude tool invocation failed: {exc}") from exc
+                        draft_ = str(result_)
+                        structured_output_ = _extract_structured_conclude_output(result_.data)
+                        if structured_output_ is None:
+                            raise RuntimeError(
+                                f"Forced conclude did not produce valid structured output for {structured_conclude_output_kind or 'unknown'}."
+                            )
+                        return (
+                            draft_,
+                            forced_conclude_tool_call_id_,
+                            strict_json_fallback_used_,
+                            schema_detected_,
+                            structured_output_,
+                            forced_action_input_,
+                        )
                     conclusion_ = None
                     if isinstance(args, dict):
                         conclusion_ = args.get("conclusion") or args.get("final_answer")
@@ -878,6 +959,11 @@ class ReActAgent:
                     if conclusion_ is not None:
                         draft_ = str(conclusion_).strip()
                         break
+
+            if structured_conclude_required:
+                raise RuntimeError(
+                    f"Forced conclude failed to emit a valid `conclude({structured_conclude_argument_name}=...)` tool call."
+                )
 
             if not draft_:
                 # Fallback: ask for a final answer in free-form text (no tools).
@@ -1003,7 +1089,14 @@ class ReActAgent:
                         + ", ".join([str(c) for c in (task_components or [])])
                     )
 
-            return draft_, forced_conclude_tool_call_id_, strict_json_fallback_used_, schema_detected_
+            return (
+                draft_,
+                forced_conclude_tool_call_id_,
+                strict_json_fallback_used_,
+                schema_detected_,
+                structured_output_,
+                forced_action_input_,
+            )
 
         while step_number < effective_max_steps:
             remaining_steps = effective_max_steps - step_number
@@ -1018,8 +1111,17 @@ class ReActAgent:
                         "max_react_steps": effective_max_steps,
                     },
                 )
-                draft, forced_tool_call_id, strict_json_fallback_used, schema_detected = _run_forced_conclude(messages)
+                (
+                    draft,
+                    forced_tool_call_id,
+                    strict_json_fallback_used,
+                    schema_detected,
+                    forced_structured_output,
+                    forced_action_input,
+                ) = _run_forced_conclude(messages)
                 final_answer = draft
+                if forced_structured_output is not None:
+                    structured_output = forced_structured_output
 
                 if requires_strict_json and not _is_valid_strict_json_payload(final_answer, system_prompt):
                     schema_detected = _detect_strict_json_schema(system_prompt)
@@ -1098,7 +1200,7 @@ class ReActAgent:
                 tool_call = ToolCallRecord(
                     tool_name=ActionType.CONCLUDE.value,
                     tool_call_id=forced_tool_call_id or "deadline_conclude",
-                    tool_args={"conclusion": final_answer},
+                    tool_args=forced_action_input or {"conclusion": final_answer},
                     observation=final_answer,
                     observation_data=final_answer,
                 )
@@ -1112,7 +1214,7 @@ class ReActAgent:
                         step_number=step_number,
                         thought=thought_text,
                         action=ActionType.CONCLUDE.value,
-                        action_input={"conclusion": final_answer},
+                        action_input=forced_action_input or {"conclusion": final_answer},
                         observation=final_answer,
                         tool_call_id=forced_tool_call_id or "deadline_conclude",
                         observation_data=final_answer,
@@ -1389,12 +1491,18 @@ class ReActAgent:
                         "tools": [name for name, _args, _id in normalized_calls],
                     },
                 )
-            search_tools = {
-                ActionType.SEARCH_LITERATURE.value,
-                ActionType.SEARCH_EXPERIENCE.value,
-                ActionType.FETCH_LITERATURE_CHUNK.value,
-            }
-            analysis_tools = {ActionType.ANALYZE.value, ActionType.CONCLUDE.value}
+            search_tools = set(
+                self._search_tool_names
+                or [
+                    ActionType.SEARCH_LITERATURE.value,
+                    ActionType.SEARCH_EXPERIENCE.value,
+                    ActionType.FETCH_LITERATURE_CHUNK.value,
+                ]
+            )
+            analysis_tools = set(
+                self._analysis_tool_names
+                or [ActionType.ANALYZE.value, ActionType.CONCLUDE.value]
+            )
 
             retrieval_budget_exhausted = (
                 retrieval_budget is not None and retrieval_action_steps_used >= int(retrieval_budget)
@@ -1405,6 +1513,42 @@ class ReActAgent:
             has_search = any(name in search_tools for name, _args, _id in normalized_calls)
             has_search_unblocked = bool(has_search and (not block_search_this_step))
             has_analysis = any(name in analysis_tools for name, _args, _id in normalized_calls)
+            if structured_conclude_required and deadline_no_retrieval and has_search and not has_analysis:
+                (
+                    final_answer,
+                    forced_tool_call_id,
+                    strict_json_fallback_used,
+                    _schema_detected,
+                    forced_structured_output,
+                    forced_action_input,
+                ) = _run_forced_conclude(messages)
+                structured_output = forced_structured_output
+                step_number += 1
+                tool_call = ToolCallRecord(
+                    tool_name=ActionType.CONCLUDE.value,
+                    tool_call_id=forced_tool_call_id or "deadline_conclude",
+                    tool_args=forced_action_input or {},
+                    observation=final_answer,
+                    observation_data=final_answer,
+                )
+                thought_text = (
+                    "Deadline mode: retrieval attempt was blocked with 2 steps remaining, so conclude was forced immediately."
+                )
+                if strict_json_fallback_used:
+                    thought_text += " Strict JSON fallback was used."
+                trajectory.add_step(
+                    ReActStep(
+                        step_number=step_number,
+                        thought=thought_text,
+                        action=ActionType.CONCLUDE.value,
+                        action_input=forced_action_input or {},
+                        observation=final_answer,
+                        tool_call_id=forced_tool_call_id or "deadline_conclude",
+                        observation_data=final_answer,
+                        tool_calls=[tool_call],
+                    )
+                )
+                break
             # If retrieval is blocked by policy, do NOT treat this step as mixed (allow analyze/conclude to run).
             mixed_search_and_analysis = has_search_unblocked and has_analysis
             mixed_error = (
@@ -1488,15 +1632,17 @@ class ReActAgent:
                         result = ToolResult(observation=mixed_error, data={"error": "mixed_search_and_analysis"})
                     elif blocked_retrieval:
                         if deadline_no_retrieval:
+                            analysis_list = ", ".join(f"`{name}`" for name in sorted(analysis_tools)) or "`conclude`"
                             obs = (
                                 "Policy: retrieval is disabled when only 2 steps remain in this call.\n"
-                                "Do NOT call search tools now; call `analyze` or `conclude`."
+                                f"Do NOT call search tools now; call one of: {analysis_list}."
                             )
                             result = ToolResult(observation=obs, data={"error": "deadline_no_retrieval"})
                         else:
+                            analysis_list = ", ".join(f"`{name}`" for name in sorted(analysis_tools)) or "`conclude`"
                             obs = (
                                 "Policy: retrieval budget exceeded for this phase.\n"
-                                "Do NOT call search tools now; call `analyze` or `conclude`."
+                                f"Do NOT call search tools now; call one of: {analysis_list}."
                             )
                             result = ToolResult(observation=obs, data={"error": "retrieval_budget_exceeded"})
                     else:
@@ -1514,6 +1660,9 @@ class ReActAgent:
                             result = ToolResult(observation=f"Tool error: {str(e)}", data=None)
 
                 observation_text = str(result)
+                structured_output_candidate = None
+                if tool_name == ActionType.CONCLUDE.value and not blocked:
+                    structured_output_candidate = _extract_structured_conclude_output(result.data)
                 if tool_name == ActionType.CONCLUDE.value and requires_strict_json and not blocked:
                     if not _is_valid_strict_json_payload(observation_text, system_prompt):
                         schema_detected = _detect_strict_json_schema(system_prompt)
@@ -1624,7 +1773,13 @@ class ReActAgent:
                 if tool_name in search_tools and (not blocked_retrieval):
                     retrieval_executed_this_step = True
 
-                if tool_name == ActionType.CONCLUDE.value and not blocked:
+                conclude_valid = True
+                if isinstance(result.data, dict) and result.data.get("__conclude_valid__") is False:
+                    conclude_valid = False
+
+                if tool_name == ActionType.CONCLUDE.value and not blocked and conclude_valid:
+                    if structured_output_candidate is not None:
+                        structured_output = structured_output_candidate
                     final_answer = observation_text
                     break
 
@@ -1666,8 +1821,6 @@ class ReActAgent:
                 break
 
         if final_answer is None:
-            # Hard fallback: ask for a final answer text, then record it via the `conclude` tool
-            # so downstream callers (tests / debate protocol) see a proper CONCLUDE action.
             self.logger.warning(
                 "react_forced_conclude",
                 extra={
@@ -1676,262 +1829,21 @@ class ReActAgent:
                     "steps_so_far": step_number,
                 },
             )
-            retrieved = _collect_retrieved_source_ids_from_trajectory(trajectory)
-            sid_hint = ""
-            if retrieved:
-                sid_hint = (
-                    "\nYou MUST cite at least one of these source_id values verbatim in your final answer:\n"
-                    + "\n".join(f"- {sid}" for sid in sorted(list(retrieved))[:10])
-                )
-            elements_hint = ""
-            if task_components:
-                elements_hint = (
-                    "\nThe metal catalyst elements for this task are EXACTLY:\n- "
-                    + ", ".join([str(c) for c in (task_components or [])])
-                    + "\nYou MUST explicitly include ALL of these elements in your final conclusion."
-                )
-
-            # Some callers (e.g. debate REVIEW/REBUTTAL) require strict JSON only; don't inject free-form text
-            # or extra evidence lines that would break parsing.
-            requires_strict_json = "STRICT JSON" in (system_prompt or "").upper()
-
-            # Prefer forcing a `conclude` tool call. Some providers (notably Gemini via OpenAI-compatible routes)
-            # can return empty `content` for a free-form completion here; tool-calling is more reliable.
-            draft = ""
-            forced_conclude_tool_call_id = "forced_conclude"
-
-            # Best-effort: force a specific tool if the backend supports it; otherwise fall back to "required".
-            force_conclude_llm = llm_with_tools_forced
-            try:
-                if hasattr(llm, "bind_tools"):
-                    force_conclude_llm = llm.bind_tools(tools, tool_choice=ActionType.CONCLUDE.value)
-                else:  # pragma: no cover
-                    force_conclude_llm = llm.bind(tools=tools, tool_choice=ActionType.CONCLUDE.value)
-            except Exception:
-                force_conclude_llm = llm_with_tools_forced
-
-            forced_action_msg = None
-            try:
-                forced_action_msg = _invoke_llm(
-                    force_conclude_llm,
-                    messages
-                    + [
-                        SystemMessage(
-                            content=(
-                                (
-                                    "FINAL ACTION: You MUST call ONLY the `conclude` tool now.\n"
-                                    "Set the `conclusion` argument to STRICT JSON ONLY that follows the schema in the system prompt EXACTLY.\n"
-                                    "- No markdown, no extra text.\n"
-                                    "- If evidence is required, cite at least one verifiable source_id.\n"
-                                    + sid_hint
-                                    + elements_hint
-                                )
-                                if requires_strict_json
-                                else (
-                                    "FINAL ACTION: You MUST call ONLY the `conclude` tool now.\n"
-                                    "Set the `conclusion` argument to the best possible final answer.\n"
-                                    "- Include the reaction type explicitly.\n"
-                                    "- Explicitly restate the catalyst metal elements exactly as provided.\n"
-                                    "- Provide a single speculated value + confidence for key performance metric(s) (no numeric range).\n"
-                                    "- If you used literature evidence, cite source_id exactly as provided.\n"
-                                    + sid_hint
-                                    + elements_hint
-                                )
-                            )
-                        )
-                    ],
-                )
-            except Exception:
-                forced_action_msg = None
-
-            if self.verbose and forced_action_msg is not None:
-                self.logger.debug(
-                    "react_forced_conclude_action_raw",
-                    extra={
-                        "event": "agent.react.forced_conclude.action.raw",
-                        "agent_id": self.agent_id,
-                        "forced_action_additional_kwargs": _preview(getattr(forced_action_msg, "additional_kwargs", None)),
-                        "forced_action_tool_calls": _preview(getattr(forced_action_msg, "tool_calls", None)),
-                        "forced_action_text": (getattr(forced_action_msg, "content", "") or "")[:1500],
-                    },
-                )
-
-            if forced_action_msg is not None:
-                forced_calls = _extract_tool_calls(forced_action_msg)
-                for name, args, call_id in (_normalize_tool_call(c) for c in forced_calls):
-                    if name != ActionType.CONCLUDE.value:
-                        continue
-                    if call_id:
-                        forced_conclude_tool_call_id = call_id
-                    conclusion = None
-                    if isinstance(args, dict):
-                        conclusion = args.get("conclusion") or args.get("final_answer")
-                    if isinstance(conclusion, (dict, list)):
-                        try:
-                            conclusion = json.dumps(conclusion, ensure_ascii=False)
-                        except Exception:
-                            conclusion = str(conclusion)
-                    if conclusion is not None:
-                        draft = str(conclusion).strip()
-                        break
-
-            if not draft:
-                # Fallback: ask for a final answer in free-form text (no tools).
-                forced = _invoke_llm(
-                    llm,
-                    messages
-                    + [
-                        (HumanMessage if use_user_role_for_action else SystemMessage)(
-                            content=(
-                                (
-                                    "FINAL PHASE: Output STRICT JSON ONLY.\n"
-                                    "- Follow the output schema in the system prompt EXACTLY.\n"
-                                    "- No markdown, no extra text.\n"
-                                    "- If evidence is required, cite at least one verifiable source_id.\n"
-                                    + sid_hint
-                                    + elements_hint
-                                )
-                                if requires_strict_json
-                                else (
-                                    "FINAL PHASE: Write the best possible final answer now.\n"
-                                    "- Include the reaction type explicitly.\n"
-                                    "- Explicitly restate the catalyst metal elements exactly as provided.\n"
-                                    "- Provide a single speculated value + confidence for key performance metric(s) (no numeric range).\n"
-                                    "- If you used literature evidence, cite source_id exactly as provided.\n"
-                                    + sid_hint
-                                    + elements_hint
-                                )
-                            )
-                        )
-                    ],
-                )
-                if self.verbose:
-                    self.logger.debug(
-                        "react_forced_conclude_text_raw",
-                        extra={
-                            "event": "agent.react.forced_conclude.text.raw",
-                            "agent_id": self.agent_id,
-                            "forced_text_additional_kwargs": _preview(getattr(forced, "additional_kwargs", None)),
-                            "forced_text_tool_calls": _preview(getattr(forced, "tool_calls", None)),
-                            "forced_text": (getattr(forced, "content", "") or "")[:1500],
-                        },
-                    )
-                draft = (getattr(forced, "content", "") or "").strip()
-                if not draft:
-                    # Some providers return a legacy function_call even when tools are not bound.
-                    fc = (getattr(forced, "additional_kwargs", {}) or {}).get("function_call")
-                    if isinstance(fc, dict):
-                        args = fc.get("arguments")
-                        parsed = None
-                        if isinstance(args, str):
-                            try:
-                                parsed = json.loads(args)
-                            except Exception:
-                                parsed = None
-                        elif isinstance(args, dict):
-                            parsed = args
-                        if isinstance(parsed, dict):
-                            draft = str(parsed.get("conclusion") or parsed.get("final_answer") or "").strip()
-            strict_json_fallback_used = False
-            if requires_strict_json and not _is_valid_strict_json_payload(draft, system_prompt):
-                schema_detected = _detect_strict_json_schema(system_prompt)
-                _orig = draft
-                repaired, repair_reason = _repair_strict_json_text(draft, system_prompt)
-                if repaired and _is_valid_strict_json_payload(repaired, system_prompt):
-                    draft = repaired
-                    _log_strict_json_repair(
-                        schema_detected=schema_detected,
-                        repair_reason=repair_reason,
-                        original_preview=str(_orig),
-                        repaired_preview=str(repaired),
-                        repaired_ok=True,
-                    )
-                else:
-                    _log_strict_json_repair(
-                        schema_detected=schema_detected,
-                        repair_reason=repair_reason,
-                        original_preview=str(_orig),
-                        repaired_preview=str(repaired or ""),
-                        repaired_ok=False,
-                    )
-                    salvaged, salvage_reason = _salvage_invalid_strict_json_payload(
-                        _orig,
-                        system_prompt=system_prompt,
-                        full_query=full_query,
-                        task_reaction=task_reaction,
-                        task_components=task_components,
-                    )
-                    if salvaged and _is_valid_strict_json_payload(salvaged, system_prompt):
-                        draft = salvaged
-                        _log_strict_json_salvage(
-                            schema_detected=schema_detected,
-                            salvage_reason=salvage_reason,
-                            original_preview=str(_orig),
-                            salvaged_preview=str(salvaged),
-                            salvage_used=True,
-                        )
-                    else:
-                        strict_json_fallback_used = True
-                        draft = _minimal_strict_json_payload(system_prompt)
-                        _log_strict_json_fallback(
-                            schema_detected=schema_detected,
-                            reason="post_loop_forced_conclude_invalid_or_empty",
-                            original_preview=str(_orig),
-                        )
-            elif not draft:
-                draft = "No conclusion generated."
-
-            # If strict JSON is not required and the model forgot to include a verifiable source_id,
-            # attach a minimal evidence line.
-            if (not requires_strict_json) and retrieved and not any(sid in draft for sid in retrieved):
-                draft = draft.rstrip() + "\n\nEvidence (retrieved source_id): " + ", ".join(sorted(list(retrieved))[:3])
-
-            # If a PROPOSE conclusion is missing required task elements, patch a minimal explicit line.
-            # This keeps forced-conclude fallbacks consistent with the normal conclude guard behavior.
-            if (not requires_strict_json) and task_components:
-                ok_, reason_ = _validate_conclusion_against_task(draft, task_components)
-                if not ok_ and "missing required catalyst" in str(reason_).lower():
-                    draft = (
-                        draft.rstrip()
-                        + "\n\nCatalyst metal elements (exactly as provided): "
-                        + ", ".join([str(c) for c in (task_components or [])])
-                    )
-
-            final_answer = draft
-
-            # PROPOSE-only: ensure the final answer respects the unified output contract even in forced-conclude paths.
-            if propose_phase and (not requires_strict_json):
-                before = final_answer
-                missing = _diagnose_propose_contract_missing_lines(before)
-                final_answer = _coerce_propose_conclusion_to_contract(
-                    draft=before,
-                    full_query=full_query,
-                    task_reaction=task_reaction,
-                    task_components=task_components,
-                    trajectory=trajectory,
-                )
-                if final_answer != before:
-                    try:
-                        self.logger.warning(
-                            "react_propose_contract_rewrite",
-                            extra={
-                                "event": "agent.react.propose.contract_rewrite",
-                                "agent_id": self.agent_id,
-                                "step": step_number + 1,
-                                "missing_lines": missing,
-                                "original_preview": (before or "")[:500],
-                                "rewritten_preview": (final_answer or "")[:500],
-                            },
-                        )
-                    except Exception:
-                        pass
-
-            # Record a final CONCLUDE step.
+            (
+                final_answer,
+                forced_conclude_tool_call_id,
+                strict_json_fallback_used,
+                _schema_detected,
+                forced_structured_output,
+                forced_action_input,
+            ) = _run_forced_conclude(messages)
+            if forced_structured_output is not None:
+                structured_output = forced_structured_output
             step_number += 1
             tool_call = ToolCallRecord(
                 tool_name=ActionType.CONCLUDE.value,
                 tool_call_id=forced_conclude_tool_call_id,
-                tool_args={"conclusion": final_answer},
+                tool_args=forced_action_input or {"conclusion": final_answer},
                 observation=final_answer,
                 observation_data=final_answer,
             )
@@ -1947,7 +1859,7 @@ class ReActAgent:
                         )
                     ),
                     action=ActionType.CONCLUDE.value,
-                    action_input={"conclusion": final_answer},
+                    action_input=forced_action_input or {"conclusion": final_answer},
                     observation=final_answer,
                     tool_call_id=forced_conclude_tool_call_id,
                     observation_data=final_answer,
@@ -1971,6 +1883,7 @@ class ReActAgent:
             content=final_answer,
             reasoning=trajectory.get_trajectory_summary(),
             sources=_extract_sources(trajectory),
+            structured_output=structured_output,
         )
         # Reset per-call state to avoid leaking into the next call on the same agent instance.
         self._current_requires_strict_json = False

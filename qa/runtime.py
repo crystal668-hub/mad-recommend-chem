@@ -30,6 +30,8 @@ from qa.providers import (
 )
 from qa.retrieval_pipeline import HeterogeneousRetrievalPipeline
 from qa.review_pipeline import StructuredPeerReviewPipeline
+from qa.react_reviewed_workflow import ReactReviewedWorkflow
+from qa.react_reviewed_state import WorkflowMode
 from qa.synthesis_pipeline import VerifiedSynthesisPipeline
 
 
@@ -47,6 +49,11 @@ INFERENCE_NODE_MODEL_KEYS = (
     "claim_revision",
     "review_merge",
     "synthesizer",
+    "react_proposer",
+    "react_reviewer_search_coverage",
+    "react_reviewer_evidence_trace",
+    "react_reviewer_reasoning_consistency",
+    "react_reviewer_counterevidence",
 )
 
 DEFAULT_QA_MODEL_ALIASES = {node_name: "agent1" for node_name in INFERENCE_NODE_MODEL_KEYS}
@@ -76,7 +83,20 @@ DEFAULT_QA_PDF_EXTRACTION_CONFIG: Dict[str, Any] = {
     "skip_ocr_when_text_already_usable": True,
 }
 
+DEFAULT_QA_ENTITY_RESOLUTION_CONFIG: Dict[str, Any] = {
+    "seed_file": "./qa/resources/entity_seeds.yaml",
+    "emit_seed_suggestions": True,
+    "pubchem_enabled": True,
+    "pubchem_entity_types": ["molecule", "solvent", "reagent", "ligand", "substrate"],
+    "max_pubchem_candidates": 5,
+    "mention_extraction_min_confidence": 0.7,
+    "llm_disambiguation_enabled": True,
+    "disambiguation_min_confidence": 0.7,
+    "fail_open_on_provider_error": True,
+}
+
 DEFAULT_QA_CONFIG: Dict[str, Any] = {
+    "workflow_mode": "react_reviewed",
     "save_output": True,
     "outputs_dir": None,
     "artifact_subdir": "qa_artifacts",
@@ -85,6 +105,30 @@ DEFAULT_QA_CONFIG: Dict[str, Any] = {
     "progress_log_every_claims": 10,
     "models": copy.deepcopy(DEFAULT_QA_MODEL_ALIASES),
     "peer_review": copy.deepcopy(DEFAULT_QA_PEER_REVIEW_CONFIG),
+    "entity_resolution": copy.deepcopy(DEFAULT_QA_ENTITY_RESOLUTION_CONFIG),
+    "react_reviewed": {
+        "max_propose_steps_initial": 6,
+        "max_propose_steps_revision": 4,
+        "proposer_fallback_mode": "fail_fast_only",
+        "proposer_repair_attempts": 1,
+        "proposer_evidence_policy": "prefer_fulltext",
+        "max_review_cycles": 3,
+        "reviewer_max_steps": 3,
+        "reviewer_max_concurrency": 4,
+        "reviewer_max_retrieval_actions": 1,
+        "reviewer_retrieval_budget_by_role": {
+            "search_coverage": 1,
+            "evidence_trace": 0,
+            "reasoning_consistency": 0,
+            "counterevidence": 2,
+        },
+        "max_review_items_per_reviewer": 3,
+        "max_review_items_per_step_section": 1,
+        "stop_on_no_blocking_items": True,
+        "require_all_reviewers": True,
+        "review_call_retry_limit": 1,
+        "review_failure_blocks_acceptance": True,
+    },
     "pdf_extraction": copy.deepcopy(DEFAULT_QA_PDF_EXTRACTION_CONFIG),
     "providers": {
         "openalex_mailto": None,
@@ -107,6 +151,7 @@ class QARuntime:
     retrieval_pipeline: HeterogeneousRetrievalPipeline
     peer_review_pipeline: Optional[StructuredPeerReviewPipeline]
     synthesis_pipeline: VerifiedSynthesisPipeline
+    react_reviewed_workflow: Optional[Any]
     runtime_manifest: Dict[str, Any]
 
 
@@ -115,6 +160,8 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     raw_qa_config = dict((config or {}).get("qa", {}) or {})
     raw_models = dict(raw_qa_config.pop("models", {}) or {})
     raw_peer_review = dict(raw_qa_config.pop("peer_review", {}) or {})
+    raw_entity_resolution = dict(raw_qa_config.pop("entity_resolution", {}) or {})
+    raw_react_reviewed = dict(raw_qa_config.pop("react_reviewed", {}) or {})
     raw_pdf_extraction = dict(raw_qa_config.pop("pdf_extraction", {}) or {})
     raw_providers = dict(raw_qa_config.pop("providers", {}) or {})
     qa_config.update(raw_qa_config)
@@ -132,9 +179,18 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     provider_config.update(raw_providers)
     peer_review_config = copy.deepcopy(DEFAULT_QA_PEER_REVIEW_CONFIG)
     peer_review_config.update(raw_peer_review)
+    entity_resolution_config = copy.deepcopy(DEFAULT_QA_ENTITY_RESOLUTION_CONFIG)
+    entity_resolution_config.update(raw_entity_resolution)
+    react_reviewed_config = copy.deepcopy(DEFAULT_QA_CONFIG["react_reviewed"])
+    react_reviewed_config.update(raw_react_reviewed)
     pdf_extraction_config = copy.deepcopy(DEFAULT_QA_PDF_EXTRACTION_CONFIG)
     pdf_extraction_config.update(raw_pdf_extraction)
 
+    qa_config["workflow_mode"] = _coerce_allowed_text(
+        qa_config.get("workflow_mode"),
+        allowed={"ledger", "react_reviewed"},
+        fallback=DEFAULT_QA_CONFIG["workflow_mode"],
+    )
     qa_config["save_output"] = bool(qa_config.get("save_output", DEFAULT_QA_CONFIG["save_output"]))
     qa_config["outputs_dir"] = str(outputs_dir)
     qa_config["artifact_subdir"] = artifact_subdir or str(DEFAULT_QA_CONFIG["artifact_subdir"])
@@ -169,6 +225,125 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
             peer_review_config.get("fallback_mode"),
             allowed={"deterministic_only"},
             fallback=DEFAULT_QA_PEER_REVIEW_CONFIG["fallback_mode"],
+        ),
+    }
+    qa_config["entity_resolution"] = {
+        "seed_file": str(
+            entity_resolution_config.get("seed_file") or DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["seed_file"]
+        ).strip(),
+        "emit_seed_suggestions": bool(
+            entity_resolution_config.get(
+                "emit_seed_suggestions",
+                DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["emit_seed_suggestions"],
+            )
+        ),
+        "pubchem_enabled": bool(
+            entity_resolution_config.get("pubchem_enabled", DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["pubchem_enabled"])
+        ),
+        "pubchem_entity_types": _coerce_text_list(
+            entity_resolution_config.get("pubchem_entity_types"),
+            fallback=DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["pubchem_entity_types"],
+        ),
+        "max_pubchem_candidates": _coerce_positive_int(
+            entity_resolution_config.get("max_pubchem_candidates"),
+            fallback=DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["max_pubchem_candidates"],
+        ),
+        "mention_extraction_min_confidence": _coerce_probability(
+            entity_resolution_config.get("mention_extraction_min_confidence"),
+            fallback=DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["mention_extraction_min_confidence"],
+        ),
+        "llm_disambiguation_enabled": bool(
+            entity_resolution_config.get(
+                "llm_disambiguation_enabled",
+                DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["llm_disambiguation_enabled"],
+            )
+        ),
+        "disambiguation_min_confidence": _coerce_probability(
+            entity_resolution_config.get("disambiguation_min_confidence"),
+            fallback=DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["disambiguation_min_confidence"],
+        ),
+        "fail_open_on_provider_error": bool(
+            entity_resolution_config.get(
+                "fail_open_on_provider_error",
+                DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["fail_open_on_provider_error"],
+            )
+        ),
+    }
+    qa_config["react_reviewed"] = {
+        "max_propose_steps_initial": _coerce_positive_int(
+            react_reviewed_config.get("max_propose_steps_initial"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_propose_steps_initial"],
+        ),
+        "max_propose_steps_revision": _coerce_positive_int(
+            react_reviewed_config.get("max_propose_steps_revision"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_propose_steps_revision"],
+        ),
+        "proposer_fallback_mode": _coerce_allowed_text(
+            react_reviewed_config.get("proposer_fallback_mode"),
+            allowed={"fail_fast_only"},
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_fallback_mode"],
+        ),
+        "proposer_repair_attempts": _coerce_non_negative_int(
+            react_reviewed_config.get("proposer_repair_attempts"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_repair_attempts"],
+        ),
+        "proposer_evidence_policy": _coerce_allowed_text(
+            react_reviewed_config.get("proposer_evidence_policy"),
+            allowed={"prefer_fulltext"},
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_evidence_policy"],
+        ),
+        "max_review_cycles": _coerce_positive_int(
+            react_reviewed_config.get("max_review_cycles"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_review_cycles"],
+        ),
+        "reviewer_max_steps": _coerce_positive_int(
+            react_reviewed_config.get("reviewer_max_steps"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_max_steps"],
+        ),
+        "reviewer_max_concurrency": _coerce_positive_int(
+            react_reviewed_config.get("reviewer_max_concurrency"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_max_concurrency"],
+        ),
+        "reviewer_max_retrieval_actions": _coerce_non_negative_int(
+            react_reviewed_config.get("reviewer_max_retrieval_actions"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_max_retrieval_actions"],
+        ),
+        "reviewer_retrieval_budget_by_role": {
+            role: _coerce_non_negative_int(
+                dict(react_reviewed_config.get("reviewer_retrieval_budget_by_role", {}) or {}).get(role),
+                fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_retrieval_budget_by_role"][role],
+            )
+            for role in DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_retrieval_budget_by_role"]
+        },
+        "max_review_items_per_reviewer": _coerce_positive_int(
+            react_reviewed_config.get("max_review_items_per_reviewer"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_review_items_per_reviewer"],
+        ),
+        "max_review_items_per_step_section": _coerce_positive_int(
+            react_reviewed_config.get("max_review_items_per_step_section"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_review_items_per_step_section"],
+        ),
+        "stop_on_no_blocking_items": bool(
+            react_reviewed_config.get(
+                "stop_on_no_blocking_items",
+                DEFAULT_QA_CONFIG["react_reviewed"]["stop_on_no_blocking_items"],
+            )
+        ),
+        "require_all_reviewers": bool(
+            react_reviewed_config.get(
+                "require_all_reviewers",
+                DEFAULT_QA_CONFIG["react_reviewed"]["require_all_reviewers"],
+            )
+        ),
+        "review_call_retry_limit": _coerce_non_negative_int(
+            react_reviewed_config.get("review_call_retry_limit"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["review_call_retry_limit"],
+        ),
+        "review_failure_blocks_acceptance": bool(
+            react_reviewed_config.get(
+                "review_failure_blocks_acceptance",
+                DEFAULT_QA_CONFIG["react_reviewed"]["review_failure_blocks_acceptance"],
+            )
         ),
     }
     qa_config["pdf_extraction"] = {
@@ -269,6 +444,7 @@ def build_qa_runtime(
     retrieval_pipeline: Optional[HeterogeneousRetrievalPipeline] = None,
     peer_review_pipeline: Optional[StructuredPeerReviewPipeline] = None,
     synthesis_pipeline: Optional[VerifiedSynthesisPipeline] = None,
+    react_reviewed_workflow: Optional[Any] = None,
 ) -> QARuntime:
     qa_config = resolve_qa_runtime_config(config)
     llm_configs = dict((config or {}).get("llm", {}) or {})
@@ -278,6 +454,11 @@ def build_qa_runtime(
     default_model_timeout = qa_config["model_timeout_seconds"]
     progress_log_every_claims = qa_config["progress_log_every_claims"]
     peer_review_config = dict(qa_config.get("peer_review", {}) or {})
+
+    def _fallback_label(node_name: str) -> str:
+        if node_name == "entity_resolver":
+            return "entity mention extraction will hard-fail when grounding runs"
+        return "node will use deterministic fallback"
 
     def get_node_llm(node_name: str) -> Any:
         requested_alias = str(qa_config["models"].get(node_name) or "").strip()
@@ -292,7 +473,7 @@ def build_qa_runtime(
         llm_manifest[node_name] = entry
 
         if not requested_alias:
-            message = f"qa.models.{node_name} is missing; node will use deterministic fallback."
+            message = f"qa.models.{node_name} is missing; {_fallback_label(node_name)}."
             warnings.append(message)
             logger.warning(message)
             entry["error"] = "missing_model_alias"
@@ -302,7 +483,7 @@ def build_qa_runtime(
         if not isinstance(model_config, dict):
             message = (
                 f"qa.models.{node_name} points to unknown llm alias '{requested_alias}'; "
-                "node will use deterministic fallback."
+                f"{_fallback_label(node_name)}."
             )
             warnings.append(message)
             logger.warning(message)
@@ -315,7 +496,7 @@ def build_qa_runtime(
         if not has_api_key:
             message = (
                 f"qa.models.{node_name} -> llm.{requested_alias} has no usable api_key; "
-                "node will use deterministic fallback."
+                f"{_fallback_label(node_name)}."
             )
             warnings.append(message)
             logger.warning(message)
@@ -340,7 +521,7 @@ def build_qa_runtime(
         except Exception as exc:
             message = (
                 f"Failed to build chat model for qa.models.{node_name} -> llm.{requested_alias}: {exc}; "
-                "node will use deterministic fallback."
+                f"{_fallback_label(node_name)}."
             )
             warnings.append(message)
             logger.warning(message)
@@ -350,6 +531,39 @@ def build_qa_runtime(
         llm_cache[requested_alias] = llm
         entry["enabled"] = True
         return llm
+
+    def get_node_model_config(node_name: str) -> Optional[Dict[str, Any]]:
+        requested_alias = str(qa_config["models"].get(node_name) or "").strip()
+        entry = llm_manifest.get(node_name)
+        if entry is None:
+            entry = {
+                "requested_alias": requested_alias or None,
+                "enabled": False,
+                "provider": None,
+                "model": None,
+                "fallback": "deterministic",
+                "timeout_seconds": None,
+            }
+            llm_manifest[node_name] = entry
+        if not requested_alias:
+            return None
+        model_config = llm_configs.get(requested_alias)
+        if not isinstance(model_config, dict):
+            return None
+        provider, model, has_api_key = describe_chat_model_config(model_config)
+        entry["provider"] = provider
+        entry["model"] = model
+        if not has_api_key:
+            entry["error"] = "missing_api_key"
+            return None
+        effective_model_config = dict(model_config)
+        configured_timeout = effective_model_config.get("timeout") or effective_model_config.get("request_timeout")
+        if configured_timeout in (None, "") and default_model_timeout is not None:
+            effective_model_config["timeout"] = default_model_timeout
+            configured_timeout = default_model_timeout
+        entry["timeout_seconds"] = configured_timeout
+        entry["enabled"] = True
+        return effective_model_config
 
     provider_config = qa_config["providers"]
     http_timeout = provider_config["http_timeout"]
@@ -399,6 +613,7 @@ def build_qa_runtime(
     runtime_manifest = {
         "config_path": config_path,
         "qa": {
+            "workflow_mode": qa_config["workflow_mode"],
             "save_output": qa_config["save_output"],
             "outputs_dir": qa_config["outputs_dir"],
             "artifact_subdir": qa_config["artifact_subdir"],
@@ -406,6 +621,8 @@ def build_qa_runtime(
             "model_timeout_seconds": qa_config["model_timeout_seconds"],
             "progress_log_every_claims": qa_config["progress_log_every_claims"],
             "peer_review": qa_config["peer_review"],
+            "entity_resolution": qa_config["entity_resolution"],
+            "react_reviewed": qa_config["react_reviewed"],
             "pdf_extraction": qa_config["pdf_extraction"],
         },
         "models": llm_manifest,
@@ -449,6 +666,12 @@ def build_qa_runtime(
                 "backoff_base_seconds": backoff_base_seconds,
                 "backoff_max_seconds": backoff_max_seconds,
             },
+            "pubchem": {
+                "enabled": bool(qa_config["entity_resolution"]["pubchem_enabled"]),
+                "timeout": http_timeout,
+                "max_candidates": qa_config["entity_resolution"]["max_pubchem_candidates"],
+                "entity_types": list(qa_config["entity_resolution"]["pubchem_entity_types"]),
+            },
         },
         "warnings": warnings,
         "overrides": {
@@ -456,15 +679,29 @@ def build_qa_runtime(
             "retrieval_pipeline": retrieval_pipeline is not None,
             "peer_review_pipeline": peer_review_pipeline is not None,
             "synthesis_pipeline": synthesis_pipeline is not None,
+            "react_reviewed_workflow": react_reviewed_workflow is not None,
         },
     }
 
     if grounding_pipeline is None:
+        entity_resolution_config = dict(qa_config.get("entity_resolution", {}) or {})
         grounding_pipeline = QueryGroundingPipeline(
             router=RouterNode(llm=get_node_llm("router")),
             entity_resolver=EntityResolverNode(
                 llm=get_node_llm("entity_resolver"),
                 pubchem_client=PubChemClient(timeout=http_timeout),
+                seed_path=entity_resolution_config.get("seed_file"),
+                pubchem_enabled=entity_resolution_config.get("pubchem_enabled", True),
+                pubchem_entity_types=entity_resolution_config.get("pubchem_entity_types"),
+                max_pubchem_candidates=entity_resolution_config.get("max_pubchem_candidates", 5),
+                mention_extraction_min_confidence=entity_resolution_config.get(
+                    "mention_extraction_min_confidence",
+                    0.7,
+                ),
+                llm_disambiguation_enabled=entity_resolution_config.get("llm_disambiguation_enabled", True),
+                disambiguation_min_confidence=entity_resolution_config.get("disambiguation_min_confidence", 0.7),
+                fail_open_on_provider_error=entity_resolution_config.get("fail_open_on_provider_error", True),
+                emit_seed_suggestions=entity_resolution_config.get("emit_seed_suggestions", True),
             ),
         )
 
@@ -515,12 +752,32 @@ def build_qa_runtime(
             progress_log_every=progress_log_every_claims,
         )
 
+    if react_reviewed_workflow is None and qa_config["workflow_mode"] == "react_reviewed":
+        react_reviewed_workflow = ReactReviewedWorkflow(
+            qa_config=qa_config,
+            router=grounding_pipeline.router,
+            entity_resolver=grounding_pipeline.entity_resolver,
+            query_planner=retrieval_pipeline.query_planner,
+            retriever=retrieval_pipeline.retriever,
+            document_acquirer=retrieval_pipeline.document_acquirer,
+            handoff=retrieval_pipeline.handoff,
+            evidence_extractor=retrieval_pipeline.evidence_extractor,
+            proposer_model_config=get_node_model_config("react_proposer"),
+            reviewer_model_configs={
+                "search_coverage": get_node_model_config("react_reviewer_search_coverage") or {},
+                "evidence_trace": get_node_model_config("react_reviewer_evidence_trace") or {},
+                "reasoning_consistency": get_node_model_config("react_reviewer_reasoning_consistency") or {},
+                "counterevidence": get_node_model_config("react_reviewer_counterevidence") or {},
+            },
+        )
+
     return QARuntime(
         qa_config=qa_config,
         grounding_pipeline=grounding_pipeline,
         retrieval_pipeline=retrieval_pipeline,
         peer_review_pipeline=peer_review_pipeline,
         synthesis_pipeline=synthesis_pipeline,
+        react_reviewed_workflow=react_reviewed_workflow,
         runtime_manifest=runtime_manifest,
     )
 
@@ -576,3 +833,19 @@ def _coerce_positive_int(value: Any, *, fallback: int) -> int:
 def _coerce_allowed_text(value: Any, *, allowed: set[str], fallback: str) -> str:
     text = str(value or "").strip().lower()
     return text if text in allowed else fallback
+
+
+def _coerce_text_list(value: Any, *, fallback: list[str]) -> list[str]:
+    if value is None:
+        return list(fallback)
+    values = value if isinstance(value, list) else [value]
+    cleaned: list[str] = []
+    seen = set()
+    for item in values:
+        text = str(item or "").strip()
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+    return cleaned or list(fallback)
