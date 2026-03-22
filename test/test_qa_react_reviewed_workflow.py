@@ -7,6 +7,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from agents.react_agent import AgentResponse
 from agents.react_reasoning import ReActTrajectory
@@ -424,7 +425,7 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual("react_reviewed", resolved["workflow_mode"])
         self.assertEqual(6, resolved["react_reviewed"]["max_propose_steps_initial"])
-        self.assertEqual(4, resolved["react_reviewed"]["max_propose_steps_revision"])
+        self.assertEqual(6, resolved["react_reviewed"]["max_propose_steps_revision"])
         self.assertEqual("fail_fast_only", resolved["react_reviewed"]["proposer_fallback_mode"])
         self.assertEqual(1, resolved["react_reviewed"]["proposer_repair_attempts"])
         self.assertEqual("prefer_fulltext", resolved["react_reviewed"]["proposer_evidence_policy"])
@@ -607,6 +608,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         document_acquirer: _CountingDocumentAcquirer | None = None,
         evidence_extractor: _CountingEvidenceExtractor | None = None,
         entity_resolution_snapshot: dict | None = None,
+        stage_watchdog_seconds: float = 120.0,
     ) -> ReactReviewedWorkspace:
         artifact_store = QAArtifactStore(base_dir=self.temp_dir / "workspace")
         return ReactReviewedWorkspace(
@@ -621,6 +623,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             document_acquirer=document_acquirer or _CountingDocumentAcquirer(),
             handoff=EvidenceExtractorHandoff(),
             evidence_extractor=evidence_extractor or _CountingEvidenceExtractor(),
+            stage_watchdog_seconds=stage_watchdog_seconds,
         )
 
     def _make_session(self, role: str, budget_limit: int) -> ReviewerSession:
@@ -654,7 +657,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         proposer = ReactReviewedProposerAgent(
             model_config={},
             max_steps_initial=6,
-            max_steps_revision=4,
+            max_steps_revision=6,
             llm_timeout_seconds=45.0,
         )
         payload = _submission("How does Pt/C affect HER activity?").model_dump(exclude_none=True)
@@ -672,7 +675,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         proposer = ReactReviewedProposerAgent(
             model_config={},
             max_steps_initial=6,
-            max_steps_revision=4,
+            max_steps_revision=6,
             llm_timeout_seconds=45.0,
         )
         workspace = self._make_workspace()
@@ -718,7 +721,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         proposer = ReactReviewedProposerAgent(
             model_config={},
             max_steps_initial=6,
-            max_steps_revision=4,
+            max_steps_revision=6,
             llm_timeout_seconds=45.0,
         )
         workspace = self._make_workspace()
@@ -742,11 +745,129 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(1, len(normalized.sections))
         self.assertEqual("Pt/C follows an alkaline Volmer-first HER pathway.", normalized.sections[0].content)
 
+    def test_validate_submission_payload_backfills_citations_from_run_state(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace()
+        workspace.paper_records["paper-1"] = PaperRecord(
+            paper_id="paper-1",
+            title="Recovered paper",
+            doi="10.1000/example",
+            year=2024,
+            venue="Journal",
+            abstract="abstract",
+            fulltext_available=True,
+            fulltext_status="fulltext_indexed",
+        )
+        run_state = _ProposerRunState(evidence_policy="prefer_fulltext")
+        run_state.query_plan_ids.append("qp_1")
+        run_state.searched_paper_ids.add("paper-1")
+        run_state.acquired_paper_ids.add("paper-1")
+        run_state.fulltext_status_by_paper["paper-1"] = "fulltext_indexed"
+        run_state.section_ids_by_paper["paper-1"] = {"sec_results"}
+
+        normalized = proposer._validate_submission_payload(
+            workspace=workspace,
+            submission={
+                "sections": [
+                    {
+                        "section_id": "direct_answer",
+                        "title": "Direct Answer",
+                        "content": "Pt/C remains the benchmark in alkaline HER.",
+                    },
+                ],
+                "citations": [],
+                "limitations": ["evidence is degraded"],
+                "overall_confidence": _confidence(0.3),
+            },
+            cycle_number=1,
+            open_review_items=[],
+            agent=None,
+            run_state=run_state,
+        )
+
+        self.assertEqual(1, len(normalized.citations))
+        self.assertEqual("paper-1", normalized.citations[0].paper_id)
+        self.assertEqual(["sec_results"], normalized.citations[0].section_ids)
+
+    def test_validate_submission_payload_normalizes_scalar_confidence_fields(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace()
+
+        normalized = proposer._validate_submission_payload(
+            workspace=workspace,
+            submission={
+                "sections": [
+                    {
+                        "section_id": "direct_answer",
+                        "title": "Direct Answer",
+                        "content": "Pt/C remains the benchmark in alkaline HER.",
+                        "section_confidence": 0.2,
+                    }
+                ],
+                "citations": [],
+                "limitations": ["No document-level citations were available, so the submission remains conservative."],
+                "overall_confidence": 0.15,
+            },
+            cycle_number=1,
+            open_review_items=[],
+            agent=None,
+        )
+
+        self.assertEqual("low", normalized.overall_confidence.level)
+        self.assertEqual(0.15, normalized.overall_confidence.score)
+        self.assertEqual("low", normalized.sections[0].section_confidence.level)
+        self.assertEqual(0.2, normalized.sections[0].section_confidence.score)
+
+    def test_validate_submission_payload_normalizes_dict_list_fields(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace()
+
+        normalized = proposer._validate_submission_payload(
+            workspace=workspace,
+            submission={
+                "sections": [
+                    {
+                        "section_id": "direct_answer",
+                        "title": "Direct Answer",
+                        "content": "Pt/C remains the benchmark in alkaline HER.",
+                    }
+                ],
+                "citations": {},
+                "limitations": {},
+                "issue_refs": {},
+                "step_refs": {},
+                "overall_confidence": _confidence(0.2),
+            },
+            cycle_number=1,
+            open_review_items=[],
+            agent=None,
+        )
+
+        self.assertEqual([], normalized.citations)
+        self.assertEqual([], normalized.limitations)
+        self.assertEqual([], normalized.issue_refs)
+        self.assertEqual(1, len(normalized.step_refs))
+
     def test_validate_submission_payload_still_rejects_unknown_fields(self):
         proposer = ReactReviewedProposerAgent(
             model_config={},
             max_steps_initial=6,
-            max_steps_revision=4,
+            max_steps_revision=6,
             llm_timeout_seconds=45.0,
         )
         workspace = self._make_workspace()
@@ -832,7 +953,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         workflow.proposer = ReactReviewedProposerAgent(
             model_config={"provider": "openai", "model": "fake", "api_key": "test"},
             max_steps_initial=6,
-            max_steps_revision=4,
+            max_steps_revision=6,
             llm_timeout_seconds=45.0,
         )
         workspace = self._make_workspace()
@@ -863,11 +984,236 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
 
         self.assertEqual({}, workspace.paper_candidates)
 
+    def test_proposer_invalid_tool_arguments_response_enters_repair(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+            repair_attempts=1,
+        )
+        workspace = self._make_workspace()
+        repaired_submission = _submission(workspace.question)
+        repaired_trajectory = _trajectory("repaired proposer output")
+        repair_calls: list[dict[str, object]] = []
+
+        class _StubStructuredTool:
+            @staticmethod
+            def from_function(func, name=None, args_schema=None):
+                class _Tool:
+                    def __init__(self, func, name, args_schema):
+                        self.func = func
+                        self.name = name or getattr(func, "__name__", "tool")
+                        self.args_schema = args_schema
+
+                    def invoke(self, payload):
+                        if isinstance(payload, dict):
+                            return self.func(**payload)
+                        return self.func(payload)
+
+                return _Tool(func, name, args_schema)
+
+        class _RepairableReActAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def generate_response_with_react(self, *args, **kwargs):
+                response = AgentResponse(content="Invalid tool arguments for `conclude`: submission.overall_confidence: Field required")
+                response.response_content = {
+                    "forced_conclude_action_response": {
+                        "message_type": "AIMessage",
+                        "content": "",
+                        "additional_kwargs": {},
+                        "tool_calls": [
+                            {
+                                "name": "conclude",
+                                "args": {
+                                    "submission": {
+                                        "answer_sections": [],
+                                        "overall_confidence": 0.05,
+                                        "evidence_items": [],
+                                    }
+                                },
+                                "id": "call_1",
+                            }
+                        ],
+                        "function_call": None,
+                    },
+                    "forced_conclude_structured_json_response": None,
+                }
+                return response, _trajectory("invalid conclude output")
+
+        def _repair_submission_with_llm(**kwargs):
+            repair_calls.append(kwargs)
+            return repaired_submission, repaired_trajectory
+
+        proposer._repair_submission_with_llm = _repair_submission_with_llm
+
+        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed_workflow.ReActAgent",
+            _RepairableReActAgent,
+        ):
+            submission, trajectory = proposer.run(
+                workspace=workspace,
+                cycle_number=1,
+                open_review_items=[],
+            )
+
+        self.assertEqual(repaired_submission.submission_id, submission.submission_id)
+        self.assertEqual(repaired_trajectory.trajectory_id, trajectory.trajectory_id)
+        self.assertEqual(1, len(repair_calls))
+        self.assertIsInstance(repair_calls[0]["error"].response_content, dict)
+        self.assertEqual(
+            "",
+            repair_calls[0]["error"].response_content["forced_conclude_action_response"]["content"],
+        )
+
+    def test_parse_submission_response_salvages_forced_conclude_tool_args(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        payload = _submission("How does Pt/C affect HER activity?").model_dump(exclude_none=True)
+        response = AgentResponse(content="not valid json")
+        response.response_content = {
+            "forced_conclude_action_response": {
+                "message_type": "AIMessage",
+                "content": "",
+                "additional_kwargs": {},
+                "tool_calls": [
+                    {
+                        "name": "conclude",
+                        "args": {"submission": payload},
+                        "id": "call_1",
+                        "type": "tool_call",
+                    }
+                ],
+                "function_call": None,
+                "tool_call_id": None,
+            }
+        }
+
+        salvaged = proposer._salvage_submission_payload(response=response, trajectory=None)
+
+        self.assertIsInstance(salvaged, dict)
+        self.assertEqual(payload["submission_id"], salvaged["submission_id"])
+        self.assertEqual(payload["trajectory_id"], salvaged["trajectory_id"])
+
+    def test_proposer_repair_parses_valid_json_response(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+            repair_attempts=1,
+        )
+        workspace = self._make_workspace()
+        trajectory = _trajectory("repair proposer output")
+        invalid_error = ReactReviewedStructuredOutputError(
+            stage="proposer",
+            cycle_number=1,
+            message="invalid proposer structured output",
+            response_content="not json",
+            structured_output=None,
+            trajectory=trajectory,
+        )
+        run_state = _ProposerRunState(evidence_policy="strict")
+        repaired_submission = _submission(workspace.question, trajectory_id=trajectory.trajectory_id)
+
+        with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
+            "qa.react_reviewed_workflow.invoke_llm",
+            return_value=json.dumps({"kind": "submission", "payload": repaired_submission.model_dump(exclude_none=True)}),
+        ), patch.object(proposer, "_validate_submission_payload", return_value=repaired_submission):
+            submission, repaired_trajectory = proposer._repair_submission_with_llm(
+                workspace=workspace,
+                cycle_number=1,
+                open_review_items=[],
+                error=invalid_error,
+                trajectory=trajectory,
+                run_state=run_state,
+            )
+
+        self.assertEqual(repaired_submission.submission_id, submission.submission_id)
+        self.assertEqual(trajectory.trajectory_id, repaired_trajectory.trajectory_id)
+
+    def test_proposer_repair_salvages_prior_invalid_payload_when_repair_response_is_not_json(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+            repair_attempts=1,
+        )
+        workspace = self._make_workspace()
+        trajectory = _trajectory("repair salvage proposer output")
+        salvaged_submission = _submission(workspace.question, trajectory_id=trajectory.trajectory_id)
+        invalid_error = ReactReviewedStructuredOutputError(
+            stage="proposer",
+            cycle_number=1,
+            message="invalid proposer structured output",
+            response_content={
+                "forced_conclude_action_response": {
+                    "message_type": "AIMessage",
+                    "content": "",
+                    "additional_kwargs": {},
+                    "tool_calls": [
+                        {
+                            "name": "conclude",
+                            "args": {
+                                "submission": salvaged_submission.model_dump(exclude_none=True),
+                            },
+                            "id": "call_1",
+                            "type": "tool_call",
+                        }
+                    ],
+                    "function_call": None,
+                    "tool_call_id": None,
+                }
+            },
+            structured_output=None,
+            trajectory=trajectory,
+        )
+        run_state = _ProposerRunState(evidence_policy="strict")
+
+        def _validate_submission_payload(*, submission, **kwargs):
+            self.assertEqual(
+                salvaged_submission.model_dump(exclude_none=True)["submission_id"],
+                submission["submission_id"],
+            )
+            return salvaged_submission
+
+        with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
+            "qa.react_reviewed_workflow.invoke_llm",
+            return_value="not json",
+        ), patch.object(proposer, "_validate_submission_payload", side_effect=_validate_submission_payload):
+            submission, repaired_trajectory = proposer._repair_submission_with_llm(
+                workspace=workspace,
+                cycle_number=1,
+                open_review_items=[],
+                error=invalid_error,
+                trajectory=trajectory,
+                run_state=run_state,
+            )
+
+        self.assertEqual(salvaged_submission.submission_id, submission.submission_id)
+        self.assertEqual(trajectory.trajectory_id, repaired_trajectory.trajectory_id)
+
+    def test_proposer_requires_revision_budget_large_enough_for_grounded_cycle(self):
+        with self.assertRaisesRegex(ValueError, "max_steps_revision must be at least 6"):
+            ReactReviewedProposerAgent(
+                model_config={},
+                max_steps_initial=6,
+                max_steps_revision=4,
+                llm_timeout_seconds=45.0,
+            )
+
     def test_proposer_fail_fast_without_fallback_when_model_unavailable(self):
         proposer = ReactReviewedProposerAgent(
             model_config={},
             max_steps_initial=6,
-            max_steps_revision=4,
+            max_steps_revision=6,
             llm_timeout_seconds=45.0,
         )
         workspace = self._make_workspace()
@@ -882,6 +1228,78 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual({}, workspace.paper_candidates)
         failure_path = self.temp_dir / "workspace" / "diagnostics" / "proposer_cycle_1_failure.json"
         self.assertTrue(failure_path.exists(), str(failure_path))
+
+    def test_proposer_execution_failure_persists_forced_conclude_raw_responses(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace()
+
+        class _StubStructuredTool:
+            @staticmethod
+            def from_function(func, name=None, args_schema=None):
+                class _Tool:
+                    def __init__(self, func, name, args_schema):
+                        self.func = func
+                        self.name = name or getattr(func, "__name__", "tool")
+                        self.args_schema = args_schema
+
+                    def invoke(self, payload):
+                        if isinstance(payload, dict):
+                            return self.func(**payload)
+                        return self.func(payload)
+
+                return _Tool(func, name, args_schema)
+
+        class _RaisingReActAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def generate_response_with_react(self, *args, **kwargs):
+                error = RuntimeError("Forced conclude failed to emit a recognized `conclude` tool call.")
+                error.response_content = {
+                    "forced_conclude_action_response": {
+                        "message_type": "AIMessage",
+                        "content": "first raw return",
+                        "additional_kwargs": {"provider": "test"},
+                        "tool_calls": [],
+                        "function_call": None,
+                    },
+                    "forced_conclude_structured_json_response": {
+                        "message_type": "AIMessage",
+                        "content": "{\"submission\":{\"submission_id\":\"submission_cycle_1\"}}",
+                        "additional_kwargs": {},
+                        "tool_calls": [],
+                        "function_call": None,
+                    },
+                }
+                error.structured_output = None
+                raise error
+
+        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed_workflow.ReActAgent",
+            _RaisingReActAgent,
+        ):
+            with self.assertRaises(ReactReviewedProposerExecutionError):
+                proposer.run(
+                    workspace=workspace,
+                    cycle_number=1,
+                    open_review_items=[],
+                )
+
+        failure_path = self.temp_dir / "workspace" / "diagnostics" / "proposer_cycle_1_failure.json"
+        payload = _read_json(str(failure_path))
+        self.assertEqual(
+            "first raw return",
+            payload["response_content"]["forced_conclude_action_response"]["content"],
+        )
+        self.assertEqual(
+            "{\"submission\":{\"submission_id\":\"submission_cycle_1\"}}",
+            payload["response_content"]["forced_conclude_structured_json_response"]["content"],
+        )
 
     def test_ad_hoc_query_plan_ids_are_stable_across_repeated_searches(self):
         workspace = self._make_workspace(retriever=_CountingRetriever())
@@ -953,7 +1371,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         proposer = ReactReviewedProposerAgent(
             model_config={},
             max_steps_initial=6,
-            max_steps_revision=4,
+            max_steps_revision=6,
             llm_timeout_seconds=45.0,
         )
         workspace = self._make_workspace()
@@ -1027,7 +1445,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         proposer = ReactReviewedProposerAgent(
             model_config={},
             max_steps_initial=6,
-            max_steps_revision=4,
+            max_steps_revision=6,
             llm_timeout_seconds=45.0,
         )
         workspace = self._make_workspace()
@@ -1465,6 +1883,32 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(1, document_acquirer.calls)
         self.assertEqual(1, evidence_extractor.calls)
         self.assertEqual([0, 1], sorted(session.budget_state.actions_used for session in sessions))
+
+    def test_workspace_stage_watchdog_records_timeout_for_acquire_document(self):
+        document_acquirer = _CountingDocumentAcquirer(delay=0.2)
+        workspace = self._make_workspace(document_acquirer=document_acquirer, stage_watchdog_seconds=0.05)
+        workspace.paper_candidates["paper-1"] = PaperCandidate(
+            paper_id="paper-1",
+            title="Pt/C HER in alkaline media",
+            year=2024,
+            provider_hits=["openalex"],
+            lane_sources=["contrarian"],
+            retrieval_score=0.9,
+        )
+
+        started_at = time.perf_counter()
+        with self.assertRaises(TimeoutError):
+            workspace.acquire_document(
+                paper_id="paper-1",
+                artifact_store=workspace.store,
+                write_snapshot=False,
+            )
+        elapsed = time.perf_counter() - started_at
+
+        stage_status = _read_json(str(self.temp_dir / "workspace" / "diagnostics" / "runtime_stage_status.json"))
+        self.assertEqual("acquire_document", stage_status["stage"])
+        self.assertEqual("timeout", stage_status["status"])
+        self.assertLess(elapsed, 0.15)
 
     def test_budget_block_prevents_state_mutation(self):
         retriever = _CountingRetriever()

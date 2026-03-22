@@ -75,6 +75,10 @@ class QARuntimeConfigTests(unittest.TestCase):
         self.assertTrue(resolved["entity_resolution"]["llm_disambiguation_enabled"])
         self.assertEqual(0.7, resolved["entity_resolution"]["disambiguation_min_confidence"])
         self.assertTrue(resolved["entity_resolution"]["fail_open_on_provider_error"])
+        self.assertEqual(120.0, resolved["react_reviewed"]["stage_watchdog_seconds"])
+        self.assertEqual(45.0, resolved["providers"]["document_fetch_timeout_seconds"])
+        self.assertEqual(300.0, resolved["providers"]["document_fetch_total_timeout_seconds"])
+        self.assertEqual(8, resolved["providers"]["provider_redirect_limit"])
 
     @patch("qa.runtime.build_chat_model_from_config")
     def test_build_runtime_injects_default_timeout_when_alias_has_none(self, mock_build_model):

@@ -22,11 +22,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agents.chat_models import build_chat_model_from_config
 from agents.react_reasoning import ReActTrajectory, ReActStep, ActionType, ToolCallRecord
+from agents import react_tool_schemas as tool_schemas
+from pydantic import ValidationError
 from utils.source_id import build_chroma_source_id, normalize_doc_id, parse_chroma_source_id
 from utils.request_limiter import get_global_limiter
 
@@ -56,6 +59,59 @@ class ToolResult:
         return self.observation
 
 
+def _validation_error_items(error: ValidationError) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for raw_item in error.errors():
+        loc = ".".join(str(part) for part in list(raw_item.get("loc") or []))
+        items.append(
+            {
+                "loc": loc,
+                "msg": str(raw_item.get("msg") or "").strip(),
+                "type": str(raw_item.get("type") or "").strip(),
+            }
+        )
+    return items
+
+
+def _invalid_tool_arguments_result(tool_name: str, error: ValidationError) -> ToolResult:
+    error_items = _validation_error_items(error)
+    summary_parts: List[str] = []
+    for item in error_items[:5]:
+        loc = str(item.get("loc") or "").strip()
+        msg = str(item.get("msg") or "").strip()
+        summary_parts.append(f"{loc}: {msg}" if loc else msg)
+    summary = "; ".join(part for part in summary_parts if part) or str(error)
+    return ToolResult(
+        observation=f"Invalid tool arguments for `{tool_name}`: {summary}",
+        data={
+            "error": "invalid_tool_arguments",
+            "tool_name": str(tool_name or "").strip(),
+            "validation_errors": error_items,
+        },
+    )
+
+
+def _invoke_tool_with_validation(tool: Any, tool_name: str, tool_args: Any) -> ToolResult:
+    try:
+        result = tool.invoke(tool_args)
+        if not isinstance(result, ToolResult):
+            result = ToolResult(observation=str(result), data=result)
+        return result
+    except ValidationError as exc:
+        return _invalid_tool_arguments_result(tool_name, exc)
+    except TypeError as exc:
+        if "missing" in str(exc).lower() or "unexpected" in str(exc).lower():
+            return ToolResult(
+                observation=f"Invalid tool arguments for `{tool_name}`: {exc}",
+                data={
+                    "error": "invalid_tool_arguments",
+                    "tool_name": str(tool_name or "").strip(),
+                    "validation_errors": [{"loc": "", "msg": str(exc), "type": "type_error"}],
+                },
+            )
+        raise
+
+
 def _extract_structured_conclude_output(data: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(data, dict) or data.get("__conclude_valid__") is not True:
         return None
@@ -65,6 +121,251 @@ def _extract_structured_conclude_output(data: Any) -> Optional[Dict[str, Any]]:
     review_items = data.get("review_items")
     if isinstance(review_items, list):
         return {"kind": "review_items", "payload": review_items}
+    return None
+
+
+def _json_safe(obj: Any) -> Any:
+    try:
+        return json.loads(json.dumps(obj, ensure_ascii=False, default=str))
+    except Exception:
+        return str(obj)
+
+
+def _serialize_model_message(message: Any) -> Optional[Dict[str, Any]]:
+    if message is None:
+        return None
+    return {
+        "message_type": type(message).__name__,
+        "content": _json_safe(getattr(message, "content", None)),
+        "additional_kwargs": _json_safe(getattr(message, "additional_kwargs", None)),
+        "tool_calls": _json_safe(getattr(message, "tool_calls", None)),
+        "function_call": _json_safe(getattr(message, "function_call", None)),
+        "tool_call_id": _json_safe(getattr(message, "tool_call_id", None)),
+    }
+
+
+def _serialize_exception(exc: BaseException) -> Dict[str, Any]:
+    return {
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+    }
+
+
+def _is_missing_tool_output_provider_error(payload: Any) -> bool:
+    if isinstance(payload, BaseException):
+        payload = _serialize_exception(payload)
+    if isinstance(payload, dict):
+        message = str(payload.get("message") or "")
+    else:
+        message = str(payload or "")
+    return "No tool output found for function call" in message
+
+
+def _coerce_llm_text(payload: Any) -> str:
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, list):
+        parts: List[str] = []
+        for item in payload:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(parts)
+    return str(payload)
+
+
+def _strip_code_fences(text: str) -> str:
+    if text.startswith("```"):
+        return re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
+    return text
+
+
+def _try_json_load(text: str) -> Optional[Any]:
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _extract_balanced_json(text: str, *, opener: str, closer: str) -> Optional[str]:
+    start = text.find(opener)
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _parse_json_payload(payload: Any) -> Optional[Any]:
+    if isinstance(payload, (dict, list)):
+        return payload
+    text = _coerce_llm_text(payload).strip()
+    if not text:
+        return None
+    candidate = _strip_code_fences(text)
+    parsed = _try_json_load(candidate)
+    if parsed is not None:
+        return parsed
+    for opener, closer in (("{", "}"), ("[", "]")):
+        fragment = _extract_balanced_json(candidate, opener=opener, closer=closer)
+        if fragment is None:
+            continue
+        parsed = _try_json_load(fragment)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _extract_json_candidates(value: Any) -> List[Any]:
+    candidates: List[Any] = []
+    if value is None:
+        return candidates
+    if isinstance(value, (dict, list)):
+        candidates.append(value)
+        return candidates
+    parsed = _parse_json_payload(value)
+    if parsed is not None:
+        candidates.append(parsed)
+    text = _coerce_llm_text(value).strip()
+    if not text:
+        return candidates
+    for match in re.finditer(r"(\{.*?\}|\[.*?\])", text, re.DOTALL):
+        snippet = match.group(1).strip()
+        parsed = _parse_json_payload(snippet)
+        if parsed is not None:
+            candidates.append(parsed)
+    return candidates
+
+
+def _build_tool_balanced_history(messages: Sequence[Any]) -> Tuple[List[Any], Dict[str, Any]]:
+    raw_messages = list(messages or [])
+    sanitized_messages: List[Any] = []
+    orphan_indexes: List[int] = []
+    orphan_ids: List[str] = []
+    pending_ids: List[str] = []
+    pending_start_index: Optional[int] = None
+    truncated_from_index: Optional[int] = None
+
+    for index, message in enumerate(raw_messages):
+        tool_calls = _extract_tool_calls(message)
+        if tool_calls:
+            if pending_ids:
+                truncated_from_index = pending_start_index if pending_start_index is not None else index
+                break
+            current_ids: List[str] = []
+            for call in tool_calls:
+                _name, _args, call_id = _normalize_tool_call(call)
+                call_id = str(call_id or "").strip()
+                if call_id:
+                    current_ids.append(call_id)
+            pending_ids = current_ids
+            pending_start_index = index
+            sanitized_messages.append(message)
+            continue
+
+        tool_call_id = getattr(message, "tool_call_id", None)
+        if tool_call_id is not None:
+            normalized_tool_call_id = str(tool_call_id or "").strip()
+            if pending_ids and normalized_tool_call_id in pending_ids:
+                sanitized_messages.append(message)
+                pending_ids = [item for item in pending_ids if item != normalized_tool_call_id]
+                if not pending_ids:
+                    pending_start_index = None
+                continue
+            orphan_indexes.append(index)
+            if normalized_tool_call_id:
+                orphan_ids.append(normalized_tool_call_id)
+            continue
+
+        if pending_ids:
+            truncated_from_index = pending_start_index if pending_start_index is not None else index
+            break
+
+        sanitized_messages.append(message)
+
+    if truncated_from_index is None and pending_ids:
+        truncated_from_index = pending_start_index if pending_start_index is not None else len(raw_messages)
+
+    if truncated_from_index is not None:
+        orphan_index_set = set(orphan_indexes)
+        sanitized_messages = [
+            message
+            for index, message in enumerate(raw_messages)
+            if index < truncated_from_index and index not in orphan_index_set
+        ]
+
+    original_tail = [_serialize_model_message(message) for message in raw_messages[-8:]]
+    sanitized_tail = [_serialize_model_message(message) for message in sanitized_messages[-8:]]
+    audit = {
+        "original_message_count": len(raw_messages),
+        "sanitized_message_count": len(sanitized_messages),
+        "dangling_tool_call_ids": list(pending_ids),
+        "dangling_turn_start_index": pending_start_index,
+        "orphan_tool_message_ids": orphan_ids,
+        "orphan_tool_message_indexes": orphan_indexes,
+        "truncated_from_index": truncated_from_index,
+        "history_rewrite_applied": bool(orphan_indexes or truncated_from_index is not None),
+        "original_tail": original_tail,
+        "sanitized_tail": sanitized_tail,
+    }
+    return sanitized_messages, audit
+
+
+def _coerce_salvaged_conclude_input(
+    payload: Any,
+    *,
+    structured_conclude_argument_name: Optional[str],
+    structured_conclude_output_kind: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    arg_name = str(structured_conclude_argument_name or "").strip()
+    output_kind = str(structured_conclude_output_kind or "").strip()
+    if not arg_name or not output_kind:
+        return None
+
+    current = payload
+    if output_kind == "submission":
+        if isinstance(current, dict) and current.get("kind") == "submission" and isinstance(current.get("payload"), dict):
+            return {arg_name: current.get("payload")}
+        if isinstance(current, dict) and isinstance(current.get("submission"), dict):
+            return {arg_name: current.get("submission")}
+        if isinstance(current, dict) and current:
+            return {arg_name: current}
+        return None
+
+    if output_kind == "review_items":
+        if isinstance(current, dict) and current.get("kind") == "review_items" and isinstance(current.get("payload"), list):
+            return {arg_name: {"review_items": current.get("payload")}}
+        if isinstance(current, dict) and isinstance(current.get("review"), dict):
+            current = current.get("review")
+        if isinstance(current, dict) and isinstance(current.get("review_items"), list):
+            return {arg_name: {"review_items": current.get("review_items")}}
+        if isinstance(current, list):
+            return {arg_name: {"review_items": current}}
+        return None
+
     return None
 
 
@@ -522,6 +823,8 @@ class ReActAgent:
         object (dict/list) rather than a pre-serialized string. Accept both to avoid
         brittle manual string construction (e.g., unescaped newlines inside JSON strings).
         """
+        if hasattr(conclusion, "model_dump"):
+            conclusion = conclusion.model_dump(exclude_none=True)
         if isinstance(conclusion, (dict, list)):
             try:
                 conclusion = json.dumps(conclusion, ensure_ascii=False)
@@ -531,7 +834,11 @@ class ReActAgent:
             conclusion = str(conclusion)
         return ToolResult(observation=conclusion, data=conclusion)
 
-    def _build_tools(self):
+    def _conclude_args_schema_for_prompt(self, system_prompt: str):
+        schema_kind = _detect_strict_json_schema(system_prompt)
+        return tool_schemas.get_generic_conclude_args_schema(schema_kind)
+
+    def _build_tools(self, system_prompt: Optional[str] = None):
         _ChatOpenAI, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, StructuredTool = _lazy_langchain_imports()
 
         if self._custom_tools:
@@ -539,10 +846,14 @@ class ReActAgent:
             tools_by_name = {t.name: t for t in tools}
             return tools, tools_by_name
 
+        effective_system_prompt = system_prompt if system_prompt is not None else self.system_prompt
+        conclude_args_schema = self._conclude_args_schema_for_prompt(effective_system_prompt or "")
+
         tools = [
             StructuredTool.from_function(
                 func=self._tool_search_literature,
                 name=ActionType.SEARCH_LITERATURE.value,
+                args_schema=tool_schemas.SearchLiteratureToolInput,
                 description=(
                     "Search the local literature database (Chroma-backed RAG) and return relevant chunks. "
                     "Use AFTER `search_experience` when you need verifiable citations; cite source_id from results."
@@ -551,6 +862,7 @@ class ReActAgent:
             StructuredTool.from_function(
                 func=self._tool_fetch_literature_chunk,
                 name=ActionType.FETCH_LITERATURE_CHUNK.value,
+                args_schema=tool_schemas.FetchLiteratureChunkToolInput,
                 description=(
                     "Fetch a specific literature chunk deterministically by canonical source_id "
                     "(rag:chroma/<collection>/doi:<doc_id>#chunk:<idx>). Use to verify another agent's cited evidence."
@@ -559,16 +871,19 @@ class ReActAgent:
             StructuredTool.from_function(
                 func=self._tool_search_experience,
                 name=ActionType.SEARCH_EXPERIENCE.value,
+                args_schema=tool_schemas.SearchExperienceToolInput,
                 description="Search the experience database for similar past cases / guidelines (preferred before `search_literature`).",
             ),
             StructuredTool.from_function(
                 func=self._tool_analyze,
                 name=ActionType.ANALYZE.value,
+                args_schema=tool_schemas.AnalyzeToolInput,
                 description="Stop searching and synthesize what is known/unknown; plan next step.",
             ),
             StructuredTool.from_function(
                 func=self._tool_conclude,
                 name=ActionType.CONCLUDE.value,
+                args_schema=conclude_args_schema,
                 description="Submit the final answer and stop.",
             ),
         ]
@@ -695,7 +1010,9 @@ class ReActAgent:
             llm = build_chat_model_from_config(llm_cfg)
         else:
             llm = self._get_llm()
-        tools, tools_by_name = self._build_tools()
+
+        system_prompt = system_prompt_override if system_prompt_override is not None else self.system_prompt
+        tools, tools_by_name = self._build_tools(system_prompt=system_prompt)
 
         # Bind tools to enable tool-calling.
         if hasattr(llm, "bind_tools"):
@@ -703,13 +1020,14 @@ class ReActAgent:
         else:  # pragma: no cover
             llm_with_tools = llm.bind(tools=tools)
 
-        system_prompt = system_prompt_override if system_prompt_override is not None else self.system_prompt
         messages: List[Any] = [SystemMessage(content=system_prompt), HumanMessage(content=full_query)]
 
         step_number = 0
         final_answer: Optional[str] = None
         structured_output: Optional[Dict[str, Any]] = None
         no_tool_call_streak = 0
+        last_forced_conclude_debug: Optional[Dict[str, Any]] = None
+        last_forced_conclude_observation_data: Any = None
 
         # Many debate phases (REVIEW/REBUTTAL/PROPOSE) may require STRICT JSON.
         requires_strict_json = "STRICT JSON" in (system_prompt or "").upper()
@@ -820,7 +1138,12 @@ class ReActAgent:
                 pass
 
         def _run_forced_conclude(messages_: List[Any]) -> Tuple[str, str, bool, str, Optional[Dict[str, Any]], Dict[str, Any]]:
-            """Generate a forced conclude result, invoking the real conclude tool when structured output is required."""
+            """Generate a forced conclude result and run the real conclude tool whenever the model emits it."""
+            nonlocal last_forced_conclude_debug, last_forced_conclude_observation_data
+            last_forced_conclude_debug = None
+            last_forced_conclude_observation_data = None
+            forced_messages_, forced_history_audit_ = _build_tool_balanced_history(messages_)
+            forced_started_at_ = time.perf_counter()
             retrieved_ = _collect_retrieved_source_ids_from_trajectory(trajectory)
             sid_hint_ = ""
             if retrieved_:
@@ -842,6 +1165,48 @@ class ReActAgent:
             schema_detected_ = "unknown"
             structured_output_ = None
             forced_action_input_: Dict[str, Any] = {}
+            invalid_conclude_observation_ = ""
+            recognized_conclude_call_ = False
+            forced_conclude_debug_: Dict[str, Any] = {
+                "forced_conclude_action_response": None,
+                "forced_conclude_action_error": None,
+                "forced_conclude_structured_json_response": None,
+                "forced_conclude_structured_json_error": None,
+                "forced_conclude_tool_choice_strategy": "required",
+                "forced_conclude_history_audit": forced_history_audit_,
+                "forced_conclude_started_at": round(time.time(), 6),
+                "forced_conclude_elapsed_seconds": None,
+            }
+
+            def _log_forced_conclude_status(status_: str, **extra_: Any) -> None:
+                forced_conclude_debug_["forced_conclude_elapsed_seconds"] = round(
+                    max(0.0, time.perf_counter() - forced_started_at_),
+                    3,
+                )
+                try:
+                    self.logger.info(
+                        "react_forced_conclude_status",
+                        extra={
+                            "event": "agent.react.forced_conclude.status",
+                            "agent_id": self.agent_id,
+                            "status": status_,
+                            "elapsed_seconds": forced_conclude_debug_["forced_conclude_elapsed_seconds"],
+                            **extra_,
+                        },
+                    )
+                except Exception:
+                    pass
+
+            def _raise_forced_conclude_failure(message_: str, *, cause_: Optional[BaseException] = None) -> None:
+                nonlocal last_forced_conclude_debug
+                last_forced_conclude_debug = forced_conclude_debug_
+                _log_forced_conclude_status("failure", error=message_)
+                error_ = RuntimeError(message_)
+                setattr(error_, "response_content", forced_conclude_debug_)
+                setattr(error_, "structured_output", None)
+                if cause_ is not None:
+                    raise error_ from cause_
+                raise error_
 
             # Best-effort: force a specific tool if the backend supports it; otherwise fall back to "required".
             force_conclude_llm_ = llm_with_tools_forced
@@ -850,23 +1215,25 @@ class ReActAgent:
                     force_conclude_llm_ = llm.bind_tools(tools, tool_choice=ActionType.CONCLUDE.value)
                 else:  # pragma: no cover
                     force_conclude_llm_ = llm.bind(tools=tools, tool_choice=ActionType.CONCLUDE.value)
+                forced_conclude_debug_["forced_conclude_tool_choice_strategy"] = ActionType.CONCLUDE.value
             except Exception:
                 force_conclude_llm_ = llm_with_tools_forced
 
             forced_action_msg_ = None
+            _log_forced_conclude_status("start")
             try:
                 forced_msg_cls_ = HumanMessage if use_user_role_for_action else SystemMessage
                 forced_action_msg_ = _invoke_llm(
                     force_conclude_llm_,
-                    messages_
+                    forced_messages_
                     + [
                         forced_msg_cls_(
                             content=(
                                 (
                                     "FINAL ACTION: You MUST call ONLY the `conclude` tool now.\n"
                                     + (
-                                        f"Use exactly the `{structured_conclude_argument_name}` argument with a JSON object payload.\n"
-                                        "Do not use `conclusion` or any other argument name.\n"
+                                        "Provide the required structured payload for the conclude tool.\n"
+                                        f"If the backend exposes named arguments, use `{structured_conclude_argument_name}`.\n"
                                         if structured_conclude_required
                                         else "Set the `conclusion` argument to STRICT JSON ONLY that follows the schema in the system prompt EXACTLY.\n"
                                     )
@@ -879,8 +1246,8 @@ class ReActAgent:
                                 else (
                                     "FINAL ACTION: You MUST call ONLY the `conclude` tool now.\n"
                                     + (
-                                        f"Use exactly the `{structured_conclude_argument_name}` argument with the final structured payload.\n"
-                                        "Do not use `conclusion` or any other argument name.\n"
+                                        "Provide the final structured payload to the conclude tool.\n"
+                                        f"If the backend exposes named arguments, use `{structured_conclude_argument_name}`.\n"
                                         if structured_conclude_required
                                         else "Set the `conclusion` argument to the best possible final answer.\n"
                                     )
@@ -901,8 +1268,12 @@ class ReActAgent:
                         )
                     ],
                 )
-            except Exception:
+            except Exception as exc:
+                forced_conclude_debug_["forced_conclude_action_error"] = _serialize_exception(exc)
                 forced_action_msg_ = None
+            forced_conclude_debug_["forced_conclude_action_response"] = _serialize_model_message(forced_action_msg_)
+
+            tool = tools_by_name.get(ActionType.CONCLUDE.value)
 
             if self.verbose and forced_action_msg_ is not None:
                 self.logger.debug(
@@ -921,25 +1292,75 @@ class ReActAgent:
                 for name, args, call_id in (_normalize_tool_call(c) for c in forced_calls_):
                     if name != ActionType.CONCLUDE.value:
                         continue
+                    recognized_conclude_call_ = True
                     if call_id:
                         forced_conclude_tool_call_id_ = call_id
                     forced_action_input_ = args if isinstance(args, dict) else {}
+                    if tool is None:
+                        if structured_conclude_required:
+                            _raise_forced_conclude_failure("Forced conclude could not find the conclude tool.")
+                        draft_ = str((forced_action_input_ or {}).get("conclusion") or "").strip()
+                        if draft_:
+                            break
+                        continue
+                    result_ = _invoke_tool_with_validation(tool, ActionType.CONCLUDE.value, forced_action_input_)
+                    last_forced_conclude_observation_data = result_.data
                     if structured_conclude_required:
-                        tool = tools_by_name.get(ActionType.CONCLUDE.value)
-                        if tool is None:
-                            raise RuntimeError("Forced conclude could not find the conclude tool.")
-                        try:
-                            result_ = tool.invoke(forced_action_input_)
-                            if not isinstance(result_, ToolResult):
-                                result_ = ToolResult(observation=str(result_), data=result_)
-                        except Exception as exc:
-                            raise RuntimeError(f"Forced conclude tool invocation failed: {exc}") from exc
+                        structured_output_ = _extract_structured_conclude_output(result_.data)
+                        if structured_output_ is not None:
+                            draft_ = str(result_)
+                            last_forced_conclude_debug = forced_conclude_debug_
+                            _log_forced_conclude_status(
+                                "success",
+                                mode="tool_call",
+                                tool_choice_strategy=forced_conclude_debug_.get("forced_conclude_tool_choice_strategy"),
+                            )
+                            return (
+                                draft_,
+                                forced_conclude_tool_call_id_,
+                                strict_json_fallback_used_,
+                                schema_detected_,
+                                structured_output_,
+                                forced_action_input_,
+                            )
+                        invalid_conclude_observation_ = str(result_)
+                        continue
+                    if isinstance(result_.data, dict) and result_.data.get("error") == "invalid_tool_arguments":
+                        invalid_conclude_observation_ = str(result_)
+                        continue
+                    draft_ = str(result_).strip()
+                    if draft_:
+                        break
+
+            if structured_conclude_required:
+                if tool is None:
+                    _raise_forced_conclude_failure("Forced conclude could not find the conclude tool.")
+                if forced_action_msg_ is not None:
+                    salvage_payloads: List[Any] = []
+                    salvage_payloads.extend(_extract_json_candidates(getattr(forced_action_msg_, "content", None)))
+                    additional_kwargs_ = getattr(forced_action_msg_, "additional_kwargs", {}) or {}
+                    for key_, value_ in additional_kwargs_.items():
+                        if key_ in {"tool_calls", "function_call", "function_calls"}:
+                            continue
+                        salvage_payloads.extend(_extract_json_candidates(value_))
+                    for payload_ in salvage_payloads:
+                        salvage_input_ = _coerce_salvaged_conclude_input(
+                            payload_,
+                            structured_conclude_argument_name=structured_conclude_argument_name,
+                            structured_conclude_output_kind=structured_conclude_output_kind,
+                        )
+                        if salvage_input_ is None:
+                            continue
+                        result_ = _invoke_tool_with_validation(tool, ActionType.CONCLUDE.value, salvage_input_)
+                        last_forced_conclude_observation_data = result_.data
                         draft_ = str(result_)
                         structured_output_ = _extract_structured_conclude_output(result_.data)
                         if structured_output_ is None:
-                            raise RuntimeError(
-                                f"Forced conclude did not produce valid structured output for {structured_conclude_output_kind or 'unknown'}."
-                            )
+                            invalid_conclude_observation_ = draft_
+                            continue
+                        forced_action_input_ = salvage_input_
+                        last_forced_conclude_debug = forced_conclude_debug_
+                        _log_forced_conclude_status("success", mode="tool_call_salvage")
                         return (
                             draft_,
                             forced_conclude_tool_call_id_,
@@ -948,22 +1369,106 @@ class ReActAgent:
                             structured_output_,
                             forced_action_input_,
                         )
-                    conclusion_ = None
-                    if isinstance(args, dict):
-                        conclusion_ = args.get("conclusion") or args.get("final_answer")
-                    if isinstance(conclusion_, (dict, list)):
-                        try:
-                            conclusion_ = json.dumps(conclusion_, ensure_ascii=False)
-                        except Exception:
-                            conclusion_ = str(conclusion_)
-                    if conclusion_ is not None:
-                        draft_ = str(conclusion_).strip()
-                        break
+
+                # Second chance for providers that ignore tool-calling entirely on the final step,
+                # or when the forced tool-call request itself fails.
+                forced_json_msg_ = None
+                try:
+                    forced_json_msg_ = _invoke_llm(
+                        llm,
+                        forced_messages_
+                        + [
+                            (HumanMessage if use_user_role_for_action else SystemMessage)(
+                                content=(
+                                    "FINAL PHASE: Output STRICT JSON ONLY.\n"
+                                    "- Do NOT call tools.\n"
+                                    "- Do NOT output markdown, explanations, or extra text.\n"
+                                    f"- Return the final `{structured_conclude_output_kind}` payload in JSON form.\n"
+                                    + (
+                                        '- You may return either {"kind":"submission","payload":{...}}, {"submission": {...}}, or the submission object itself.\n'
+                                        if structured_conclude_output_kind == "submission"
+                                        else '- You may return either {"kind":"review_items","payload":[...]}, {"review":{"review_items":[...]}}, {"review_items":[...]}, or the review_items array itself.\n'
+                                    )
+                                    + (
+                                        f"- Previous conclude validation error: {invalid_conclude_observation_}\n"
+                                        if invalid_conclude_observation_
+                                        else ""
+                                    )
+                                    + sid_hint_
+                                    + elements_hint_
+                                )
+                            )
+                        ],
+                    )
+                except Exception as exc:
+                    forced_conclude_debug_["forced_conclude_structured_json_error"] = _serialize_exception(exc)
+                forced_conclude_debug_["forced_conclude_structured_json_response"] = _serialize_model_message(forced_json_msg_)
+                if self.verbose and forced_json_msg_ is not None:
+                    self.logger.debug(
+                        "react_forced_conclude_structured_text_raw",
+                        extra={
+                            "event": "agent.react.forced_conclude.structured_text.raw",
+                            "agent_id": self.agent_id,
+                            "forced_structured_text_additional_kwargs": _preview(getattr(forced_json_msg_, "additional_kwargs", None)),
+                            "forced_structured_text_tool_calls": _preview(getattr(forced_json_msg_, "tool_calls", None)),
+                            "forced_structured_text": (getattr(forced_json_msg_, "content", "") or "")[:1500],
+                        },
+                    )
+                salvage_payloads = []
+                salvage_payloads.extend(_extract_json_candidates(getattr(forced_json_msg_, "content", None)))
+                forced_json_additional_kwargs_ = getattr(forced_json_msg_, "additional_kwargs", {}) or {}
+                for key_, value_ in forced_json_additional_kwargs_.items():
+                    if key_ in {"tool_calls", "function_call", "function_calls"}:
+                        continue
+                    salvage_payloads.extend(_extract_json_candidates(value_))
+                for payload_ in salvage_payloads:
+                    salvage_input_ = _coerce_salvaged_conclude_input(
+                        payload_,
+                        structured_conclude_argument_name=structured_conclude_argument_name,
+                        structured_conclude_output_kind=structured_conclude_output_kind,
+                    )
+                    if salvage_input_ is None:
+                        continue
+                    result_ = _invoke_tool_with_validation(tool, ActionType.CONCLUDE.value, salvage_input_)
+                    last_forced_conclude_observation_data = result_.data
+                    draft_ = str(result_)
+                    structured_output_ = _extract_structured_conclude_output(result_.data)
+                    if structured_output_ is None:
+                        invalid_conclude_observation_ = draft_
+                        continue
+                    forced_action_input_ = salvage_input_
+                    last_forced_conclude_debug = forced_conclude_debug_
+                    _log_forced_conclude_status("success", mode="json_only_salvage")
+                    return (
+                        draft_,
+                        forced_conclude_tool_call_id_,
+                        strict_json_fallback_used_,
+                        schema_detected_,
+                        structured_output_,
+                        forced_action_input_,
+                    )
+
+            if structured_conclude_required and recognized_conclude_call_ and invalid_conclude_observation_:
+                draft_ = invalid_conclude_observation_
+                last_forced_conclude_debug = forced_conclude_debug_
+                _log_forced_conclude_status("repairable_invalid")
+                return (
+                    draft_,
+                    forced_conclude_tool_call_id_,
+                    strict_json_fallback_used_,
+                    schema_detected_,
+                    None,
+                    forced_action_input_,
+                )
 
             if structured_conclude_required:
-                raise RuntimeError(
-                    f"Forced conclude failed to emit a valid `conclude({structured_conclude_argument_name}=...)` tool call."
-                )
+                action_error_ = forced_conclude_debug_.get("forced_conclude_action_error")
+                structured_error_ = forced_conclude_debug_.get("forced_conclude_structured_json_error")
+                if _is_missing_tool_output_provider_error(action_error_) or _is_missing_tool_output_provider_error(structured_error_):
+                    _raise_forced_conclude_failure(
+                        "Forced conclude provider rejected tool-call history before returning a new `conclude` tool call."
+                    )
+                _raise_forced_conclude_failure("Forced conclude failed to emit a recognized `conclude` tool call.")
 
             if not draft_:
                 # Fallback: ask for a final answer in free-form text (no tools).
@@ -978,6 +1483,11 @@ class ReActAgent:
                                     "- Follow the output schema in the system prompt EXACTLY.\n"
                                     "- No markdown, no extra text.\n"
                                     "- If evidence is required, cite at least one verifiable source_id.\n"
+                                    + (
+                                        f"- Previous conclude validation error: {invalid_conclude_observation_}\n"
+                                        if invalid_conclude_observation_
+                                        else ""
+                                    )
                                     + sid_hint_
                                     + elements_hint_
                                 )
@@ -988,6 +1498,11 @@ class ReActAgent:
                                     "- Explicitly restate the catalyst metal elements exactly as provided.\n"
                                     "- Provide a single speculated value + confidence for key performance metric(s) (no numeric range).\n"
                                     "- If you used literature evidence, cite source_id exactly as provided.\n"
+                                    + (
+                                        f"- Previous conclude validation error: {invalid_conclude_observation_}\n"
+                                        if invalid_conclude_observation_
+                                        else ""
+                                    )
                                     + sid_hint_
                                     + elements_hint_
                                 )
@@ -1089,6 +1604,9 @@ class ReActAgent:
                         + ", ".join([str(c) for c in (task_components or [])])
                     )
 
+            if structured_output_ is None and not structured_conclude_required:
+                last_forced_conclude_observation_data = draft_
+            last_forced_conclude_debug = forced_conclude_debug_
             return (
                 draft_,
                 forced_conclude_tool_call_id_,
@@ -1202,7 +1720,7 @@ class ReActAgent:
                     tool_call_id=forced_tool_call_id or "deadline_conclude",
                     tool_args=forced_action_input or {"conclusion": final_answer},
                     observation=final_answer,
-                    observation_data=final_answer,
+                    observation_data=last_forced_conclude_observation_data if last_forced_conclude_observation_data is not None else final_answer,
                 )
                 thought_text = "Deadline mode: forced conclude on the final step to avoid budget overrun."
                 if strict_json_fallback_used:
@@ -1217,7 +1735,7 @@ class ReActAgent:
                         action_input=forced_action_input or {"conclusion": final_answer},
                         observation=final_answer,
                         tool_call_id=forced_tool_call_id or "deadline_conclude",
-                        observation_data=final_answer,
+                        observation_data=last_forced_conclude_observation_data if last_forced_conclude_observation_data is not None else final_answer,
                         tool_calls=[tool_call],
                     )
                 )
@@ -1514,6 +2032,16 @@ class ReActAgent:
             has_search_unblocked = bool(has_search and (not block_search_this_step))
             has_analysis = any(name in analysis_tools for name, _args, _id in normalized_calls)
             if structured_conclude_required and deadline_no_retrieval and has_search and not has_analysis:
+                analysis_list = ", ".join(f"`{name}`" for name in sorted(analysis_tools)) or "`conclude`"
+                deadline_messages = list(messages)
+                blocked_observation = (
+                    "Policy: retrieval is disabled when only 2 steps remain in this call.\n"
+                    f"Do NOT call search tools now; call one of: {analysis_list}."
+                )
+                for tool_name, _tool_args, tool_call_id in normalized_calls:
+                    if tool_name not in search_tools:
+                        continue
+                    deadline_messages.append(ToolMessage(content=blocked_observation, tool_call_id=tool_call_id))
                 (
                     final_answer,
                     forced_tool_call_id,
@@ -1521,7 +2049,7 @@ class ReActAgent:
                     _schema_detected,
                     forced_structured_output,
                     forced_action_input,
-                ) = _run_forced_conclude(messages)
+                ) = _run_forced_conclude(deadline_messages)
                 structured_output = forced_structured_output
                 step_number += 1
                 tool_call = ToolCallRecord(
@@ -1529,7 +2057,7 @@ class ReActAgent:
                     tool_call_id=forced_tool_call_id or "deadline_conclude",
                     tool_args=forced_action_input or {},
                     observation=final_answer,
-                    observation_data=final_answer,
+                    observation_data=last_forced_conclude_observation_data if last_forced_conclude_observation_data is not None else final_answer,
                 )
                 thought_text = (
                     "Deadline mode: retrieval attempt was blocked with 2 steps remaining, so conclude was forced immediately."
@@ -1544,7 +2072,7 @@ class ReActAgent:
                         action_input=forced_action_input or {},
                         observation=final_answer,
                         tool_call_id=forced_tool_call_id or "deadline_conclude",
-                        observation_data=final_answer,
+                        observation_data=last_forced_conclude_observation_data if last_forced_conclude_observation_data is not None else final_answer,
                         tool_calls=[tool_call],
                     )
                 )
@@ -1653,9 +2181,7 @@ class ReActAgent:
                         result = ToolResult(observation=f"Error: Unknown tool '{tool_name}'", data=None)
                     else:
                         try:
-                            result = tool.invoke(tool_args)
-                            if not isinstance(result, ToolResult):
-                                result = ToolResult(observation=str(result), data=result)
+                            result = _invoke_tool_with_validation(tool, tool_name, tool_args)
                         except Exception as e:
                             result = ToolResult(observation=f"Tool error: {str(e)}", data=None)
 
@@ -1845,7 +2371,7 @@ class ReActAgent:
                 tool_call_id=forced_conclude_tool_call_id,
                 tool_args=forced_action_input or {"conclusion": final_answer},
                 observation=final_answer,
-                observation_data=final_answer,
+                observation_data=last_forced_conclude_observation_data if last_forced_conclude_observation_data is not None else final_answer,
             )
             trajectory.add_step(
                 ReActStep(
@@ -1862,7 +2388,7 @@ class ReActAgent:
                     action_input=forced_action_input or {"conclusion": final_answer},
                     observation=final_answer,
                     tool_call_id=forced_conclude_tool_call_id,
-                    observation_data=final_answer,
+                    observation_data=last_forced_conclude_observation_data if last_forced_conclude_observation_data is not None else final_answer,
                     tool_calls=[tool_call],
                 )
             )
@@ -1885,6 +2411,8 @@ class ReActAgent:
             sources=_extract_sources(trajectory),
             structured_output=structured_output,
         )
+        if last_forced_conclude_debug is not None:
+            setattr(response, "response_content", last_forced_conclude_debug)
         # Reset per-call state to avoid leaking into the next call on the same agent instance.
         self._current_requires_strict_json = False
         return response, trajectory

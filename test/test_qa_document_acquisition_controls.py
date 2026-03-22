@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -11,7 +12,7 @@ import pymupdf as fitz
 from qa.artifacts import QAArtifactStore
 from qa.handoff import EvidenceExtractorHandoff
 from qa.nodes.document_acquirer import DocumentAcquirerNode
-from qa.providers import FetchedDocument, HttpTextFetcher
+from qa.providers import FetchedDocument, HttpTextFetcher, ProviderRequestError
 from qa.retrieval_state import PaperCandidate, PaperRecord, Section, SectionIndex
 from qa.state import QueryConstraints, TaskSpec
 
@@ -22,6 +23,15 @@ class _StaticFetcher:
 
     def fetch(self, url: str) -> FetchedDocument:
         return self._fetched
+
+
+class _SlowFetcher:
+    def __init__(self, *, delay_seconds: float) -> None:
+        self.delay_seconds = float(delay_seconds)
+
+    def fetch(self, url: str) -> FetchedDocument:
+        time.sleep(self.delay_seconds)
+        return FetchedDocument(url=url, content_type="text/plain", text="slow response")
 
 
 def _make_pdf_bytes(pages: list[str]) -> bytes:
@@ -94,6 +104,28 @@ class DocumentAcquisitionTests(unittest.TestCase):
         self.assertEqual("image/jpeg", fetched.content_type)
         self.assertEqual(b"\xff\xd8\xff", fetched.binary)
         self.assertIsNone(fetched.text)
+
+    def test_http_text_fetcher_rejects_excessive_redirects(self):
+        class _Response:
+            status_code = 200
+            headers = {"content-type": "text/html"}
+            content = b"<html></html>"
+            text = "<html></html>"
+            url = "https://example.test/final"
+            history = [object(), object(), object()]
+
+            def raise_for_status(self) -> None:
+                return None
+
+        fetcher = HttpTextFetcher(
+            request_get=lambda *args, **kwargs: _Response(),
+            max_redirects=1,
+        )
+
+        with self.assertRaises(ProviderRequestError) as ctx:
+            fetcher.fetch("https://example.test/start")
+
+        self.assertIn("redirect limit exceeded", str(ctx.exception))
 
     def test_document_acquirer_ignores_short_redirect_pages(self):
         node = DocumentAcquirerNode(
@@ -209,6 +241,29 @@ class DocumentAcquisitionTests(unittest.TestCase):
             self.assertTrue(Path(record.extraction_report_path).exists())
             self.assertEqual("fulltext_unusable", indices[0].fulltext_status)
             self.assertEqual([], indices[0].sections)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_document_acquirer_times_out_single_paper_and_records_runtime_diagnostic(self):
+        node = DocumentAcquirerNode(
+            unpaywall_client=None,
+            fetcher=_SlowFetcher(delay_seconds=0.2),
+            document_fetch_timeout_seconds=0.05,
+            document_fetch_total_timeout_seconds=0.1,
+        )
+
+        tmpdir = _workspace_tmpdir()
+        try:
+            store = QAArtifactStore(base_dir=tmpdir)
+            records, indices = node.run([_candidate()], artifact_store=store)
+            record = records[0]
+            self.assertFalse(record.fulltext_available)
+            self.assertEqual("abstract_only", record.fulltext_status)
+            self.assertEqual("abstract_only", indices[0].fulltext_status)
+            self.assertTrue(any("timed out" in warning for warning in node.last_execution_warnings))
+            runtime_payload = json.loads((tmpdir / "diagnostics" / "document_acquirer_runtime.json").read_text(encoding="utf-8"))
+            self.assertEqual("paper-1", runtime_payload["paper_id"])
+            self.assertIn(runtime_payload["status"], {"timeout", "success"})
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 

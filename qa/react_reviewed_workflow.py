@@ -10,10 +10,12 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from agents.chat_models import build_chat_model_from_config, describe_chat_model_config
-from agents.react_agent import ReActAgent, ToolResult
+from agents import react_tool_schemas as tool_schemas
+from agents.react_agent import AgentResponse, ReActAgent, ToolResult
 from agents.react_reasoning import ReActStep, ReActTrajectory, ToolCallRecord
 from qa.artifacts import QAArtifactStore
 from qa.evidence import EvidenceExtractor
@@ -52,6 +54,8 @@ from qa.synthesis_state import AnswerSectionOutput, CitationRecord, ConfidenceRa
 
 
 logger = logging.getLogger("MAD.qa.react_reviewed")
+
+MIN_REACT_REVIEWED_PROPOSER_STEPS = 6
 
 PROPOSER_TOOL_NAMES = (
     "plan_queries",
@@ -134,6 +138,12 @@ def _compact_text(value: Any) -> str:
     return text.strip()
 
 
+def _tool_plain_payload(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_none=True)
+    return value
+
+
 def _merge_unique_text(existing: Optional[Sequence[str]], extra: Optional[Sequence[str]]) -> List[str]:
     merged: List[str] = []
     seen = set()
@@ -156,6 +166,22 @@ def _confidence(level_score: float, rationale: str) -> SubmissionConfidenceRatin
     else:
         level = "low"
     return SubmissionConfidenceRating(level=level, score=score, rationale=str(rationale).strip() or "No rationale.")
+
+
+def _normalize_confidence_payload(value: Any, *, rationale: str) -> Any:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _confidence(float(value), rationale).model_dump()
+    return value
+
+
+def _normalize_list_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        if not value:
+            return []
+        dict_values = list(value.values())
+        if all(isinstance(item, dict) for item in dict_values):
+            return dict_values
+    return value
 
 
 def _result_confidence(level_score: float, rationale: str) -> ConfidenceRating:
@@ -664,6 +690,18 @@ def _extract_json_candidates(value: Any) -> List[Any]:
     return candidates
 
 
+def _coerce_salvaged_submission_payload(payload: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("kind") == "submission" and isinstance(payload.get("payload"), dict):
+        return payload.get("payload")
+    if isinstance(payload.get("submission"), dict):
+        return payload.get("submission")
+    if any(key in payload for key in ("submission_id", "sections", "citations", "overall_confidence", "trajectory_id")):
+        return payload
+    return None
+
+
 @dataclass
 class RouterAgentWrapper:
     router: RouterNode
@@ -789,6 +827,7 @@ class ReactReviewedWorkspace:
         document_acquirer: DocumentAcquirerNode,
         handoff: EvidenceExtractorHandoff,
         evidence_extractor: EvidenceExtractor,
+        stage_watchdog_seconds: float = 120.0,
     ) -> None:
         self.question = question
         self.context = context
@@ -801,6 +840,7 @@ class ReactReviewedWorkspace:
         self.document_acquirer = document_acquirer
         self.handoff = handoff
         self.evidence_extractor = evidence_extractor
+        self.stage_watchdog_seconds = max(0.01, float(stage_watchdog_seconds))
 
         self._state_lock = threading.RLock()
         self.query_plans: Dict[str, QueryPlan] = {}
@@ -824,6 +864,7 @@ class ReactReviewedWorkspace:
         self._search_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
         self._acquire_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
         self._extract_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
+        self._stage_events: List[Dict[str, Any]] = []
 
     def _register_query_plan(self, query_plan: QueryPlan, *, prefix: str = "qp") -> str:
         with self._state_lock:
@@ -874,6 +915,83 @@ class ReactReviewedWorkspace:
     def _merge_execution_warnings(self, warnings: Optional[Sequence[str]]) -> None:
         with self._state_lock:
             self.execution_warnings = _merge_unique_text(self.execution_warnings, warnings)
+
+    def _record_stage_event(
+        self,
+        *,
+        stage: str,
+        status: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload = {
+            "timestamp": round(time.time(), 6),
+            "stage": str(stage),
+            "status": str(status),
+            "details": copy.deepcopy(details or {}),
+        }
+        with self._state_lock:
+            self._stage_events.append(payload)
+            events_payload = copy.deepcopy(self._stage_events)
+        self.store.write_json("diagnostics/runtime_stage_events.json", events_payload)
+        self.store.write_json("diagnostics/runtime_stage_status.json", payload)
+
+    def _run_stage(
+        self,
+        *,
+        stage: str,
+        operation: Callable[[], Any],
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        start_details = copy.deepcopy(details or {})
+        start_details["watchdog_seconds"] = self.stage_watchdog_seconds
+        self._record_stage_event(stage=stage, status="start", details=start_details)
+        started_at = time.perf_counter()
+        result_holder: Dict[str, Any] = {}
+        error_holder: Dict[str, BaseException] = {}
+        done = threading.Event()
+
+        def _target() -> None:
+            try:
+                result_holder["value"] = operation()
+            except BaseException as exc:  # pragma: no cover - thread plumbing
+                error_holder["error"] = exc
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=_target, daemon=True)
+        thread.start()
+        if not done.wait(self.stage_watchdog_seconds):
+            elapsed = round(max(0.0, time.perf_counter() - started_at), 3)
+            timeout_exc = TimeoutError(
+                f"{stage} exceeded stage_watchdog_seconds={self.stage_watchdog_seconds}s "
+                f"(elapsed {elapsed}s)"
+            )
+            timeout_details = copy.deepcopy(details or {})
+            timeout_details.update({"elapsed_seconds": elapsed, "error": str(timeout_exc)})
+            self._record_stage_event(stage=stage, status="timeout", details=timeout_details)
+            raise timeout_exc
+        try:
+            if "error" in error_holder:
+                raise error_holder["error"]
+            result = result_holder.get("value")
+        except Exception as exc:
+            elapsed = round(max(0.0, time.perf_counter() - started_at), 3)
+            failure_status = "timeout" if isinstance(exc, TimeoutError) else "failure"
+            failure_details = copy.deepcopy(details or {})
+            failure_details.update(
+                {
+                    "elapsed_seconds": elapsed,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            self._record_stage_event(stage=stage, status=failure_status, details=failure_details)
+            raise
+        elapsed = round(max(0.0, time.perf_counter() - started_at), 3)
+        success_details = copy.deepcopy(details or {})
+        success_details["elapsed_seconds"] = elapsed
+        self._record_stage_event(stage=stage, status="success", details=success_details)
+        return result
 
     def set_review_context(
         self,
@@ -1023,6 +1141,8 @@ class ReactReviewedWorkspace:
                 unpaywall_client=self.document_acquirer.unpaywall_client,
                 fetcher=self.document_acquirer.fetcher,
                 pdf_extractor=pdf_extractor_clone,
+                document_fetch_timeout_seconds=self.document_acquirer.document_fetch_timeout_seconds,
+                document_fetch_total_timeout_seconds=self.document_acquirer.document_fetch_total_timeout_seconds,
             )
         return self.document_acquirer
 
@@ -1113,11 +1233,19 @@ class ReactReviewedWorkspace:
         else:
             retriever = self._build_retriever_clone()
             try:
-                candidates = retriever.run(
-                    task_spec=self.task_spec,
-                    entity_pack=self.entity_pack,
-                    query_plans=[query_plan],
-                    artifact_store=store,
+                candidates = self._run_stage(
+                    stage="search_papers",
+                    details={
+                        "query_plan_id": resolved_id,
+                        "lane": query_plan.lane,
+                        "requested_via": requested_via,
+                    },
+                    operation=lambda: retriever.run(
+                        task_spec=self.task_spec,
+                        entity_pack=self.entity_pack,
+                        query_plans=[query_plan],
+                        artifact_store=store,
+                    ),
                 )
                 self._merge_diagnostics(getattr(retriever, "last_diagnostics", []) or [])
                 self._merge_provider_health(getattr(retriever, "last_provider_health", {}) or {})
@@ -1205,9 +1333,16 @@ class ReactReviewedWorkspace:
                 raise error
             acquirer = self._build_document_acquirer_clone()
             try:
-                paper_records, section_indices = acquirer.run(
-                    candidates=[candidate],
-                    artifact_store=store,
+                paper_records, section_indices = self._run_stage(
+                    stage="acquire_document",
+                    details={
+                        "paper_id": normalized_paper_id,
+                        "requested_via": requested_via,
+                    },
+                    operation=lambda: acquirer.run(
+                        candidates=[candidate],
+                        artifact_store=store,
+                    ),
                 )
                 self._merge_diagnostics(getattr(acquirer, "last_diagnostics", []) or [])
                 self._merge_provider_health(getattr(acquirer, "last_provider_health", {}) or {})
@@ -1307,36 +1442,36 @@ class ReactReviewedWorkspace:
             if session is not None:
                 session.record_hit(tool_name="read_sections", cache_key=cache_key, requested_via=requested_via)
             return payload
-        if preferred_sections:
-            section_views = self.handoff.read_preferred_sections(
-                paper_record=paper_record,
-                section_index=section_index,
-                task_spec=self.task_spec,
-                evidence_is_weak=False,
-                missing_conditions=False,
-            )
-        else:
-            section_views = [
-                self.handoff.read_section_text(
+        def _read_sections_operation() -> List[Dict[str, Any]]:
+            if preferred_sections:
+                section_views = self.handoff.read_preferred_sections(
                     paper_record=paper_record,
                     section_index=section_index,
-                    section_id=section_id,
+                    task_spec=self.task_spec,
+                    evidence_is_weak=False,
+                    missing_conditions=False,
                 )
-                for section_id in list(selected_ids)
-            ]
-            section_views = [view for view in section_views if view is not None]
-        if not section_views and paper_record.abstract:
-            payloads = [
-                {
-                    "paper_id": paper_record.paper_id,
-                    "section_id": "sec_abstract",
-                    "section_type": "abstract",
-                    "heading": "Abstract",
-                    "text": paper_record.abstract,
-                }
-            ]
-        else:
-            payloads = [
+            else:
+                section_views = [
+                    self.handoff.read_section_text(
+                        paper_record=paper_record,
+                        section_index=section_index,
+                        section_id=section_id,
+                    )
+                    for section_id in list(selected_ids)
+                ]
+                section_views = [view for view in section_views if view is not None]
+            if not section_views and paper_record.abstract:
+                return [
+                    {
+                        "paper_id": paper_record.paper_id,
+                        "section_id": "sec_abstract",
+                        "section_type": "abstract",
+                        "heading": "Abstract",
+                        "text": paper_record.abstract,
+                    }
+                ]
+            return [
                 {
                     "paper_id": view.paper_id,
                     "section_id": view.section_id,
@@ -1348,6 +1483,17 @@ class ReactReviewedWorkspace:
                 }
                 for view in section_views
             ]
+
+        payloads = self._run_stage(
+            stage="read_sections",
+            details={
+                "paper_id": str(paper_id),
+                "requested_via": requested_via,
+                "preferred_sections": bool(preferred_sections),
+                "section_ids": list(selected_ids),
+            },
+            operation=_read_sections_operation,
+        )
         with self._state_lock:
             self._section_read_cache[cache_key] = copy.deepcopy(payloads)
         return payloads
@@ -1394,15 +1540,15 @@ class ReactReviewedWorkspace:
                 write_snapshot=write_snapshot,
             )
             try:
-                if not section_ids and not preferred_sections:
-                    evidence_items = self.evidence_extractor.run(
-                        task_spec=self.task_spec,
-                        entity_pack=self.entity_pack,
-                        paper_record=paper_record,
-                        section_index=section_index,
-                    )
-                else:
-                    evidence_items = []
+                def _extract_evidence_operation() -> List[EvidenceItem]:
+                    if not section_ids and not preferred_sections:
+                        return self.evidence_extractor.run(
+                            task_spec=self.task_spec,
+                            entity_pack=self.entity_pack,
+                            paper_record=paper_record,
+                            section_index=section_index,
+                        )
+                    evidence_items: List[EvidenceItem] = []
                     for section_payload in self.read_sections(
                         paper_id=paper_id,
                         section_ids=section_ids,
@@ -1443,6 +1589,18 @@ class ReactReviewedWorkspace:
                                 section_view=section_view,
                             )
                         )
+                    return evidence_items
+
+                evidence_items = self._run_stage(
+                    stage="extract_evidence",
+                    details={
+                        "paper_id": str(paper_id),
+                        "requested_via": requested_via,
+                        "preferred_sections": bool(preferred_sections),
+                        "section_ids": list(self._canonical_section_ids(section_ids)),
+                    },
+                    operation=_extract_evidence_operation,
+                )
                 with self._state_lock:
                     for evidence_item in evidence_items:
                         self.evidence_items[evidence_item.evidence_id] = evidence_item
@@ -1690,6 +1848,18 @@ class ReactReviewedProposerAgent:
         self.model_config = dict(model_config or {})
         self.max_steps_initial = max(1, int(max_steps_initial))
         self.max_steps_revision = max(1, int(max_steps_revision))
+        if self.max_steps_initial < MIN_REACT_REVIEWED_PROPOSER_STEPS:
+            raise ValueError(
+                "ReactReviewed proposer max_steps_initial must be at least "
+                f"{MIN_REACT_REVIEWED_PROPOSER_STEPS} so the required plan/search/acquire/read-or-extract/conclude "
+                "tool chain remains feasible under deadline mode."
+            )
+        if self.max_steps_revision < MIN_REACT_REVIEWED_PROPOSER_STEPS:
+            raise ValueError(
+                "ReactReviewed proposer max_steps_revision must be at least "
+                f"{MIN_REACT_REVIEWED_PROPOSER_STEPS} so revision cycles can still acquire evidence and conclude "
+                "before deadline-mode retrieval blocking starts."
+            )
         self.llm_timeout_seconds = float(llm_timeout_seconds)
         self.fallback_mode = str(fallback_mode or "fail_fast_only").strip().lower() or "fail_fast_only"
         self.repair_attempts = max(0, int(repair_attempts))
@@ -1912,6 +2082,7 @@ class ReactReviewedProposerAgent:
                     code="evidence_required_before_conclude",
                 )
             try:
+                submission = _tool_plain_payload(submission)
                 agent = agent_holder.get("agent")
                 payload = self._validate_submission_payload(
                     workspace=workspace,
@@ -1932,16 +2103,32 @@ class ReactReviewedProposerAgent:
             )
 
         tools = [
-            StructuredTool.from_function(plan_queries, name="plan_queries"),
-            StructuredTool.from_function(search_papers, name="search_papers"),
-            StructuredTool.from_function(acquire_document, name="acquire_document"),
-            StructuredTool.from_function(read_sections, name="read_sections"),
-            StructuredTool.from_function(extract_evidence, name="extract_evidence"),
-            StructuredTool.from_function(fetch_citation_context, name="fetch_citation_context"),
-            StructuredTool.from_function(inspect_entity_cache, name="inspect_entity_cache"),
-            StructuredTool.from_function(inspect_submission_anchor, name="inspect_submission_anchor"),
-            StructuredTool.from_function(analyze_submission_gap, name="analyze_submission_gap"),
-            StructuredTool.from_function(conclude, name="conclude"),
+            StructuredTool.from_function(plan_queries, name="plan_queries", args_schema=tool_schemas.PlanQueriesToolInput),
+            StructuredTool.from_function(search_papers, name="search_papers", args_schema=tool_schemas.SearchPapersToolInput),
+            StructuredTool.from_function(acquire_document, name="acquire_document", args_schema=tool_schemas.AcquireDocumentToolInput),
+            StructuredTool.from_function(read_sections, name="read_sections", args_schema=tool_schemas.SectionAccessToolInput),
+            StructuredTool.from_function(extract_evidence, name="extract_evidence", args_schema=tool_schemas.SectionAccessToolInput),
+            StructuredTool.from_function(
+                fetch_citation_context,
+                name="fetch_citation_context",
+                args_schema=tool_schemas.FetchCitationContextToolInput,
+            ),
+            StructuredTool.from_function(
+                inspect_entity_cache,
+                name="inspect_entity_cache",
+                args_schema=tool_schemas.InspectEntityCacheToolInput,
+            ),
+            StructuredTool.from_function(
+                inspect_submission_anchor,
+                name="inspect_submission_anchor",
+                args_schema=tool_schemas.InspectSubmissionAnchorToolInput,
+            ),
+            StructuredTool.from_function(
+                analyze_submission_gap,
+                name="analyze_submission_gap",
+                args_schema=tool_schemas.EmptyToolInput,
+            ),
+            StructuredTool.from_function(conclude, name="conclude", args_schema=tool_schemas.ProposerConcludeToolInput),
         ]
         system_prompt = self._build_system_prompt()
         try:
@@ -1983,6 +2170,8 @@ class ReactReviewedProposerAgent:
                 stage="proposer_execution",
                 message=f"Proposer failed during ReAct execution: {exc}",
                 details={"fallback_mode": self.fallback_mode},
+                response_content=getattr(exc, "response_content", None),
+                structured_output=getattr(exc, "structured_output", None),
             )
         try:
             payload = self._parse_submission_response(response=response)
@@ -1997,11 +2186,30 @@ class ReactReviewedProposerAgent:
             )
             return submission, trajectory
         except Exception as exc:
+            try:
+                salvaged_payload = self._salvage_submission_payload(response=response, trajectory=trajectory)
+                if salvaged_payload is not None:
+                    submission = self._validate_submission_payload(
+                        workspace=workspace,
+                        submission=salvaged_payload,
+                        cycle_number=cycle_number,
+                        open_review_items=open_review_items,
+                        agent=None,
+                        trajectory=trajectory,
+                        run_state=run_state,
+                    )
+                    logger.warning(
+                        "react_reviewed_proposer_payload_salvaged cycle=%s source=forced_conclude_diagnostics",
+                        cycle_number,
+                    )
+                    return submission, trajectory
+            except Exception:
+                pass
             error = ReactReviewedStructuredOutputError(
                 stage="proposer",
                 cycle_number=cycle_number,
                 message=f"invalid proposer structured output: {exc}",
-                response_content=getattr(response, "content", None),
+                response_content=getattr(response, "response_content", getattr(response, "content", None)),
                 structured_output=getattr(response, "structured_output", None),
                 trajectory=trajectory,
             )
@@ -2028,6 +2236,101 @@ class ReactReviewedProposerAgent:
             raise ValueError("submission payload must be a JSON object.")
         return payload
 
+    def _build_fallback_submission_citations(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        run_state: Optional[_ProposerRunState],
+    ) -> List[Dict[str, Any]]:
+        if run_state is None:
+            return []
+        fallback_citations: List[Dict[str, Any]] = []
+        candidate_paper_ids = list(sorted(run_state.acquired_paper_ids or run_state.searched_paper_ids))
+        for paper_id in candidate_paper_ids[:4]:
+            paper_record = workspace.paper_records.get(paper_id)
+            section_ids = list(sorted(run_state.section_ids_by_paper.get(paper_id, set())))
+            evidence_ids = list(sorted(run_state.evidence_ids_by_paper.get(paper_id, set())))
+            if not section_ids and not evidence_ids:
+                fulltext_status = str(run_state.fulltext_status_by_paper.get(paper_id) or "").strip().lower()
+                if fulltext_status == "abstract_only":
+                    section_ids = ["sec_abstract"]
+            if not section_ids and not evidence_ids:
+                continue
+            fallback_citations.append(
+                {
+                    "citation_id": f"CIT-{len(fallback_citations) + 1}",
+                    "paper_id": paper_id,
+                    "doi": getattr(paper_record, "doi", None) if paper_record is not None else None,
+                    "title": getattr(paper_record, "title", None) if paper_record is not None else None,
+                    "year": getattr(paper_record, "year", None) if paper_record is not None else None,
+                    "venue": getattr(paper_record, "venue", None) if paper_record is not None else None,
+                    "section_ids": section_ids,
+                    "evidence_ids": evidence_ids,
+                }
+            )
+        return fallback_citations
+
+    def _salvage_submission_payload(
+        self,
+        *,
+        response: Any,
+        trajectory: Optional[ReActTrajectory],
+    ) -> Optional[Dict[str, Any]]:
+        candidate_payloads: List[Any] = []
+        response_content = getattr(response, "response_content", None)
+        candidate_payloads.extend(_extract_json_candidates(getattr(response, "structured_output", None)))
+        candidate_payloads.extend(_extract_json_candidates(getattr(response, "content", None)))
+        candidate_payloads.extend(_extract_json_candidates(response_content))
+
+        if isinstance(response_content, dict):
+            for key in (
+                "forced_conclude_action_response",
+                "forced_conclude_structured_json_response",
+            ):
+                message_payload = response_content.get(key)
+                if not isinstance(message_payload, dict):
+                    continue
+                candidate_payloads.extend(_extract_json_candidates(message_payload.get("content")))
+                candidate_payloads.extend(_extract_json_candidates(message_payload.get("additional_kwargs")))
+                function_call = message_payload.get("function_call")
+                if function_call is not None:
+                    candidate_payloads.extend(_extract_json_candidates(function_call))
+                    if isinstance(function_call, dict):
+                        candidate_payloads.extend(_extract_json_candidates(function_call.get("arguments")))
+                for tool_call in list(message_payload.get("tool_calls") or []):
+                    if not isinstance(tool_call, dict):
+                        continue
+                    candidate_payloads.extend(_extract_json_candidates(tool_call))
+                    candidate_payloads.extend(_extract_json_candidates(tool_call.get("args")))
+                    function_payload = tool_call.get("function")
+                    if isinstance(function_payload, dict):
+                        candidate_payloads.extend(_extract_json_candidates(function_payload.get("arguments")))
+
+        for step in reversed(list(getattr(trajectory, "steps", []) or [])):
+            if getattr(step, "action", "") == "conclude":
+                candidate_payloads.extend(_extract_json_candidates(getattr(step, "action_input", None)))
+                candidate_payloads.extend(_extract_json_candidates(getattr(step, "observation_data", None)))
+                candidate_payloads.extend(_extract_json_candidates(getattr(step, "observation", None)))
+            for call in reversed(list(getattr(step, "tool_calls", []) or [])):
+                if getattr(call, "tool_name", "") != "conclude":
+                    continue
+                candidate_payloads.extend(_extract_json_candidates(getattr(call, "tool_args", None)))
+                candidate_payloads.extend(_extract_json_candidates(getattr(call, "observation_data", None)))
+                candidate_payloads.extend(_extract_json_candidates(getattr(call, "observation", None)))
+
+        seen_payloads = set()
+        for payload in candidate_payloads:
+            payload_key = _compact_text(
+                json.dumps(payload, ensure_ascii=False, default=str) if isinstance(payload, (dict, list)) else str(payload)
+            )
+            if payload_key in seen_payloads:
+                continue
+            seen_payloads.add(payload_key)
+            submission_payload = _coerce_salvaged_submission_payload(payload)
+            if isinstance(submission_payload, dict):
+                return submission_payload
+        return None
+
     def _repair_submission_with_llm(
         self,
         *,
@@ -2051,6 +2354,7 @@ class ReactReviewedProposerAgent:
                                 "You are repairing an invalid AnswerSubmission for a chemistry QA proposer.\n"
                                 "Return STRICT JSON only.\n"
                                 "Return either {\"kind\":\"submission\",\"payload\":{...}} or the submission object itself.\n"
+                                "The canonical submission keys are submission_id, question, version, sections, citations, limitations, overall_confidence, trajectory_id, step_refs, and issue_refs.\n"
                                 "Use only the supplied task_spec, entity_pack, review items, retrieval state, and cited IDs.\n"
                                 "Do not invent citations, evidence_ids, section_ids, or papers.\n"
                                 "If the current run has only abstract-backed evidence, include an explicit degraded-evidence limitation and lower overall confidence.\n"
@@ -2102,6 +2406,39 @@ class ReactReviewedProposerAgent:
                 logger.info("react_reviewed_proposer_repair_succeeded cycle=%s attempt=%s", cycle_number, attempt_number)
                 return submission, trajectory
             except Exception as exc:
+                try:
+                    salvage_sources = [
+                        SimpleNamespace(content=raw_response, structured_output=None, response_content=raw_response),
+                        SimpleNamespace(
+                            content=raw_response,
+                            structured_output=last_error.structured_output,
+                            response_content=last_error.response_content,
+                        ),
+                    ]
+                    for salvage_source in salvage_sources:
+                        salvaged_payload = self._salvage_submission_payload(
+                            response=salvage_source,
+                            trajectory=trajectory,
+                        )
+                        if salvaged_payload is None:
+                            continue
+                        submission = self._validate_submission_payload(
+                            workspace=workspace,
+                            submission=salvaged_payload,
+                            cycle_number=cycle_number,
+                            open_review_items=open_review_items,
+                            agent=None,
+                            trajectory=trajectory,
+                            run_state=run_state,
+                        )
+                        logger.warning(
+                            "react_reviewed_proposer_repair_salvaged cycle=%s attempt=%s source=invalid_payload",
+                            cycle_number,
+                            attempt_number,
+                        )
+                        return submission, trajectory
+                except Exception:
+                    pass
                 last_error = ReactReviewedStructuredOutputError(
                     stage="proposer_repair",
                     cycle_number=cycle_number,
@@ -2183,12 +2520,28 @@ class ReactReviewedProposerAgent:
         raw_payload.setdefault("version", cycle_number)
         raw_payload.setdefault("trajectory_id", trajectory_id or f"traj_placeholder_{cycle_number}")
         raw_payload.setdefault("citations", [])
+        raw_payload["citations"] = _normalize_list_payload(raw_payload.get("citations"))
         raw_payload.setdefault("limitations", [])
+        raw_payload["limitations"] = _normalize_list_payload(raw_payload.get("limitations"))
         raw_payload.setdefault("issue_refs", [item.review_id for item in open_review_items])
+        raw_payload["issue_refs"] = _normalize_list_payload(raw_payload.get("issue_refs"))
         raw_payload.setdefault(
             "overall_confidence",
             _confidence(0.65, "LLM proposer confidence normalized by conclude validator.").model_dump(),
         )
+        raw_payload["overall_confidence"] = _normalize_confidence_payload(
+            raw_payload.get("overall_confidence"),
+            rationale="LLM proposer confidence normalized by conclude validator.",
+        )
+        fallback_citations = self._build_fallback_submission_citations(workspace=workspace, run_state=run_state)
+        raw_citations = list(raw_payload.get("citations") or [])
+        anchored_input_citation_found = any(
+            bool(list(item.get("section_ids") or []) or list(item.get("evidence_ids") or []))
+            for item in raw_citations
+            if isinstance(item, dict)
+        )
+        if fallback_citations and (not raw_citations or not anchored_input_citation_found):
+            raw_payload["citations"] = fallback_citations
         citation_ids = {
             str(item.get("citation_id") or "").strip()
             for item in list(raw_payload.get("citations") or [])
@@ -2217,6 +2570,10 @@ class ReactReviewedProposerAgent:
             section_payload.setdefault(
                 "section_confidence",
                 _confidence(0.6, "Section confidence normalized by conclude validator.").model_dump(),
+            )
+            section_payload["section_confidence"] = _normalize_confidence_payload(
+                section_payload.get("section_confidence"),
+                rationale="Section confidence normalized by conclude validator.",
             )
             legacy_section_citations = section_payload.pop("citations", None)
             section_payload.pop("evidence_refs", None)
@@ -2250,7 +2607,7 @@ class ReactReviewedProposerAgent:
             item
             if not isinstance(item, dict)
             else {**item, "trajectory_id": item.get("trajectory_id") or raw_payload["trajectory_id"]}
-            for item in list(raw_payload.get("step_refs") or [])
+            for item in list(_normalize_list_payload(raw_payload.get("step_refs")) or [])
         ] or [{"trajectory_id": raw_payload["trajectory_id"], "step_number": 1}]
         validated = AnswerSubmission.model_validate(raw_payload)
         if run_state is not None:
@@ -2617,8 +2974,7 @@ class ReactReviewedProposerAgent:
             "Only use citations, section_ids, and evidence_ids returned by tools in this cycle.\n"
             "There is no deterministic fallback. If the run cannot produce a valid evidence-backed submission within budget, fail explicitly.\n"
             "If conclude returns a validation error, fix the submission object rather than inventing unsupported anchors.\n"
-            "When finished, call conclude with `submission={...}` only.\n"
-            "The only valid conclude argument name is `submission`.\n"
+            "When finished, call the conclude tool with the final structured submission payload.\n"
             "Do not output free text instead of the conclude tool call.\n"
         )
 
@@ -2679,7 +3035,7 @@ class ReactReviewedProposerAgent:
             "Call extract_evidence before conclude. Prefer fulltext-backed evidence when it exists.\n"
             "Do not mix retrieval tools with conclude in the same step.\n"
             "Use conclude only when the submission object is ready.\n"
-            "The final step must be `conclude(submission={...})`.\n"
+            "The final step must call the conclude tool with the completed submission payload.\n"
         )
 
     def _add_tool_step(
@@ -2923,6 +3279,7 @@ class ReactReviewedReviewerAgent:
         def conclude(review: Any) -> ToolResult:
             """Validate and submit the reviewer payload for this cycle."""
             try:
+                review = _tool_plain_payload(review)
                 items = self._validate_review_payload(
                     review=review,
                     submission=submission,
@@ -2952,7 +3309,20 @@ class ReactReviewedReviewerAgent:
             "extract_evidence": extract_evidence,
             "conclude": conclude,
         }
-        tools = [StructuredTool.from_function(tool_builders[name], name=name) for name in allowed_tool_names]
+        tool_args_schemas: Dict[str, Any] = {
+            "inspect_entity_cache": tool_schemas.InspectEntityCacheToolInput,
+            "inspect_submission_anchor": tool_schemas.InspectSubmissionAnchorToolInput,
+            "read_sections": tool_schemas.SectionAccessToolInput,
+            "search_papers": tool_schemas.ReviewerSearchPapersToolInput,
+            "acquire_document": tool_schemas.AcquireDocumentToolInput,
+            "fetch_citation_context": tool_schemas.FetchCitationContextToolInput,
+            "extract_evidence": tool_schemas.SectionAccessToolInput,
+            "conclude": tool_schemas.ReviewerConcludeToolInput,
+        }
+        tools = [
+            StructuredTool.from_function(tool_builders[name], name=name, args_schema=tool_args_schemas[name])
+            for name in allowed_tool_names
+        ]
         system_prompt = self._build_system_prompt()
         try:
             agent = ReActAgent(
@@ -2969,7 +3339,7 @@ class ReactReviewedReviewerAgent:
                     f"Allowed tools: {', '.join(allowed_tool_names)}.\n"
                     f"Charged retrieval budget: {session.budget_state.budget_limit} cache-miss actions.\n"
                     "Use conclude only when the review item list is ready.\n"
-                    "The final step must be `conclude(review={\"review_items\": [...]})`.\n"
+                    "The final step must call the conclude tool with the completed review payload.\n"
                 ),
                 search_tool_names=[name for name in allowed_tool_names if name != "conclude"],
                 analysis_tool_names=["conclude"],
@@ -2993,6 +3363,8 @@ class ReactReviewedReviewerAgent:
                 cycle_number=cycle_number,
                 reviewer_role=self.reviewer_role,
                 message=f"reviewer structured conclude failed after LLM start: {exc}",
+                response_content=getattr(exc, "response_content", None),
+                structured_output=getattr(exc, "structured_output", None),
             )
             _store_invalid_llm_output(
                 artifact_store=session.artifact_store,
@@ -3031,7 +3403,7 @@ class ReactReviewedReviewerAgent:
                 cycle_number=cycle_number,
                 reviewer_role=self.reviewer_role,
                 message=f"invalid reviewer structured output: {exc}",
-                response_content=getattr(response, "content", None),
+                response_content=getattr(response, "response_content", getattr(response, "content", None)),
                 structured_output=getattr(response, "structured_output", None),
                 trajectory=trajectory,
             )
@@ -3399,8 +3771,7 @@ class ReactReviewedReviewerAgent:
             "Do not challenge RouterAgent or EntityResolverAgent outputs.\n"
             f"You have at most {self.max_retrieval_actions} charged retrieval cache-miss actions.\n"
             "Return ReviewItem objects only by calling conclude.\n"
-            "The final tool call must be `conclude(review={\"review_items\": [...]})`.\n"
-            "The only valid conclude argument name is `review`.\n"
+            "The final tool call must call conclude with the completed review payload.\n"
         )
 
     def _build_user_prompt(
@@ -3624,6 +3995,7 @@ class ReactReviewedWorkflow:
         self.handoff = handoff
         self.evidence_extractor = evidence_extractor
         self.reviewer_role_order = tuple(role for role in DEFAULT_REVIEWER_ROLES if role in REVIEWER_TOOL_NAMES)
+        self.stage_watchdog_seconds = max(0.01, float(react_config.get("stage_watchdog_seconds", 120.0)))
         self.reviewer_max_concurrency = max(1, int(react_config.get("reviewer_max_concurrency", len(self.reviewer_role_order))))
         self.reviewer_global_budget = max(0, int(react_config.get("reviewer_max_retrieval_actions", 1)))
         configured_reviewer_budgets = dict(
@@ -3639,7 +4011,7 @@ class ReactReviewedWorkflow:
         self.proposer = ReactReviewedProposerAgent(
             model_config=proposer_model_config,
             max_steps_initial=react_config.get("max_propose_steps_initial", 6),
-            max_steps_revision=react_config.get("max_propose_steps_revision", 4),
+            max_steps_revision=react_config.get("max_propose_steps_revision", 6),
             llm_timeout_seconds=self.qa_config.get("model_timeout_seconds", 45.0),
             fallback_mode=react_config.get("proposer_fallback_mode", "fail_fast_only"),
             repair_attempts=react_config.get("proposer_repair_attempts", 1),
@@ -3936,6 +4308,7 @@ class ReactReviewedWorkflow:
             document_acquirer=self.document_acquirer,
             handoff=self.handoff,
             evidence_extractor=self.evidence_extractor,
+            stage_watchdog_seconds=self.stage_watchdog_seconds,
         )
 
         react_config = dict(self.qa_config.get("react_reviewed", {}) or {})

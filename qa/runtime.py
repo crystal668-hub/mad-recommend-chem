@@ -108,10 +108,11 @@ DEFAULT_QA_CONFIG: Dict[str, Any] = {
     "entity_resolution": copy.deepcopy(DEFAULT_QA_ENTITY_RESOLUTION_CONFIG),
     "react_reviewed": {
         "max_propose_steps_initial": 6,
-        "max_propose_steps_revision": 4,
+        "max_propose_steps_revision": 6,
         "proposer_fallback_mode": "fail_fast_only",
         "proposer_repair_attempts": 1,
         "proposer_evidence_policy": "prefer_fulltext",
+        "stage_watchdog_seconds": 120.0,
         "max_review_cycles": 3,
         "reviewer_max_steps": 3,
         "reviewer_max_concurrency": 4,
@@ -137,6 +138,9 @@ DEFAULT_QA_CONFIG: Dict[str, Any] = {
         "unpaywall_email": None,
         "http_timeout": 10.0,
         "fetch_timeout": 15.0,
+        "document_fetch_timeout_seconds": 45.0,
+        "document_fetch_total_timeout_seconds": 300.0,
+        "provider_redirect_limit": 8,
         "retry_attempts": 2,
         "backoff_base_seconds": 1.0,
         "backoff_max_seconds": 8.0,
@@ -292,6 +296,10 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
             allowed={"prefer_fulltext"},
             fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_evidence_policy"],
         ),
+        "stage_watchdog_seconds": _coerce_positive_float(
+            react_reviewed_config.get("stage_watchdog_seconds"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["stage_watchdog_seconds"],
+        ),
         "max_review_cycles": _coerce_positive_int(
             react_reviewed_config.get("max_review_cycles"),
             fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_review_cycles"],
@@ -421,6 +429,18 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "unpaywall_email": _resolve_provider_text(provider_config.get("unpaywall_email")),
         "http_timeout": _coerce_positive_float(provider_config.get("http_timeout"), fallback=10.0),
         "fetch_timeout": _coerce_positive_float(provider_config.get("fetch_timeout"), fallback=15.0),
+        "document_fetch_timeout_seconds": _coerce_positive_float(
+            provider_config.get("document_fetch_timeout_seconds"),
+            fallback=DEFAULT_QA_CONFIG["providers"]["document_fetch_timeout_seconds"],
+        ),
+        "document_fetch_total_timeout_seconds": _coerce_positive_float(
+            provider_config.get("document_fetch_total_timeout_seconds"),
+            fallback=DEFAULT_QA_CONFIG["providers"]["document_fetch_total_timeout_seconds"],
+        ),
+        "provider_redirect_limit": _coerce_non_negative_int(
+            provider_config.get("provider_redirect_limit"),
+            fallback=DEFAULT_QA_CONFIG["providers"]["provider_redirect_limit"],
+        ),
         "retry_attempts": _coerce_non_negative_int(provider_config.get("retry_attempts"), fallback=2),
         "backoff_base_seconds": _coerce_non_negative_float(
             provider_config.get("backoff_base_seconds"),
@@ -568,6 +588,9 @@ def build_qa_runtime(
     provider_config = qa_config["providers"]
     http_timeout = provider_config["http_timeout"]
     fetch_timeout = provider_config["fetch_timeout"]
+    document_fetch_timeout_seconds = provider_config["document_fetch_timeout_seconds"]
+    document_fetch_total_timeout_seconds = provider_config["document_fetch_total_timeout_seconds"]
+    provider_redirect_limit = provider_config["provider_redirect_limit"]
     retry_attempts = provider_config["retry_attempts"]
     backoff_base_seconds = provider_config["backoff_base_seconds"]
     backoff_max_seconds = provider_config["backoff_max_seconds"]
@@ -662,6 +685,9 @@ def build_qa_runtime(
             "http_fetcher": {
                 "enabled": True,
                 "timeout": fetch_timeout,
+                "document_fetch_timeout_seconds": document_fetch_timeout_seconds,
+                "document_fetch_total_timeout_seconds": document_fetch_total_timeout_seconds,
+                "provider_redirect_limit": provider_redirect_limit,
                 "retry_attempts": retry_attempts,
                 "backoff_base_seconds": backoff_base_seconds,
                 "backoff_max_seconds": backoff_max_seconds,
@@ -716,8 +742,14 @@ def build_qa_runtime(
             ),
             document_acquirer=DocumentAcquirerNode(
                 unpaywall_client=unpaywall_client,
-                fetcher=HttpTextFetcher(timeout=fetch_timeout, **retry_kwargs),
+                fetcher=HttpTextFetcher(
+                    timeout=fetch_timeout,
+                    max_redirects=provider_redirect_limit,
+                    **retry_kwargs,
+                ),
                 pdf_extractor=PDFExtractionPipeline(config=qa_config["pdf_extraction"]),
+                document_fetch_timeout_seconds=document_fetch_timeout_seconds,
+                document_fetch_total_timeout_seconds=document_fetch_total_timeout_seconds,
             ),
             handoff=handoff,
             evidence_extractor=EvidenceExtractor(

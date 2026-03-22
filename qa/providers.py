@@ -21,6 +21,8 @@ class FetchedDocument:
     content_type: str
     text: Optional[str] = None
     binary: Optional[bytes] = None
+    final_url: Optional[str] = None
+    redirect_count: int = 0
 
 
 @dataclass
@@ -78,6 +80,7 @@ class _HttpTransportMixin:
         *,
         provider_name: str,
         timeout: float,
+        max_redirects: Optional[int] = None,
         retry_attempts: int = 2,
         backoff_base_seconds: float = 1.0,
         backoff_max_seconds: float = 8.0,
@@ -88,6 +91,7 @@ class _HttpTransportMixin:
     ) -> None:
         self.provider_name = provider_name
         self.timeout = float(timeout)
+        self.max_redirects = None if max_redirects is None else max(0, int(max_redirects))
         self.retry_attempts = max(0, int(retry_attempts))
         self.backoff_base_seconds = max(0.0, float(backoff_base_seconds))
         self.backoff_max_seconds = max(self.backoff_base_seconds, float(backoff_max_seconds))
@@ -130,6 +134,17 @@ class _HttpTransportMixin:
                     timeout=self.timeout,
                 )
                 status_code = int(getattr(response, "status_code", 200))
+                redirect_count = len(getattr(response, "history", None) or [])
+                if self.max_redirects is not None and redirect_count > self.max_redirects:
+                    raise self._finalize_nonrecoverable_error(
+                        failure_kind="failure",
+                        message=(
+                            f"{self.provider_name} redirect limit exceeded: "
+                            f"{redirect_count} redirects (max {self.max_redirects})"
+                        ),
+                        attempts=attempt,
+                        status_code=status_code,
+                    )
                 if self._should_retry_status(status_code):
                     raise _RetryableHttpStatusError(
                         status_code,
@@ -449,6 +464,7 @@ class HttpTextFetcher(_HttpTransportMixin):
     def __init__(
         self,
         timeout: float = 15.0,
+        max_redirects: Optional[int] = None,
         retry_attempts: int = 2,
         backoff_base_seconds: float = 1.0,
         backoff_max_seconds: float = 8.0,
@@ -459,6 +475,7 @@ class HttpTextFetcher(_HttpTransportMixin):
         self._init_transport(
             provider_name="oa_fetch",
             timeout=timeout,
+            max_redirects=max_redirects,
             retry_attempts=retry_attempts,
             backoff_base_seconds=backoff_base_seconds,
             backoff_max_seconds=backoff_max_seconds,
@@ -474,12 +491,28 @@ class HttpTextFetcher(_HttpTransportMixin):
             headers={"User-Agent": "ChemQA/1.0 (+https://github.com/openai/codex-cli)"},
         )
         content_type = str(response.headers.get("content-type") or "").split(";")[0].strip().lower()
+        final_url = str(getattr(response, "url", "") or url)
+        redirect_count = len(getattr(response, "history", None) or [])
         if content_type == "application/pdf" or url.lower().endswith(".pdf"):
-            return FetchedDocument(url=url, content_type="application/pdf", binary=response.content)
+            return FetchedDocument(
+                url=url,
+                content_type="application/pdf",
+                binary=response.content,
+                final_url=final_url,
+                redirect_count=redirect_count,
+            )
         if is_textual_content_type(content_type):
-            return FetchedDocument(url=url, content_type=content_type or "text/plain", text=response.text)
+            return FetchedDocument(
+                url=url,
+                content_type=content_type or "text/plain",
+                text=response.text,
+                final_url=final_url,
+                redirect_count=redirect_count,
+            )
         return FetchedDocument(
             url=url,
             content_type=content_type or "application/octet-stream",
             binary=response.content,
+            final_url=final_url,
+            redirect_count=redirect_count,
         )

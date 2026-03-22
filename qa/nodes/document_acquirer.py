@@ -3,6 +3,8 @@ from __future__ import annotations
 import html
 import logging
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
 
@@ -48,13 +50,21 @@ class DocumentAcquirerNode:
         unpaywall_client: Optional[Any] = None,
         fetcher: Optional[Any] = None,
         pdf_extractor: Optional[PDFExtractionPipeline] = None,
+        document_fetch_timeout_seconds: float = 45.0,
+        document_fetch_total_timeout_seconds: float = 300.0,
     ) -> None:
         self.unpaywall_client = unpaywall_client
         self.fetcher = fetcher or HttpTextFetcher()
         self.pdf_extractor = pdf_extractor or PDFExtractionPipeline()
+        self.document_fetch_timeout_seconds = max(0.01, float(document_fetch_timeout_seconds))
+        self.document_fetch_total_timeout_seconds = max(
+            self.document_fetch_timeout_seconds,
+            float(document_fetch_total_timeout_seconds),
+        )
         self.last_diagnostics: List[RetrievalDiagnosticRecord] = []
         self.last_provider_health: dict[str, dict[str, Any]] = {}
         self.last_execution_warnings: list[str] = []
+        self.last_runtime_status: dict[str, Any] = {}
         self._diagnostic_map: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._provider_health_fallback: dict[str, dict[str, Any]] = {}
 
@@ -113,123 +123,329 @@ class DocumentAcquirerNode:
         ocr_applied = False
         fulltext_status = "abstract_only"
         indexed_sections: Optional[list[Section]] = None
+        timed_out = False
+        acquire_started_at = time.perf_counter()
 
-        if self.unpaywall_client and candidate.doi:
-            try:
-                unpaywall_payload = self.unpaywall_client.lookup(candidate.doi)
-                self._record_provider_health_success("unpaywall")
-            except ProviderUnavailableError as exc:
-                logger.warning("unpaywall_lookup_skipped paper_id=%s error=%s", candidate.paper_id, exc)
-                self._record_provider_health_skipped("unpaywall", str(exc))
-                self._record_diagnostic(
-                    provider="unpaywall",
-                    stage="lookup",
-                    outcome="skipped",
-                    message=f"paper_id={candidate.paper_id}: {exc}",
-                )
-                unpaywall_payload = None
-            except Exception as exc:
-                logger.warning("unpaywall_lookup_failed paper_id=%s error=%s", candidate.paper_id, exc)
-                self._record_provider_health_failure("unpaywall", exc)
-                self._record_diagnostic(
-                    provider="unpaywall",
-                    stage="lookup",
-                    outcome=self._classify_error(exc),
-                    message=f"paper_id={candidate.paper_id}: {exc}",
-                )
-                unpaywall_payload = None
-            if unpaywall_payload:
-                self._record_diagnostic(provider="unpaywall", stage="lookup", outcome="hit")
-                provider_sources = list(dict.fromkeys([*provider_sources, "unpaywall"]))
-                provider_artifacts["unpaywall"] = store.write_json(
-                    f"provider_raw/unpaywall/{candidate.paper_id}.json",
-                    unpaywall_payload,
-                )
-                best_location = unpaywall_payload.get("best_oa_location") or {}
-                oa_url = (
-                    best_location.get("url_for_pdf")
-                    or best_location.get("url_for_landing_page")
-                    or best_location.get("url")
-                    or oa_url
-                )
-            else:
-                self._record_diagnostic(provider="unpaywall", stage="lookup", outcome="empty")
+        self._write_runtime_status(
+            store=store,
+            stage="acquire_document",
+            status="start",
+            paper_id=candidate.paper_id,
+            provider="document_acquirer",
+            metadata={
+                "doi": candidate.doi,
+                "oa_url": oa_url,
+                "document_fetch_timeout_seconds": self.document_fetch_timeout_seconds,
+                "document_fetch_total_timeout_seconds": self.document_fetch_total_timeout_seconds,
+            },
+        )
+        logger.info("document_acquirer_stage_start paper_id=%s stage=%s", candidate.paper_id, "acquire_document")
 
-        if oa_url:
-            try:
-                fetched = self.fetcher.fetch(oa_url)
-                self._record_provider_health_success("oa_fetch")
-            except Exception as exc:
-                logger.warning("oa_fetch_failed paper_id=%s url=%s error=%s", candidate.paper_id, oa_url, exc)
-                self._record_provider_health_failure("oa_fetch", exc)
-                self._record_diagnostic(
-                    provider="oa_fetch",
-                    stage="fetch",
-                    outcome=self._classify_error(exc),
-                    message=f"paper_id={candidate.paper_id}: {exc}",
+        try:
+            if self.unpaywall_client and candidate.doi:
+                self._check_total_timeout(
+                    started_at=acquire_started_at,
+                    paper_id=candidate.paper_id,
+                    stage="unpaywall_lookup",
+                    store=store,
+                    provider="unpaywall",
                 )
-                fetched = None
-            if fetched is not None:
-                self._record_diagnostic(provider="oa_fetch", stage="fetch", outcome="hit")
-                fulltext_format = fetched.content_type
-                if fetched.content_type == "application/pdf" and fetched.binary is not None:
-                    pdf_result = self.pdf_extractor.process(
+                self._write_runtime_status(
+                    store=store,
+                    stage="unpaywall_lookup",
+                    status="start",
+                    paper_id=candidate.paper_id,
+                    provider="unpaywall",
+                    metadata={"doi": candidate.doi},
+                    started_at=acquire_started_at,
+                )
+                logger.info("document_acquirer_stage_start paper_id=%s stage=%s", candidate.paper_id, "unpaywall_lookup")
+                try:
+                    unpaywall_payload = self._run_with_timeout(
+                        lambda: self.unpaywall_client.lookup(candidate.doi),
+                        timeout_seconds=self.document_fetch_timeout_seconds,
+                    )
+                    self._record_provider_health_success("unpaywall")
+                    self._write_runtime_status(
+                        store=store,
+                        stage="unpaywall_lookup",
+                        status="success",
                         paper_id=candidate.paper_id,
-                        pdf_bytes=fetched.binary,
-                        artifact_store=store,
+                        provider="unpaywall",
+                        metadata={"doi": candidate.doi},
+                        started_at=acquire_started_at,
                     )
-                    source_artifact_path = pdf_result.source_artifact_path
-                    fulltext_artifact_path = pdf_result.fulltext_artifact_path
-                    extraction_report_path = pdf_result.extraction_report_path
-                    sections_artifact_path = pdf_result.sections_artifact_path
-                    snippets_artifact_path = pdf_result.snippets_artifact_path
-                    extraction_warnings = list(pdf_result.warnings)
-                    fulltext_extractor = pdf_result.extractor
-                    ocr_applied = bool(pdf_result.ocr_applied)
-                    fulltext_available = True
-                    fulltext_status = pdf_result.fulltext_status
-                    if pdf_result.sections:
-                        indexed_sections = [
-                            Section.model_validate(
-                                {
-                                    "section_id": section_payload.get("section_id"),
-                                    "section_type": section_payload.get("section_type"),
-                                    "heading": section_payload.get("heading"),
-                                    "page_start": section_payload.get("page_start"),
-                                    "page_end": section_payload.get("page_end"),
-                                    "fulltext_char_start": section_payload.get("fulltext_char_start"),
-                                    "fulltext_char_end": section_payload.get("fulltext_char_end"),
-                                }
-                            )
-                            for section_payload in pdf_result.sections
-                        ]
-                    self.last_execution_warnings.extend(extraction_warnings)
-                elif fetched.binary is not None:
-                    fulltext_artifact_path = store.write_bytes(
-                        f"fulltext/{candidate.paper_id}.{guess_binary_extension(fetched.content_type)}",
-                        fetched.binary,
+                    logger.info("document_acquirer_stage_success paper_id=%s stage=%s", candidate.paper_id, "unpaywall_lookup")
+                except ProviderUnavailableError as exc:
+                    logger.warning("unpaywall_lookup_skipped paper_id=%s error=%s", candidate.paper_id, exc)
+                    self._record_provider_health_skipped("unpaywall", str(exc))
+                    self._record_diagnostic(
+                        provider="unpaywall",
+                        stage="lookup",
+                        outcome="skipped",
+                        message=f"paper_id={candidate.paper_id}: {exc}",
                     )
-                    source_artifact_path = fulltext_artifact_path
-                    fulltext_available = True
-                    fulltext_status = "binary_only"
+                    self._write_runtime_status(
+                        store=store,
+                        stage="unpaywall_lookup",
+                        status="skipped",
+                        paper_id=candidate.paper_id,
+                        provider="unpaywall",
+                        metadata={"error": str(exc), "doi": candidate.doi},
+                        started_at=acquire_started_at,
+                    )
+                    unpaywall_payload = None
+                except Exception as exc:
+                    logger.warning("unpaywall_lookup_failed paper_id=%s error=%s", candidate.paper_id, exc)
+                    self._record_provider_health_failure("unpaywall", exc)
+                    self._record_diagnostic(
+                        provider="unpaywall",
+                        stage="lookup",
+                        outcome=self._classify_error(exc),
+                        message=f"paper_id={candidate.paper_id}: {exc}",
+                    )
+                    self._write_runtime_status(
+                        store=store,
+                        stage="unpaywall_lookup",
+                        status=self._classify_error(exc),
+                        paper_id=candidate.paper_id,
+                        provider="unpaywall",
+                        metadata={"error": str(exc), "doi": candidate.doi},
+                        started_at=acquire_started_at,
+                    )
+                    unpaywall_payload = None
+                if unpaywall_payload:
+                    self._record_diagnostic(provider="unpaywall", stage="lookup", outcome="hit")
+                    provider_sources = list(dict.fromkeys([*provider_sources, "unpaywall"]))
+                    provider_artifacts["unpaywall"] = store.write_json(
+                        f"provider_raw/unpaywall/{candidate.paper_id}.json",
+                        unpaywall_payload,
+                    )
+                    best_location = unpaywall_payload.get("best_oa_location") or {}
+                    oa_url = (
+                        best_location.get("url_for_pdf")
+                        or best_location.get("url_for_landing_page")
+                        or best_location.get("url")
+                        or oa_url
+                    )
                 else:
-                    raw_text = fetched.text or ""
-                    fulltext = self._normalize_fulltext(raw_text, fetched.content_type)
-                    if fulltext:
-                        fulltext_artifact_path = store.write_text(
-                            f"fulltext/{candidate.paper_id}.txt",
-                            fulltext,
+                    self._record_diagnostic(provider="unpaywall", stage="lookup", outcome="empty")
+
+            if oa_url:
+                self._check_total_timeout(
+                    started_at=acquire_started_at,
+                    paper_id=candidate.paper_id,
+                    stage="oa_fetch",
+                    store=store,
+                    provider="oa_fetch",
+                    url=oa_url,
+                )
+                self._write_runtime_status(
+                    store=store,
+                    stage="oa_fetch",
+                    status="start",
+                    paper_id=candidate.paper_id,
+                    provider="oa_fetch",
+                    url=oa_url,
+                    started_at=acquire_started_at,
+                )
+                logger.info("document_acquirer_stage_start paper_id=%s stage=%s", candidate.paper_id, "oa_fetch")
+                try:
+                    fetched = self._run_with_timeout(
+                        lambda: self.fetcher.fetch(oa_url),
+                        timeout_seconds=self.document_fetch_timeout_seconds,
+                    )
+                    self._record_provider_health_success("oa_fetch")
+                    self._write_runtime_status(
+                        store=store,
+                        stage="oa_fetch",
+                        status="success",
+                        paper_id=candidate.paper_id,
+                        provider="oa_fetch",
+                        url=oa_url,
+                        metadata={
+                            "final_url": getattr(fetched, "final_url", None) or getattr(fetched, "url", None),
+                            "redirect_count": int(getattr(fetched, "redirect_count", 0) or 0),
+                            "content_type": fetched.content_type,
+                        },
+                        started_at=acquire_started_at,
+                    )
+                    logger.info("document_acquirer_stage_success paper_id=%s stage=%s", candidate.paper_id, "oa_fetch")
+                except Exception as exc:
+                    logger.warning("oa_fetch_failed paper_id=%s url=%s error=%s", candidate.paper_id, oa_url, exc)
+                    self._record_provider_health_failure("oa_fetch", exc)
+                    if self._classify_error(exc) == "timeout":
+                        self.last_execution_warnings.append(
+                            f"oa_fetch timed out for paper_id={candidate.paper_id} url={oa_url}: {exc}"
+                        )
+                    self._record_diagnostic(
+                        provider="oa_fetch",
+                        stage="fetch",
+                        outcome=self._classify_error(exc),
+                        message=f"paper_id={candidate.paper_id}: {exc}",
+                    )
+                    self._write_runtime_status(
+                        store=store,
+                        stage="oa_fetch",
+                        status=self._classify_error(exc),
+                        paper_id=candidate.paper_id,
+                        provider="oa_fetch",
+                        url=oa_url,
+                        metadata={
+                            "error": str(exc),
+                            "attempts": getattr(exc, "attempts", None),
+                            "status_code": getattr(exc, "status_code", None),
+                        },
+                        started_at=acquire_started_at,
+                    )
+                    fetched = None
+                if fetched is not None:
+                    self._record_diagnostic(provider="oa_fetch", stage="fetch", outcome="hit")
+                    fulltext_format = fetched.content_type
+                    if fetched.content_type == "application/pdf" and fetched.binary is not None:
+                        self._check_total_timeout(
+                            started_at=acquire_started_at,
+                            paper_id=candidate.paper_id,
+                            stage="pdf_extraction",
+                            store=store,
+                            provider="pdf_extraction",
+                            url=getattr(fetched, "final_url", None) or fetched.url,
+                        )
+                        self._write_runtime_status(
+                            store=store,
+                            stage="pdf_extraction",
+                            status="start",
+                            paper_id=candidate.paper_id,
+                            provider="pdf_extraction",
+                            url=getattr(fetched, "final_url", None) or fetched.url,
+                            metadata={"content_type": fetched.content_type},
+                            started_at=acquire_started_at,
+                        )
+                        logger.info("document_acquirer_stage_start paper_id=%s stage=%s", candidate.paper_id, "pdf_extraction")
+                        pdf_result = self._run_with_timeout(
+                            lambda: self.pdf_extractor.process(
+                                paper_id=candidate.paper_id,
+                                pdf_bytes=fetched.binary,
+                                artifact_store=store,
+                            ),
+                            timeout_seconds=self.document_fetch_total_timeout_seconds,
+                        )
+                        self._write_runtime_status(
+                            store=store,
+                            stage="pdf_extraction",
+                            status="success",
+                            paper_id=candidate.paper_id,
+                            provider="pdf_extraction",
+                            url=getattr(fetched, "final_url", None) or fetched.url,
+                            metadata={"fulltext_status": pdf_result.fulltext_status, "extractor": pdf_result.extractor},
+                            started_at=acquire_started_at,
+                        )
+                        logger.info("document_acquirer_stage_success paper_id=%s stage=%s", candidate.paper_id, "pdf_extraction")
+                        source_artifact_path = pdf_result.source_artifact_path
+                        fulltext_artifact_path = pdf_result.fulltext_artifact_path
+                        extraction_report_path = pdf_result.extraction_report_path
+                        sections_artifact_path = pdf_result.sections_artifact_path
+                        snippets_artifact_path = pdf_result.snippets_artifact_path
+                        extraction_warnings = list(pdf_result.warnings)
+                        fulltext_extractor = pdf_result.extractor
+                        ocr_applied = bool(pdf_result.ocr_applied)
+                        fulltext_available = True
+                        fulltext_status = pdf_result.fulltext_status
+                        if pdf_result.sections:
+                            indexed_sections = [
+                                Section.model_validate(
+                                    {
+                                        "section_id": section_payload.get("section_id"),
+                                        "section_type": section_payload.get("section_type"),
+                                        "heading": section_payload.get("heading"),
+                                        "page_start": section_payload.get("page_start"),
+                                        "page_end": section_payload.get("page_end"),
+                                        "fulltext_char_start": section_payload.get("fulltext_char_start"),
+                                        "fulltext_char_end": section_payload.get("fulltext_char_end"),
+                                    }
+                                )
+                                for section_payload in pdf_result.sections
+                            ]
+                        self.last_execution_warnings.extend(extraction_warnings)
+                    elif fetched.binary is not None:
+                        fulltext_artifact_path = store.write_bytes(
+                            f"fulltext/{candidate.paper_id}.{guess_binary_extension(fetched.content_type)}",
+                            fetched.binary,
                         )
                         source_artifact_path = fulltext_artifact_path
                         fulltext_available = True
-                        fulltext_status = "fulltext_indexed"
+                        fulltext_status = "binary_only"
+                    else:
+                        raw_text = fetched.text or ""
+                        fulltext = self._normalize_fulltext(raw_text, fetched.content_type)
+                        if fulltext:
+                            fulltext_artifact_path = store.write_text(
+                                f"fulltext/{candidate.paper_id}.txt",
+                                fulltext,
+                            )
+                            source_artifact_path = fulltext_artifact_path
+                            fulltext_available = True
+                            fulltext_status = "fulltext_indexed"
+        except TimeoutError as exc:
+            timed_out = True
+            warning_text = f"document acquisition timed out for paper_id={candidate.paper_id}: {exc}"
+            logger.warning("document_acquirer_timeout paper_id=%s error=%s", candidate.paper_id, exc)
+            self.last_execution_warnings.append(warning_text)
+            self._record_diagnostic(
+                provider="document_acquirer",
+                stage="acquire",
+                outcome="timeout",
+                message=warning_text,
+            )
+            self._write_runtime_status(
+                store=store,
+                stage="acquire_document",
+                status="timeout",
+                paper_id=candidate.paper_id,
+                provider="document_acquirer",
+                url=oa_url,
+                metadata={"error": str(exc)},
+                started_at=acquire_started_at,
+            )
+        except Exception as exc:
+            self._write_runtime_status(
+                store=store,
+                stage="acquire_document",
+                status="failure",
+                paper_id=candidate.paper_id,
+                provider="document_acquirer",
+                url=oa_url,
+                metadata={"error": str(exc)},
+                started_at=acquire_started_at,
+            )
+            raise
 
+        if not timed_out:
+            self._write_runtime_status(
+                store=store,
+                stage="section_indexing",
+                status="start",
+                paper_id=candidate.paper_id,
+                provider="section_indexing",
+                metadata={"fulltext_status": fulltext_status},
+                started_at=acquire_started_at,
+            )
         section_index = self._build_section_index(
             paper_id=candidate.paper_id,
             fulltext_status=fulltext_status,
             fulltext_artifact_path=fulltext_artifact_path,
             sections=indexed_sections,
         )
+        if not timed_out:
+            self._write_runtime_status(
+                store=store,
+                stage="section_indexing",
+                status="success",
+                paper_id=candidate.paper_id,
+                provider="section_indexing",
+                metadata={"fulltext_status": fulltext_status, "section_count": len(section_index.sections)},
+                started_at=acquire_started_at,
+            )
         index_artifact_path = store.write_json(
             f"indices/{candidate.paper_id}.json",
             section_index.model_dump(exclude_none=True),
@@ -259,6 +475,22 @@ class DocumentAcquirerNode:
             fulltext_extractor=fulltext_extractor,
             ocr_applied=ocr_applied,
         )
+        if not timed_out:
+            self._write_runtime_status(
+                store=store,
+                stage="acquire_document",
+                status="success",
+                paper_id=candidate.paper_id,
+                provider="document_acquirer",
+                url=oa_url,
+                metadata={
+                    "fulltext_status": fulltext_status,
+                    "fulltext_available": fulltext_available,
+                    "section_count": len(section_index.sections),
+                },
+                started_at=acquire_started_at,
+            )
+            logger.info("document_acquirer_stage_success paper_id=%s stage=%s", candidate.paper_id, "acquire_document")
         return paper_record, section_index
 
     def _normalize_fulltext(self, raw_text: str, content_type: Optional[str]) -> str:
@@ -444,3 +676,86 @@ class DocumentAcquirerNode:
         if "timeout" in message or "timed out" in message:
             return "timeout"
         return "failure"
+
+    def _run_with_timeout(self, operation: Any, *, timeout_seconds: float) -> Any:
+        if timeout_seconds <= 0:
+            return operation()
+        result_holder: dict[str, Any] = {}
+        error_holder: dict[str, BaseException] = {}
+        done = threading.Event()
+
+        def _target() -> None:
+            try:
+                result_holder["value"] = operation()
+            except BaseException as exc:  # pragma: no cover - thread plumbing
+                error_holder["error"] = exc
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=_target, daemon=True)
+        thread.start()
+        if not done.wait(timeout_seconds):
+            raise TimeoutError(f"timed out after {round(float(timeout_seconds), 2)}s")
+        if "error" in error_holder:
+            raise error_holder["error"]
+        return result_holder.get("value")
+
+    def _write_runtime_status(
+        self,
+        *,
+        store: QAArtifactStore,
+        stage: str,
+        status: str,
+        paper_id: str,
+        provider: str,
+        url: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        started_at: Optional[float] = None,
+    ) -> None:
+        payload = {
+            "paper_id": str(paper_id),
+            "stage": str(stage),
+            "status": str(status),
+            "provider": str(provider),
+            "url": str(url or "").strip() or None,
+            "timestamp": round(time.time(), 6),
+        }
+        if started_at is not None:
+            payload["elapsed_total_seconds"] = round(max(0.0, time.perf_counter() - float(started_at)), 3)
+        if metadata:
+            payload.update({key: value for key, value in dict(metadata).items() if value is not None})
+        self.last_runtime_status = dict(payload)
+        store.write_json("diagnostics/document_acquirer_runtime.json", payload)
+
+    def _check_total_timeout(
+        self,
+        *,
+        started_at: float,
+        paper_id: str,
+        stage: str,
+        store: QAArtifactStore,
+        provider: str,
+        url: Optional[str] = None,
+    ) -> None:
+        elapsed = max(0.0, time.perf_counter() - float(started_at))
+        if elapsed <= self.document_fetch_total_timeout_seconds:
+            return
+        self._write_runtime_status(
+            store=store,
+            stage=stage,
+            status="timeout",
+            paper_id=paper_id,
+            provider=provider,
+            url=url,
+            metadata={
+                "error": (
+                    f"document acquisition exceeded total timeout "
+                    f"after {round(elapsed, 3)}s (limit {self.document_fetch_total_timeout_seconds}s)"
+                )
+            },
+            started_at=started_at,
+        )
+        raise TimeoutError(
+            f"document acquisition exceeded total timeout after {round(elapsed, 3)}s "
+            f"(limit {self.document_fetch_total_timeout_seconds}s)"
+        )
