@@ -1,23 +1,21 @@
-# MAD (Multi-Agent Debate) for Electrocatalysis Literature
+# ChemQA
 
-MAD is a multi-agent debate system for electrocatalysis analysis. Given **exactly 5 metal elements** (catalyst composition; optionally with relative percentages) and a **target reaction type**, the system debates and predicts the required performance metric(s) for that reaction (reaction-type specific; CO2RR includes main product + Faradaic efficiency).
+ChemQA is a chemistry literature QA system with two supported workflow modes:
 
-It combines:
-- 4 configurable LLM agents (LangChain tool-calling ReAct runtime)
-- Chroma-backed RAG over a local Markdown literature corpus
-- A debate coordinator (default: "LangGraph-style", implemented in-repo; no external `langgraph` dependency)
-- Optional experience-store retrieval
+- `ledger`
+- `react_reviewed`
 
-## Quickstart
 
-### 1) Install
+## Install
+
 Tested with Python 3.11.
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2) Configure API keys
+## Configure
+
 Create a `.env` file in the project root:
 
 ```bash
@@ -32,164 +30,73 @@ SEMANTIC_SCHOLAR_API_KEY=...
 UNPAYWALL_EMAIL=you@example.org
 ```
 
-Notes:
-- Agent 1/2/3 default to OpenRouter endpoints (`base_url: https://openrouter.ai/api/v1`).
-- Agent 4 chats via OpenRouter (`model: qwen/qwen3-max-thinking`, `base_url: https://openrouter.ai/api/v1`).
-- Agent 4 embeddings default to DashScope compatible-mode (`emb_url: https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings`), using `embedding_api_key` (typically `QWEN_API_KEY`).
-- See `config/config.yaml` for the exact mapping.
-- `OPENALEX_MAILTO` and `CROSSREF_MAILTO` are recommended for polite external API usage.
-- `UNPAYWALL_EMAIL` is required if you want ChemQA to perform Unpaywall OA lookup.
-
-### 3) Prepare literature data
-Place Markdown papers under:
-
-```text
-data/raw/CO2RR/*.md
-data/raw/EOR/*.md
-data/raw/HER/*.md
-data/raw/HOR/*.md
-data/raw/HZOR/*.md
-data/raw/O5H/*.md
-data/raw/OER/*.md
-data/raw/ORR/*.md
-data/raw/UOR/*.md
-```
-
-### 4) Build vector databases (Chroma)
-Preferred: build per-agent collections via the batch script.
-
-```bash
-python build_vector_db_batch.py --agents agent1,agent2,agent3,agent4 --clear
-```
-
-Collections are stored in `vector_store.persist_directory` (default `./data/chroma_db`) and named:
-`<vector_store.collection_name>_<agent_name>` (e.g., `electrochemistry_literature_agent1`).
-
-Useful options:
-- `--max-workers 1` (sequential build)
-- `--embedding-batch-size 10`
-- `--sleep-between-batches 0.5`
-
-Legacy (single-agent) script:
-
-```bash
-python build_vector_db.py
-```
-
-### 5) Run a debate
-Provide **exactly 5** metal elements (symbols only):
-
-```bash
-python main.py --components "Pt,Pd,Ru,Ir,Rh" --reaction-type CO2RR
-```
-
-You may also provide relative percentages (the system will treat them as the electrode composition):
-
-```bash
-python main.py --components "Ni(69.00%), Co(19.07%), Fe(11.48%), Cu(0.40%), Zn(0.05%)" --reaction-type OER
-```
-
-Arguments:
-- `--components`: comma-separated 5 metal elements
-- `--reaction-type`: one of `CO2RR/EOR/HER/HOR/HZOR/O5H/OER/ORR/UOR` (recommended)
-- `--engine`: `langgraph` (default; currently the only supported engine)
-
-### 6) Rank reaction types (auto-run debates for each reaction)
-If you want to **fix the composition** (5 metals + optional relative %) and let the system
-run debates for **all reaction types** and return the **Top-K** reactions by grade:
-
-```bash
-python main.py --components "Ni(69.00%), Co(19.07%), Fe(11.48%), Cu(0.40%), Zn(0.05%)" --rank-reactions
-```
-
-Optional controls:
-- Subset of reactions:
-  ```bash
-  python main.py --components "Pt,Pd,Ru,Ir,Rh" --rank-reactions --reaction-types "OER,HER,ORR"
-  ```
-- Top-K (default 2):
-  ```bash
-  python main.py --components "Pt,Pd,Ru,Ir,Rh" --rank-reactions --top-k-reactions 3
-  ```
-- Reaction-level parallelism (default 1; higher may trigger API rate limits):
-  ```bash
-  python main.py --components "Pt,Pd,Ru,Ir,Rh" --rank-reactions --max-parallel-reactions 2
-  ```
-- Also save each per-reaction `outputs/result_*.json` (off by default):
-  ```bash
-  python main.py --components "Pt,Pd,Ru,Ir,Rh" --rank-reactions --save-each-reaction
-  ```
-
-Outputs:
-- Ranking summary: `outputs/rank_<timestamp>.json`
-- Logs and per-debate artifacts: under `logs/runs/<run_id>/`
-
-### 7) Run ChemQA
-
-Ask a literature-grounded chemistry research question through the standalone QA entrypoint:
+## Run ChemQA
 
 ```bash
 python -m chemqa --question "Does Pt/C improve HER activity in 1 M KOH?" --save-output
 ```
 
-Optional controls:
-- `--context`: attach extra constraints or task framing
-- `--artifact-dir`: override the run artifact directory
-- `--config`: load a non-default config file
+Optional flags:
+
+- `--workflow-mode ledger`
+- `--workflow-mode react_reviewed`
+- `--context "..."`
+- `--artifact-dir <path>`
+- `--config <path>`
 
 Outputs:
-- Run artifacts: `logs/runs/<run_id>/qa_artifacts/`
-- User-facing result: `outputs/qa_result_<timestamp>.json`
 
-ChemQA degraded-mode behavior:
-- If literature providers are reachable, ChemQA uses external search/enrichment/fetch as usual.
-- If a provider times out or hits a retry-exhausted network failure, ChemQA marks that provider unavailable for the current run and skips later calls to it.
-- The final answer and CLI output explicitly surface these failures instead of only saying "insufficient evidence".
-- Detailed run-time diagnostics are saved in `retrieval_diagnostics.json` and `provider_health.json` under the QA artifact directory.
+- run artifacts: `logs/runs/<run_id>/qa_artifacts/`
+- user-facing result: `outputs/qa_result_<timestamp>.json`
 
-### Outputs
-- Results: `paths.outputs` (default `./outputs`) as `result_<timestamp>.json` (timestamp format: `YYYYMMDD_HHMMSS`)
-- ChemQA results: `qa.outputs_dir` (default `./outputs`) as `qa_result_<timestamp>.json`
-- Logs:
-  - rolling: `./logs/system.log`
-  - per-run: `./logs/runs/<run_id>/run.log` (plus `events.jsonl`, `db.log`, `debate.log`)
+## Live Validation
+
+Run the standard live-validation entrypoint:
+
+```bash
+python -m chemqa.live_validation --question "Does Pt/C improve HER activity in 1 M KOH?"
+```
+
+Ledger-focused partial-run diagnosis is also available:
+
+```bash
+python -m qa.ledger_live_runner --run-suite
+```
 
 ## Configuration
-All runtime configuration lives in `config/config.yaml`:
-- `llm.*`: per-agent provider/model + embedding settings
-- `vector_store.*`: Chroma persistence + base collection name
-- `rag.*`: chunking + retrieval parameters
-- `debate.*`: debate protocol parameters
-- `qa.*`: standalone ChemQA output + peer-review integration controls
-- `paths.outputs`: output directory for saved results
 
-Important ChemQA knobs in `qa.providers`:
-- `openalex_mailto` / `crossref_mailto`: optional contact email passed to provider APIs
-- `semantic_scholar_api_key`: optional Semantic Scholar API key
-- `unpaywall_email`: required to enable Unpaywall lookup
-- `http_timeout`: timeout for provider API requests
-- `fetch_timeout`: timeout for OA full-text fetches
-- `retry_attempts`: retry budget for transient provider/network failures; total attempts = `1 + retry_attempts`
-- `backoff_base_seconds`: initial exponential backoff delay
-- `backoff_max_seconds`: upper bound for exponential backoff delay
+Runtime configuration lives in `config/config.yaml`.
 
-Retry policy:
-- Retries apply only to timeouts, connection failures, HTTP `408`, HTTP `429`, and HTTP `5xx`.
-- Other HTTP `4xx` responses are treated as non-retryable request failures.
-- `oa_fetch` retries per URL, but does not globally disable the fetcher for the rest of the run.
+Primary sections:
 
-## How it works (high level)
-- `database/text_processor.py`: load + chunk Markdown documents (LlamaIndex parsers)
-- `database/embedder.py`: multi-provider embeddings selected per agent
-- `database/vector_store.py`: Chroma persistence with stable chunk ids
-- `database/rag_system.py`: query embedding + Chroma similarity search
-- `agents/react_agent.py`: LangChain tool-calling ReAct agent (`search_literature`, `search_experience`)
-- `debate/langgraph_coordinator.py`: default debate coordinator and evidence enforcement
+- `llm.*`: provider and model settings
+- `qa.*`: workflow mode, peer review, runtime controls, provider settings
+- `logging.*`: log destinations and format
+- `paths.outputs`: exported result directory
+
+Important QA provider controls:
+
+- `qa.providers.http_timeout`
+- `qa.providers.fetch_timeout`
+- `qa.providers.document_fetch_timeout_seconds`
+- `qa.providers.document_fetch_total_timeout_seconds`
+- `qa.providers.provider_redirect_limit`
+- `qa.providers.retry_attempts`
+
+Important `react_reviewed` controls:
+
+- `qa.react_reviewed.max_propose_steps_initial`
+- `qa.react_reviewed.max_propose_steps_revision`
+- `qa.react_reviewed.stage_watchdog_seconds`
+
+## Logs
+
+- rolling log: `logs/system.log`
+- per-run text log: `logs/runs/<run_id>/run.log`
+- per-run structured log: `logs/runs/<run_id>/events.jsonl`
 
 ## Tests
+
 ```bash
 python -m unittest discover -s test -p "test_*.py"
 ```
-
-## License
-MIT

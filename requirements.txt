@@ -1,50 +1,8 @@
-# ===================================
-#  System Dependencies
-# ===================================
-
-# LlamaIndex 
-llama-index-core>=0.10.0
-llama-index-embeddings-openai>=0.1.0
-llama-index-vector-stores-chroma>=0.1.0
-llama-index>=0.10.0
-
-# Vector Store 
-chromadb>=0.4.22
-
-# LangChain 
-langchain>=0.2.0
-langchain-core>=0.2.0
-langchain-openai>=0.1.0
-
-# LLM Providers
-openai>=1.10.0
-
-# Data Processing 
-pandas>=2.1.0
-numpy>=1.24.0
 pydantic>=2.5.0
-
-# HTTP Requests
 requests>=2.31.0
-
-# Voyage AI Embedding
-voyageai>=0.2.0
-
-# Configuration and YAML 
-pyyaml>=6.0.1
 python-dotenv>=1.0.0
-
-# Utility Tools
-tqdm>=4.66.0
-tenacity>=8.2.3  
-
-# [Optional]: Scientific Computing and Chemistry
-# rdkit>=2023.9.1  
-# scipy>=1.11.0
-
-# [Optional]: Development Tools
-# pytest>=7.4.0
-# black>=23.12.0
-# flake8>=7.0.0
-
-
+PyYAML>=6.0.1
+PyMuPDF>=1.24.0
+docling>=2.0.0
+langchain-core>=1.0.0
+langchain-openai>=1.0.0

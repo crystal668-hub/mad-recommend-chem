@@ -835,8 +835,8 @@ class ReActAgent:
         return ToolResult(observation=conclusion, data=conclusion)
 
     def _conclude_args_schema_for_prompt(self, system_prompt: str):
-        schema_kind = _detect_strict_json_schema(system_prompt)
-        return tool_schemas.get_generic_conclude_args_schema(schema_kind)
+        _ = system_prompt
+        return tool_schemas.get_generic_conclude_args_schema()
 
     def _build_tools(self, system_prompt: Optional[str] = None):
         _ChatOpenAI, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, StructuredTool = _lazy_langchain_imports()

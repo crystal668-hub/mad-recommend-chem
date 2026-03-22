@@ -35,28 +35,6 @@ class _ToolMessage(_Msg):
         )
 
 
-class _DummyLLM:
-    """
-    Simulate a backend that fails to emit tool_calls and returns empty content even when forced to conclude.
-    """
-
-    def __init__(self, tool_choice: str | None = None):
-        self._tool_choice = tool_choice
-
-    def bind_tools(self, tools, tool_choice: str | None = None):
-        return _DummyLLM(tool_choice=tool_choice)
-
-    def bind(self, tools=None, tool_choice: str | None = None):  # pragma: no cover
-        return self.bind_tools(tools, tool_choice=tool_choice)
-
-    def invoke(self, messages):
-        # Forced-conclude path tries tool_choice="conclude"; return empty tool_calls/content.
-        if self._tool_choice == "conclude":
-            return _AIMessage(content="", tool_calls=[])
-        # Free-form fallback also returns empty content.
-        return _AIMessage(content="")
-
-
 class _ForcedConcludeLLM:
     def __init__(self, mode: str, tool_choice: str | None = None):
         self._mode = mode
@@ -134,6 +112,19 @@ class _ConcludeTool:
         )
 
 
+class _ReviewerConcludeTool:
+    name = "conclude"
+
+    def invoke(self, tool_input):
+        from agents.react_agent import ToolResult
+
+        review = dict((tool_input or {}).get("review") or {})
+        return ToolResult(
+            observation="validated reviewer conclude",
+            data={"__conclude_valid__": True, "review_items": list(review.get("review_items") or [])},
+        )
+
+
 class _InvalidConcludeTool:
     name = "conclude"
 
@@ -199,127 +190,6 @@ class StrictJsonFallbackTests(unittest.TestCase):
         self.assertEqual([], audit["dangling_tool_call_ids"])
         self.assertIsNone(audit["truncated_from_index"])
         self.assertTrue(audit["history_rewrite_applied"])
-
-    def test_propose_strict_json_fallback_emits_minimal_schema_json(self):
-        from agents.react_agent import ReActAgent
-        from prompts.debate_phase_prompts import DEBATE_PROPOSE_SYSTEM_PROMPT
-
-        dummy_llm = _DummyLLM()
-
-        with patch(
-            "agents.react_agent._lazy_langchain_imports",
-            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
-        ):
-            agent = ReActAgent(
-                agent_id="t_prop",
-                name="test",
-                model_config={"deadline_mode": True},
-                rag_system=None,
-                experience_store=None,
-                system_prompt="",
-                max_react_steps=10,
-                verbose=False,
-            )
-
-            with patch.object(agent, "_get_llm", return_value=dummy_llm), patch.object(
-                agent, "_build_tools", return_value=([], {})
-            ):
-                response, trajectory = agent.generate_response_with_react(
-                    query="STRICT JSON fallback test (propose).",
-                    components=["Ni", "Fe", "Co"],
-                    system_prompt_override=DEBATE_PROPOSE_SYSTEM_PROMPT,
-                    max_steps_override=1,
-                )
-
-        parsed = json.loads(response.content)
-        self.assertIsInstance(parsed, dict)
-        self.assertIn("reaction_type", parsed)
-        self.assertIn("electrode_composition", parsed)
-        self.assertIn("catalyst_metal_elements", parsed)
-        self.assertIn("performance_metrics", parsed)
-        self.assertIn("confidence", parsed)
-        self.assertIn("evidence", parsed)
-        self.assertIsInstance(parsed["evidence"], list)
-        self.assertEqual(len(getattr(trajectory, "steps", []) or []), 1)
-        self.assertIn("Strict JSON fallback", getattr(trajectory.steps[0], "thought", "") or "")
-
-    def test_review_strict_json_fallback_emits_minimal_schema_json(self):
-        from agents.react_agent import ReActAgent
-        from prompts.debate_phase_prompts import DEBATE_REVIEW_SYSTEM_PROMPT
-
-        dummy_llm = _DummyLLM()
-
-        with patch(
-            "agents.react_agent._lazy_langchain_imports",
-            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
-        ):
-            agent = ReActAgent(
-                agent_id="t_review",
-                name="test",
-                model_config={"deadline_mode": True},
-                rag_system=None,
-                experience_store=None,
-                system_prompt="",
-                max_react_steps=10,
-                verbose=False,
-            )
-
-            with patch.object(agent, "_get_llm", return_value=dummy_llm), patch.object(
-                agent, "_build_tools", return_value=([], {})
-            ):
-                response, trajectory = agent.generate_response_with_react(
-                    query="STRICT JSON fallback test (review).",
-                    components=["Ni", "Fe", "Co"],
-                    system_prompt_override=DEBATE_REVIEW_SYSTEM_PROMPT,
-                    max_steps_override=1,
-                )
-
-        parsed = json.loads(response.content)
-        self.assertIsInstance(parsed, dict)
-        self.assertIn("reviews", parsed)
-        self.assertIsInstance(parsed["reviews"], list)
-        self.assertEqual(len(getattr(trajectory, "steps", []) or []), 1)
-        self.assertIn("Strict JSON fallback", getattr(trajectory.steps[0], "thought", "") or "")
-
-    def test_rebuttal_strict_json_fallback_emits_minimal_schema_json(self):
-        from agents.react_agent import ReActAgent
-        from prompts.debate_phase_prompts import DEBATE_REBUTTAL_SYSTEM_PROMPT
-
-        dummy_llm = _DummyLLM()
-
-        with patch(
-            "agents.react_agent._lazy_langchain_imports",
-            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
-        ):
-            agent = ReActAgent(
-                agent_id="t_reb",
-                name="test",
-                model_config={"deadline_mode": True},
-                rag_system=None,
-                experience_store=None,
-                system_prompt="",
-                max_react_steps=10,
-                verbose=False,
-            )
-
-            with patch.object(agent, "_get_llm", return_value=dummy_llm), patch.object(
-                agent, "_build_tools", return_value=([], {})
-            ):
-                response, trajectory = agent.generate_response_with_react(
-                    query="STRICT JSON fallback test (rebuttal).",
-                    components=["Ni", "Fe", "Co"],
-                    system_prompt_override=DEBATE_REBUTTAL_SYSTEM_PROMPT,
-                    max_steps_override=1,
-                )
-
-        parsed = json.loads(response.content)
-        self.assertIsInstance(parsed, dict)
-        self.assertIn("rebuttals", parsed)
-        self.assertIsInstance(parsed["rebuttals"], list)
-        self.assertIn("revised_claim", parsed)
-        self.assertEqual(parsed["revised_claim"], None)
-        self.assertEqual(len(getattr(trajectory, "steps", []) or []), 1)
-        self.assertIn("Strict JSON fallback", getattr(trajectory.steps[0], "thought", "") or "")
 
     def test_structured_forced_conclude_accepts_tool_calls_shape(self):
         from agents.react_agent import ReActAgent
@@ -414,6 +284,38 @@ class StrictJsonFallbackTests(unittest.TestCase):
                 )
 
         self.assertEqual(response.structured_output, {"kind": "submission", "payload": {"summary": "ok"}})
+        self.assertEqual(len(getattr(trajectory, "steps", []) or []), 1)
+        self.assertEqual(getattr(trajectory.steps[0], "action", None), "conclude")
+
+    def test_structured_forced_conclude_salvages_review_items_json_content(self):
+        from agents.react_agent import ReActAgent
+
+        llm = _ForcedConcludeLLM(mode="json_content_review_items")
+
+        with patch(
+            "agents.react_agent._lazy_langchain_imports",
+            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
+        ):
+            agent = ReActAgent(
+                agent_id="t_struct_json_review_items",
+                name="test",
+                model_config={"deadline_mode": True},
+                system_prompt="",
+                max_react_steps=1,
+                verbose=False,
+                tools=[_ReviewerConcludeTool()],
+                conclude_argument_name="review",
+                conclude_output_kind="review_items",
+            )
+
+            with patch.object(agent, "_get_llm", return_value=llm):
+                response, trajectory = agent.generate_response_with_react(
+                    query="structured forced conclude test",
+                    system_prompt_override="Return the final review payload via conclude.",
+                    max_steps_override=1,
+                )
+
+        self.assertEqual(response.structured_output, {"kind": "review_items", "payload": [{"critique": "x"}]})
         self.assertEqual(len(getattr(trajectory, "steps", []) or []), 1)
         self.assertEqual(getattr(trajectory.steps[0], "action", None), "conclude")
 
@@ -554,10 +456,7 @@ class StrictJsonFallbackTests(unittest.TestCase):
         self.assertEqual(1, len(getattr(trajectory, "steps", []) or []))
         raw_payload = getattr(response, "response_content", None)
         self.assertIsInstance(raw_payload, dict)
-        self.assertEqual(
-            "",
-            raw_payload["forced_conclude_action_response"]["content"],
-        )
+        self.assertEqual("", raw_payload["forced_conclude_action_response"]["content"])
 
     def test_structured_forced_conclude_invalid_tool_arguments_return_repairable_response(self):
         from langchain_core.tools import StructuredTool
@@ -615,4 +514,3 @@ class StrictJsonFallbackTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -1,11 +1,10 @@
 """
-Logging utilities for MAD.
+Logging utilities for ChemQA.
 
 Design goals
 - Configure logging once per process (via `setup_logging`).
 - Avoid per-module log files / timestamped logger names.
 - Group logs by run_id under `./logs/runs/<run_id>/`.
-- Keep backwards-compatible APIs (`Logger.get_logger`, `DebateLogger`).
 """
 
 from __future__ import annotations
@@ -140,15 +139,6 @@ class _ContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003 - record is stdlib name
         record.run_id = get_run_id() or "-"  # type: ignore[attr-defined]
         return True
-
-
-class _PrefixFilter(logging.Filter):
-    def __init__(self, prefix: str) -> None:
-        super().__init__()
-        self.prefix = prefix
-
-    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003 - record is stdlib name
-        return bool(record.name and record.name.startswith(self.prefix))
 
 
 _STD_ATTRS = {
@@ -296,12 +286,10 @@ def setup_logging(config: dict, run_id: Optional[str] = None) -> logging.Logger:
 
     Output layout (defaults):
       logs/
-        system.log                 # rolling "latest" file (compatible with existing config)
+        system.log                 # rolling "latest" file
         runs/<run_id>/
           run.log                  # full run log (text)
           events.jsonl             # full run log (structured)
-          debate.log               # filtered (MAD.debate.*)
-          db.log                   # filtered (MAD.database.*)
     """
     global _CONFIGURED
     with _CONFIG_LOCK:
@@ -378,21 +366,6 @@ def setup_logging(config: dict, run_id: Optional[str] = None) -> logging.Logger:
         events.addFilter(ctx_filter)
         root.addHandler(events)
 
-        # Per-run debate/db convenience logs
-        debate = logging.FileHandler(str(run_dir / "debate.log"), encoding="utf-8")
-        debate.setLevel(logging.DEBUG)
-        debate.setFormatter(formatter)
-        debate.addFilter(ctx_filter)
-        debate.addFilter(_PrefixFilter("MAD.debate"))
-        root.addHandler(debate)
-
-        db = logging.FileHandler(str(run_dir / "db.log"), encoding="utf-8")
-        db.setLevel(logging.DEBUG)
-        db.setFormatter(formatter)
-        db.addFilter(ctx_filter)
-        db.addFilter(_PrefixFilter("MAD.database"))
-        root.addHandler(db)
-
         # Reduce noise from very chatty dependencies (can be overridden by user config later).
         for noisy in ["httpx", "httpcore", "openai", "chromadb", "langchain", "langchain_core"]:
             logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -402,79 +375,3 @@ def setup_logging(config: dict, run_id: Optional[str] = None) -> logging.Logger:
         logger = logging.getLogger("MAD")
         logger.info("logging_initialized", extra={"event": "logging.init", "run_id": run_id_final, "run_dir": str(run_dir)})
         return logger
-
-
-class DebateLogger:
-    """
-    Backwards-compatible debate logger wrapper.
-
-    The project now routes debate logs into the process-wide handlers. This class exists so older
-    code can keep calling `DebateLogger().log_*()` without managing handlers/files.
-    """
-
-    def __init__(self) -> None:
-        self.debate_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.logger = logging.getLogger("MAD.debate")
-
-    def log_debate_start(self, components: list, config: dict):
-        self.logger.info(
-            "debate_start",
-            extra={
-                "event": "debate.start",
-                "debate_id": self.debate_id,
-                "components": components,
-                "max_rounds": (config or {}).get("max_rounds"),
-            },
-        )
-
-    def log_round_start(self, round_num: int):
-        self.logger.info(
-            "debate_round_start",
-            extra={"event": "debate.round.start", "debate_id": self.debate_id, "round": int(round_num)},
-        )
-
-    def log_agent_response(self, agent_name: str, response: str, products: str = None, performance: str = None):
-        self.logger.info(
-            "debate_agent_response",
-            extra={
-                "event": "debate.agent.response",
-                "debate_id": self.debate_id,
-                "agent_name": agent_name,
-                "products": products,
-                "performance": performance,
-                "response_preview": (response or "")[:500],
-            },
-        )
-
-    def log_consensus_check(self, consensus: bool, details: str):
-        self.logger.info(
-            "debate_consensus_check",
-            extra={
-                "event": "debate.consensus",
-                "debate_id": self.debate_id,
-                "consensus": bool(consensus),
-                "details": (details or "")[:1000],
-            },
-        )
-
-    def log_debate_end(self, result: dict):
-        self.logger.info(
-            "debate_end",
-            extra={
-                "event": "debate.end",
-                "debate_id": self.debate_id,
-                "consensus_reached": (result or {}).get("consensus_reached"),
-                "final_products": (result or {}).get("final_products"),
-                "final_performance": (result or {}).get("final_performance"),
-                "debate_rounds": (result or {}).get("debate_rounds"),
-                "time_elapsed": (result or {}).get("time_elapsed"),
-                "engine": (result or {}).get("engine"),
-            },
-        )
-
-    def get_log_file_path(self) -> str:
-        # Prefer the per-run debate.log if available.
-        run_dir = get_run_dir()
-        if run_dir:
-            return str(run_dir / "debate.log")
-        return ""

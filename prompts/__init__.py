@@ -1,12 +1,5 @@
-"""Prompt modules for centralized prompt management."""
+"""Prompt modules for ChemQA."""
 
-from prompts.system_prompts import UNIFIED_SYSTEM_PROMPT
-from prompts.debate_phase_prompts import (
-    DEBATE_PROPOSE_SYSTEM_PROMPT,
-    DEBATE_REVIEW_SYSTEM_PROMPT,
-    DEBATE_REBUTTAL_SYSTEM_PROMPT,
-    build_initial_debate_prompt,
-)
 from prompts.qa_prompts import (
     CLAIM_MINER_SYSTEM_PROMPT,
     CLAIM_REVISION_SYSTEM_PROMPT,
@@ -28,18 +21,13 @@ from prompts.qa_prompts import (
     build_evidence_extractor_user_prompt,
     build_query_planner_user_prompt,
     build_reviewer_user_prompt,
+    build_review_merge_user_prompt,
     build_router_localization_user_prompt,
     build_router_semantic_user_prompt,
-    build_review_merge_user_prompt,
     build_synthesizer_user_prompt,
 )
 
 __all__ = [
-    "UNIFIED_SYSTEM_PROMPT",
-    "DEBATE_PROPOSE_SYSTEM_PROMPT",
-    "build_initial_debate_prompt",
-    "DEBATE_REVIEW_SYSTEM_PROMPT",
-    "DEBATE_REBUTTAL_SYSTEM_PROMPT",
     "ENTITY_RESOLVER_SYSTEM_PROMPT",
     "QUERY_PLANNER_SYSTEM_PROMPT",
     "EVIDENCE_EXTRACTOR_SYSTEM_PROMPT",

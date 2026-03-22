@@ -67,7 +67,7 @@ class ReactToolSchemaTests(unittest.TestCase):
 
         self.assertEqual("submission_cycle_1", payload.submission_id)
 
-    def test_proposer_conclude_tool_schema_rejects_real_run_schema_drift(self):
+    def test_proposer_conclude_tool_schema_rejects_schema_drift(self):
         def conclude(submission):
             """test conclude"""
             return submission
@@ -99,25 +99,44 @@ class ReactToolSchemaTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             tool.invoke(drift_payload)
 
-    def test_generic_conclude_schema_selection_is_phase_specific(self):
-        self.assertIs(
-            tool_schemas.DebateProposalConcludeToolInput,
-            tool_schemas.get_generic_conclude_args_schema("proposal"),
-        )
-        self.assertIs(
-            tool_schemas.DebateReviewConcludeToolInput,
-            tool_schemas.get_generic_conclude_args_schema("reviews"),
-        )
-        self.assertIs(
-            tool_schemas.DebateRebuttalConcludeToolInput,
-            tool_schemas.get_generic_conclude_args_schema("rebuttals"),
-        )
-        self.assertIs(
-            tool_schemas.GenericTextConcludeToolInput,
-            tool_schemas.get_generic_conclude_args_schema("unknown"),
+    def test_reviewer_conclude_tool_schema_accepts_canonical_payload(self):
+        def conclude(review):
+            """test conclude"""
+            return review
+
+        tool = StructuredTool.from_function(
+            conclude,
+            name="conclude",
+            args_schema=tool_schemas.ReviewerConcludeToolInput,
         )
 
-    def test_debate_proposal_conclude_schema_rejects_freeform_text_shape(self):
+        payload = tool.invoke(
+            {
+                "review": {
+                    "review_items": [
+                        {
+                            "review_id": "rev-1",
+                            "reviewer_role": "search_coverage",
+                            "anchor_kind": "global",
+                            "severity": "warning",
+                            "flaw_type": "needs_manual_review",
+                            "critique": "Coverage may be incomplete.",
+                            "required_action": "Check one more supporting paper.",
+                        }
+                    ]
+                }
+            }
+        )
+
+        self.assertEqual("rev-1", payload.review_items[0].review_id)
+
+    def test_generic_conclude_schema_is_text_only(self):
+        self.assertIs(
+            tool_schemas.GenericTextConcludeToolInput,
+            tool_schemas.get_generic_conclude_args_schema("any"),
+        )
+
+    def test_generic_conclude_schema_rejects_non_text_shape(self):
         def conclude(conclusion):
             """test conclude"""
             return conclusion
@@ -125,11 +144,11 @@ class ReactToolSchemaTests(unittest.TestCase):
         tool = StructuredTool.from_function(
             conclude,
             name="conclude",
-            args_schema=tool_schemas.DebateProposalConcludeToolInput,
+            args_schema=tool_schemas.GenericTextConcludeToolInput,
         )
 
         with self.assertRaises(ValidationError):
-            tool.invoke({"conclusion": "Pt/C is better"})
+            tool.invoke({"conclusion": {"summary": "not text"}})
 
 
 if __name__ == "__main__":

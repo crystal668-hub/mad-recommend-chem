@@ -120,8 +120,6 @@ class LoggingIntegrationTests(unittest.TestCase):
         self.assertTrue((self.temp_dir / "logs" / "system.log").exists())
         self.assertTrue((run_dir / "run.log").exists())
         self.assertTrue((run_dir / "events.jsonl").exists())
-        self.assertTrue((run_dir / "debate.log").exists())
-        self.assertTrue((run_dir / "db.log").exists())
 
     def test_ledger_run_emits_key_stage_logs(self):
         config = self._config(workflow_mode="ledger")
