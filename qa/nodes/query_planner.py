@@ -9,7 +9,7 @@ from qa.retrieval_utils import normalize_text
 from qa.state import EntityPack, TaskSpec
 
 
-LANE_PREFERRED_SOURCES = ["openalex", "crossref", "semantic_scholar"]
+LANE_PREFERRED_SOURCES = ["openalex", "semantic_scholar", "crossref"]
 LANE_KEYWORDS: Dict[str, Sequence[str]] = {
     "review": ("review", "perspective", "survey"),
     "frontier": ("recent", "latest", "state of the art"),

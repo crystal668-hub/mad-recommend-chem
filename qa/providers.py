@@ -363,6 +363,21 @@ class CrossrefClient(_HttpTransportMixin):
             random_fn=random_fn,
         )
 
+    def search(self, query_plan: QueryPlan, limit: int = 8) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {
+            "rows": limit,
+            "query.bibliographic": query_plan.query_text,
+        }
+        if query_plan.year_from is not None or query_plan.year_to is not None:
+            year_from = query_plan.year_from or query_plan.year_to
+            year_to = query_plan.year_to or query_plan.year_from
+            if year_from is not None and year_to is not None:
+                params["filter"] = f"from-pub-date:{year_from}-01-01,until-pub-date:{year_to}-12-31"
+        if self.mailto:
+            params["mailto"] = self.mailto
+        response = self._perform_get(self.base_url, params=params)
+        return list(response.json().get("message", {}).get("items") or [])
+
     def enrich(self, candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         doi = normalize_doi(candidate.get("doi"))
         if doi:
@@ -409,6 +424,18 @@ class SemanticScholarClient(_HttpTransportMixin):
             sleep_fn=sleep_fn,
             random_fn=random_fn,
         )
+
+    def search(self, query_plan: QueryPlan, limit: int = 8) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {
+            "query": query_plan.query_text,
+            "limit": limit,
+            "fields": "title,abstract,citationCount,year,venue,authors,externalIds,openAccessPdf,url",
+        }
+        if query_plan.year_from is not None:
+            params["year"] = f"{query_plan.year_from}:{query_plan.year_to or query_plan.year_from}"
+        headers = {"x-api-key": self.api_key} if self.api_key else None
+        response = self._perform_get(self.base_url, params=params, headers=headers)
+        return list(response.json().get("data") or [])
 
     def enrich(self, candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         params = {

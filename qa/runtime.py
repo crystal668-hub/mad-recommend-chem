@@ -107,8 +107,8 @@ DEFAULT_QA_CONFIG: Dict[str, Any] = {
     "peer_review": copy.deepcopy(DEFAULT_QA_PEER_REVIEW_CONFIG),
     "entity_resolution": copy.deepcopy(DEFAULT_QA_ENTITY_RESOLUTION_CONFIG),
     "react_reviewed": {
-        "max_propose_steps_initial": 6,
-        "max_propose_steps_revision": 6,
+        "max_propose_steps_initial": 7,
+        "max_propose_steps_revision": 7,
         "proposer_fallback_mode": "fail_fast_only",
         "proposer_repair_attempts": 1,
         "proposer_evidence_policy": "prefer_fulltext",

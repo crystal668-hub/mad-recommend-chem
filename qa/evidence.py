@@ -236,6 +236,9 @@ ENTITY_TYPE_TO_AXIS = {
     "ligand": "ligand",
     "reagent": "reagent",
 }
+MAX_LLM_SNIPPETS_PER_FULLTEXT_SECTION = 6
+MAX_SNIPPETS_PER_FULLTEXT_SECTION = 24
+MAX_FULLTEXT_SECTION_CHARS = 12000
 
 
 @dataclass
@@ -331,13 +334,20 @@ class EvidenceExtractor:
     ) -> List[EvidenceItem]:
         evidence_items: List[EvidenceItem] = []
         local_index = 0
-        for span_start, span_end, snippet in self._iter_snippet_spans(section_view.text):
+        section_text = section_view.text
+        is_fulltext_section = section_view.section_type != "abstract"
+        if is_fulltext_section and len(section_text) > MAX_FULLTEXT_SECTION_CHARS:
+            section_text = section_text[:MAX_FULLTEXT_SECTION_CHARS]
+        for snippet_index, (span_start, span_end, snippet) in enumerate(self._iter_snippet_spans(section_text)):
+            if is_fulltext_section and snippet_index >= MAX_SNIPPETS_PER_FULLTEXT_SECTION:
+                break
             conditions = self._extract_conditions(snippet=snippet, entity_pack=entity_pack)
             decision = self._classify_roles(
                 snippet=snippet,
                 task_spec=task_spec,
                 entity_pack=entity_pack,
                 section_type=section_view.section_type,
+                use_llm=(not is_fulltext_section) or snippet_index < MAX_LLM_SNIPPETS_PER_FULLTEXT_SECTION,
             )
             for role in ROLE_ORDER:
                 if role == "condition":
@@ -447,23 +457,43 @@ class EvidenceExtractor:
         task_spec: TaskSpec,
         entity_pack: EntityPack,
         section_type: str,
+        use_llm: bool = True,
     ) -> _RoleDecision:
         heuristic_roles = self._heuristic_roles(snippet=snippet, section_type=section_type)
-        llm_payload = self._classify_with_llm(snippet=snippet, task_spec=task_spec, section_type=section_type)
+        llm_payload = self._classify_with_llm(
+            snippet=snippet,
+            task_spec=task_spec,
+            section_type=section_type,
+        ) if use_llm else None
         roles = set(heuristic_roles)
         if isinstance(llm_payload, dict):
-            for role in llm_payload.get("roles") or []:
+            for role in self._coerce_text_items(
+                llm_payload.get("roles"),
+                preferred_keys=("role", "label", "name", "value", "type", "text"),
+            ):
                 if role in CLAIM_ELIGIBLE_ROLES:
                     roles.add(role)
         ordered_roles = [role for role in ROLE_ORDER if role in roles and role != "condition"]
         entity_mentions = self._extract_entity_mentions(snippet=snippet, entity_pack=entity_pack)
         metric_mentions = self._extract_metric_mentions(snippet)
         if isinstance(llm_payload, dict):
-            entity_mentions = self._merge_unique(entity_mentions, llm_payload.get("entity_mentions"))
-            metric_mentions = self._merge_unique(metric_mentions, llm_payload.get("metric_mentions"))
+            entity_mentions = self._merge_unique(
+                entity_mentions,
+                self._coerce_text_items(
+                    llm_payload.get("entity_mentions"),
+                    preferred_keys=("entity", "mention", "name", "label", "text", "value"),
+                ),
+            )
+            metric_mentions = self._merge_unique(
+                metric_mentions,
+                self._coerce_text_items(
+                    llm_payload.get("metric_mentions"),
+                    preferred_keys=("metric", "family", "name", "label", "text", "value"),
+                ),
+            )
             claim_polarity = (
-                llm_payload.get("claim_polarity")
-                if llm_payload.get("claim_polarity") in {"support", "oppose", "neutral"}
+                normalize_text(llm_payload.get("claim_polarity")).lower()
+                if normalize_text(llm_payload.get("claim_polarity")).lower() in {"support", "oppose", "neutral"}
                 else None
             )
             note = normalize_text(llm_payload.get("notes")) or None
@@ -610,14 +640,32 @@ class EvidenceExtractor:
             return None
         roles = [
             role
-            for role in payload.get("roles") or []
+            for role in (
+                self._coerce_text_item(
+                    item,
+                    preferred_keys=("role", "label", "name", "value", "type", "text"),
+                )
+                for item in (payload.get("roles") or [])
+            )
             if role in CLAIM_ELIGIBLE_ROLES
         ]
-        claim_polarity = payload.get("claim_polarity")
+        claim_polarity = normalize_text(payload.get("claim_polarity")).lower()
         if claim_polarity not in {"support", "oppose", "neutral"}:
             claim_polarity = None
-        entity_mentions = self._merge_unique([], payload.get("entity_mentions"))
-        metric_mentions = self._merge_unique([], payload.get("metric_mentions"))
+        entity_mentions = self._merge_unique(
+            [],
+            self._coerce_text_items(
+                payload.get("entity_mentions"),
+                preferred_keys=("entity", "mention", "name", "label", "text", "value"),
+            ),
+        )
+        metric_mentions = self._merge_unique(
+            [],
+            self._coerce_text_items(
+                payload.get("metric_mentions"),
+                preferred_keys=("metric", "family", "name", "label", "text", "value"),
+            ),
+        )
         notes = normalize_text(payload.get("notes")) or None
         return {
             "roles": roles,
@@ -785,6 +833,41 @@ class EvidenceExtractor:
             seen.add(key)
             merged.append(text)
         return merged
+
+    def _coerce_text_items(
+        self,
+        values: Any,
+        *,
+        preferred_keys: Sequence[str],
+    ) -> List[str]:
+        if values is None:
+            return []
+        if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+            coerced = self._coerce_text_item(values, preferred_keys=preferred_keys)
+            return [coerced] if coerced else []
+        coerced_items: List[str] = []
+        for value in values:
+            coerced = self._coerce_text_item(value, preferred_keys=preferred_keys)
+            if coerced:
+                coerced_items.append(coerced)
+        return coerced_items
+
+    def _coerce_text_item(
+        self,
+        value: Any,
+        *,
+        preferred_keys: Sequence[str],
+    ) -> Optional[str]:
+        if isinstance(value, dict):
+            for key in preferred_keys:
+                text = normalize_text(value.get(key))
+                if text:
+                    return text.lower() if key in {"role", "type", "metric", "family"} else text
+            return None
+        text = normalize_text(value)
+        if not text:
+            return None
+        return text.lower() if any(key in {"role", "type", "metric", "family"} for key in preferred_keys) else text
 
     def _sanitize_entity_mentions(self, mentions: Sequence[str]) -> List[str]:
         cleaned: List[str] = []

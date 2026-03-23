@@ -1234,6 +1234,7 @@ class ReActAgent:
                                     + (
                                         "Provide the required structured payload for the conclude tool.\n"
                                         f"If the backend exposes named arguments, use `{structured_conclude_argument_name}`.\n"
+                                        f"Tool arguments must be exactly {{\"{structured_conclude_argument_name}\": <{structured_conclude_output_kind} JSON object>}}.\n"
                                         if structured_conclude_required
                                         else "Set the `conclusion` argument to STRICT JSON ONLY that follows the schema in the system prompt EXACTLY.\n"
                                     )
@@ -1248,6 +1249,7 @@ class ReActAgent:
                                     + (
                                         "Provide the final structured payload to the conclude tool.\n"
                                         f"If the backend exposes named arguments, use `{structured_conclude_argument_name}`.\n"
+                                        f"Tool arguments must be exactly {{\"{structured_conclude_argument_name}\": <{structured_conclude_output_kind} JSON object>}}.\n"
                                         if structured_conclude_required
                                         else "Set the `conclusion` argument to the best possible final answer.\n"
                                     )
@@ -1385,9 +1387,9 @@ class ReActAgent:
                                     "- Do NOT output markdown, explanations, or extra text.\n"
                                     f"- Return the final `{structured_conclude_output_kind}` payload in JSON form.\n"
                                     + (
-                                        '- You may return either {"kind":"submission","payload":{...}}, {"submission": {...}}, or the submission object itself.\n'
+                                        '- Return EXACTLY {"kind":"submission","payload":{...}}.\n'
                                         if structured_conclude_output_kind == "submission"
-                                        else '- You may return either {"kind":"review_items","payload":[...]}, {"review":{"review_items":[...]}}, {"review_items":[...]}, or the review_items array itself.\n'
+                                        else '- Return EXACTLY {"kind":"review_items","payload":[...]}.\n'
                                     )
                                     + (
                                         f"- Previous conclude validation error: {invalid_conclude_observation_}\n"
@@ -1616,6 +1618,69 @@ class ReActAgent:
                 forced_action_input_,
             )
 
+        def _run_last_chance_structured_followup(messages_: List[Any]) -> List[Any]:
+            if not structured_conclude_required:
+                return messages_
+            extract_tool = tools_by_name.get("extract_evidence")
+            if extract_tool is None:
+                return messages_
+
+            evidence_already_present = False
+            acquired_paper_ids: List[str] = []
+            seen_acquired = set()
+            for step in list(getattr(trajectory, "steps", []) or []):
+                for call in list(getattr(step, "tool_calls", []) or []):
+                    tool_name = str(getattr(call, "tool_name", "") or "").strip()
+                    if tool_name == "extract_evidence":
+                        payload = getattr(call, "observation_data", None)
+                        if isinstance(payload, dict) and list(payload.get("evidence") or []):
+                            evidence_already_present = True
+                        elif isinstance(payload, list) and payload:
+                            evidence_already_present = True
+                    if tool_name != "acquire_document":
+                        continue
+                    payload = getattr(call, "observation_data", None)
+                    paper_id = ""
+                    if isinstance(payload, dict):
+                        paper_id = str(payload.get("paper_id") or "").strip()
+                    if not paper_id:
+                        tool_args = getattr(call, "tool_args", None)
+                        if isinstance(tool_args, dict):
+                            paper_id = str(tool_args.get("paper_id") or "").strip()
+                    if paper_id and paper_id not in seen_acquired:
+                        seen_acquired.add(paper_id)
+                        acquired_paper_ids.append(paper_id)
+
+            if evidence_already_present or not acquired_paper_ids:
+                return messages_
+
+            synthetic_calls: List[Dict[str, Any]] = []
+            synthetic_tool_messages: List[Any] = []
+            for paper_id in acquired_paper_ids[:2]:
+                tool_call_id = f"deadline_extract_{len(synthetic_calls) + 1}"
+                tool_args = {"paper_id": paper_id, "preferred_sections": True}
+                result = _invoke_tool_with_validation(extract_tool, "extract_evidence", tool_args)
+                payload = result.data
+                extracted_items: List[Any] = []
+                if isinstance(payload, dict):
+                    extracted_items = list(payload.get("evidence") or [])
+                elif isinstance(payload, list):
+                    extracted_items = list(payload)
+                if not extracted_items:
+                    continue
+                synthetic_calls.append(
+                    {
+                        "id": tool_call_id,
+                        "name": "extract_evidence",
+                        "args": tool_args,
+                    }
+                )
+                synthetic_tool_messages.append(ToolMessage(content=str(result), tool_call_id=tool_call_id))
+            if not synthetic_calls:
+                return messages_
+
+            return messages_ + [_build_ai_tool_call_message(AIMessage, content="", tool_calls=synthetic_calls)] + synthetic_tool_messages
+
         while step_number < effective_max_steps:
             remaining_steps = effective_max_steps - step_number
             if deadline_mode and remaining_steps == 1:
@@ -1629,6 +1694,8 @@ class ReActAgent:
                         "max_react_steps": effective_max_steps,
                     },
                 )
+                if structured_conclude_required:
+                    messages = _run_last_chance_structured_followup(messages)
                 (
                     draft,
                     forced_tool_call_id,
@@ -1811,8 +1878,8 @@ class ReActAgent:
             if deadline_mode and remaining_steps == 2:
                 deadline_hint = (
                     "\nDEADLINE MODE: You have only 2 steps left.\n"
-                    "- Do NOT call `search_literature` or `search_experience`.\n"
-                    "- You may ONLY call `analyze` or `conclude`.\n"
+                    "- Do NOT call broad discovery tools such as `search_literature`, `search_experience`, `plan_queries`, or `search_papers`.\n"
+                    "- If grounding is still missing, prefer follow-up retrieval tools such as acquisition, section reading, or evidence extraction before `conclude`.\n"
                 )
             for attempt in range(2):
                 retry_hint = ""
@@ -1983,14 +2050,8 @@ class ReActAgent:
             # are consistent and future turns remain OpenAI-tool-call compatible.
             from_fc = any(isinstance(c, dict) and c.get("__from_function_call") for c in tool_calls)
             if from_fc:
-                sanitized: List[Dict[str, Any]] = []
-                for c in tool_calls:
-                    if not isinstance(c, dict):
-                        continue
-                    cc = dict(c)
-                    cc.pop("__from_function_call", None)
-                    sanitized.append(cc)
-                messages.append(AIMessage(content=raw_action_text or "", additional_kwargs={"tool_calls": sanitized}))
+                sanitized = _canonicalize_tool_calls(tool_calls)
+                messages.append(_build_ai_tool_call_message(AIMessage, content=raw_action_text or "", tool_calls=sanitized))
                 tool_calls = sanitized
             else:
                 messages.append(action_msg)
@@ -2017,6 +2078,12 @@ class ReActAgent:
                     ActionType.FETCH_LITERATURE_CHUNK.value,
                 ]
             )
+            deadline_blocked_discovery_tools = {
+                ActionType.SEARCH_LITERATURE.value,
+                ActionType.SEARCH_EXPERIENCE.value,
+                "plan_queries",
+                "search_papers",
+            }.intersection(search_tools)
             analysis_tools = set(
                 self._analysis_tool_names
                 or [ActionType.ANALYZE.value, ActionType.CONCLUDE.value]
@@ -2026,20 +2093,43 @@ class ReActAgent:
                 retrieval_budget is not None and retrieval_action_steps_used >= int(retrieval_budget)
             )
             deadline_no_retrieval = bool(deadline_mode and remaining_steps == 2)
-            block_search_this_step = bool(retrieval_budget_exhausted or deadline_no_retrieval)
+            block_discovery_this_step = bool(retrieval_budget_exhausted or deadline_no_retrieval)
 
             has_search = any(name in search_tools for name, _args, _id in normalized_calls)
-            has_search_unblocked = bool(has_search and (not block_search_this_step))
+            has_search_unblocked = bool(
+                any(
+                    name in search_tools and not (name in deadline_blocked_discovery_tools and block_discovery_this_step)
+                    for name, _args, _id in normalized_calls
+                )
+            )
+            has_deadline_blocked_discovery = bool(
+                any(
+                    name in deadline_blocked_discovery_tools
+                    for name, _args, _id in normalized_calls
+                )
+            )
+            has_followup_retrieval = bool(
+                any(
+                    name in search_tools and name not in deadline_blocked_discovery_tools
+                    for name, _args, _id in normalized_calls
+                )
+            )
             has_analysis = any(name in analysis_tools for name, _args, _id in normalized_calls)
-            if structured_conclude_required and deadline_no_retrieval and has_search and not has_analysis:
+            if (
+                structured_conclude_required
+                and deadline_no_retrieval
+                and has_deadline_blocked_discovery
+                and not has_analysis
+                and not has_followup_retrieval
+            ):
                 analysis_list = ", ".join(f"`{name}`" for name in sorted(analysis_tools)) or "`conclude`"
                 deadline_messages = list(messages)
                 blocked_observation = (
-                    "Policy: retrieval is disabled when only 2 steps remain in this call.\n"
-                    f"Do NOT call search tools now; call one of: {analysis_list}."
+                    "Policy: broad discovery is disabled when only 2 steps remain in this call.\n"
+                    f"Do NOT call planning/search expansion tools now; call one of: {analysis_list}."
                 )
                 for tool_name, _tool_args, tool_call_id in normalized_calls:
-                    if tool_name not in search_tools:
+                    if tool_name not in deadline_blocked_discovery_tools:
                         continue
                     deadline_messages.append(ToolMessage(content=blocked_observation, tool_call_id=tool_call_id))
                 (
@@ -2060,7 +2150,7 @@ class ReActAgent:
                     observation_data=last_forced_conclude_observation_data if last_forced_conclude_observation_data is not None else final_answer,
                 )
                 thought_text = (
-                    "Deadline mode: retrieval attempt was blocked with 2 steps remaining, so conclude was forced immediately."
+                    "Deadline mode: broad discovery was blocked with 2 steps remaining, so conclude was forced immediately."
                 )
                 if strict_json_fallback_used:
                     thought_text += " Strict JSON fallback was used."
@@ -2093,7 +2183,7 @@ class ReActAgent:
                 # If the model tried to both search and analyze/conclude in the same ACTION step,
                 # refuse the analysis/conclude calls (they wouldn't be grounded in the fresh observations).
                 blocked_mixed = mixed_search_and_analysis and tool_name in analysis_tools
-                blocked_retrieval = tool_name in search_tools and block_search_this_step
+                blocked_retrieval = tool_name in deadline_blocked_discovery_tools and block_discovery_this_step
 
                 # Guard: in PROPOSE (non-strict JSON) the final conclusion must stay on the provided metal elements.
                 blocked_guard = False
@@ -2162,15 +2252,15 @@ class ReActAgent:
                         if deadline_no_retrieval:
                             analysis_list = ", ".join(f"`{name}`" for name in sorted(analysis_tools)) or "`conclude`"
                             obs = (
-                                "Policy: retrieval is disabled when only 2 steps remain in this call.\n"
-                                f"Do NOT call search tools now; call one of: {analysis_list}."
+                                "Policy: broad discovery is disabled when only 2 steps remain in this call.\n"
+                                f"Do NOT call planning/search expansion tools now; call one of: {analysis_list}."
                             )
                             result = ToolResult(observation=obs, data={"error": "deadline_no_retrieval"})
                         else:
                             analysis_list = ", ".join(f"`{name}`" for name in sorted(analysis_tools)) or "`conclude`"
                             obs = (
-                                "Policy: retrieval budget exceeded for this phase.\n"
-                                f"Do NOT call search tools now; call one of: {analysis_list}."
+                                "Policy: discovery retrieval budget exceeded for this phase.\n"
+                                f"Do NOT call planning/search expansion tools now; call one of: {analysis_list}."
                             )
                             result = ToolResult(observation=obs, data={"error": "retrieval_budget_exceeded"})
                     else:
@@ -2518,6 +2608,31 @@ def _normalize_tool_call(call: Any) -> Tuple[str, Dict[str, Any], str]:
 
     # Unknown shape
     return "unknown_tool", {}, f"tool_{id(call)}"
+
+
+def _canonicalize_tool_calls(tool_calls: Sequence[Any]) -> List[Dict[str, Any]]:
+    canonical: List[Dict[str, Any]] = []
+    for call in list(tool_calls or []):
+        name, args, call_id = _normalize_tool_call(call)
+        if not name or name == "unknown_tool":
+            continue
+        canonical.append(
+            {
+                "id": str(call_id or f"tool_{id(call)}"),
+                "name": str(name),
+                "args": args if isinstance(args, dict) else {},
+                "type": "tool_call",
+            }
+        )
+    return canonical
+
+
+def _build_ai_tool_call_message(ai_message_cls: Any, *, content: str, tool_calls: Sequence[Any]) -> Any:
+    canonical = _canonicalize_tool_calls(tool_calls)
+    try:
+        return ai_message_cls(content=content or "", tool_calls=canonical)
+    except TypeError:  # pragma: no cover - compatibility path for older message shims
+        return ai_message_cls(content=content or "", additional_kwargs={"tool_calls": canonical})
 
 
 def _sanitize_thought(text: str) -> str:

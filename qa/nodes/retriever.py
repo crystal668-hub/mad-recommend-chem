@@ -77,57 +77,25 @@ class RetrieverNode:
         self._provider_health_fallback = self._init_provider_health()
 
         for query_plan in query_plans:
-            try:
-                results = list(self.openalex_client.search(query_plan, limit=self.per_lane_limit) or [])
-                self._record_provider_health_success("openalex")
-            except ProviderUnavailableError as exc:
-                logger.warning("openalex_search_skipped lane=%s error=%s", query_plan.lane, exc)
-                self._record_provider_health_skipped("openalex", str(exc))
-                self._record_diagnostic(
-                    provider="openalex",
-                    stage="search",
-                    lane=query_plan.lane,
-                    outcome="skipped",
-                    message=str(exc),
-                )
-                continue
-            except Exception as exc:
-                logger.warning("openalex_search_failed lane=%s error=%s", query_plan.lane, exc)
-                self._record_provider_health_failure("openalex", exc)
-                self._record_diagnostic(
-                    provider="openalex",
-                    stage="search",
-                    lane=query_plan.lane,
-                    outcome=self._classify_error(exc),
-                    message=str(exc),
-                )
-                continue
-            if results:
-                self._record_diagnostic(
-                    provider="openalex",
-                    stage="search",
-                    lane=query_plan.lane,
-                    outcome="hit",
-                    count=len(results),
-                )
-            else:
-                self._record_diagnostic(
-                    provider="openalex",
-                    stage="search",
-                    lane=query_plan.lane,
-                    outcome="empty",
-                )
-
-            store.write_json(f"provider_raw/openalex/search_{query_plan.lane}.json", results)
-            for raw_item in results:
-                normalized = self._candidate_from_openalex(raw_item=raw_item, lane=query_plan.lane, store=store)
-                if not normalized:
+            for provider_name in self._search_provider_order(query_plan):
+                results = self._run_provider_search(provider_name=provider_name, query_plan=query_plan)
+                if results is None:
                     continue
-                existing = self._find_duplicate(candidates, normalized)
-                if existing is None:
-                    candidates.append(normalized)
-                else:
-                    self._merge_candidates(existing, normalized)
+                store.write_json(f"provider_raw/{provider_name}/search_{query_plan.lane}.json", results)
+                for raw_item in results:
+                    normalized = self._candidate_from_provider(
+                        provider_name=provider_name,
+                        raw_item=raw_item,
+                        lane=query_plan.lane,
+                        store=store,
+                    )
+                    if not normalized:
+                        continue
+                    existing = self._find_duplicate(candidates, normalized)
+                    if existing is None:
+                        candidates.append(normalized)
+                    else:
+                        self._merge_candidates(existing, normalized)
 
         for candidate in candidates:
             self._enrich_with_crossref(candidate=candidate, store=store)
@@ -139,6 +107,80 @@ class RetrieverNode:
         return self._select_diverse_candidates(candidates, query_plans)
 
     __call__ = run
+
+    def _search_provider_order(self, query_plan: QueryPlan) -> List[str]:
+        preferred = [str(item or "").strip().lower() for item in list(query_plan.preferred_sources or [])]
+        ordered: List[str] = []
+        for provider_name in preferred + ["openalex", "semantic_scholar", "crossref"]:
+            if provider_name in {"openalex", "semantic_scholar", "crossref"} and provider_name not in ordered:
+                ordered.append(provider_name)
+        return ordered
+
+    def _run_provider_search(self, *, provider_name: str, query_plan: QueryPlan) -> Optional[List[Dict[str, Any]]]:
+        search_client = {
+            "openalex": self.openalex_client,
+            "semantic_scholar": self.semantic_scholar_client,
+            "crossref": self.crossref_client,
+        }.get(provider_name)
+        if search_client is None:
+            return None
+        try:
+            results = list(search_client.search(query_plan, limit=self.per_lane_limit) or [])
+            self._record_provider_health_success(provider_name)
+        except ProviderUnavailableError as exc:
+            logger.warning("%s_search_skipped lane=%s error=%s", provider_name, query_plan.lane, exc)
+            self._record_provider_health_skipped(provider_name, str(exc))
+            self._record_diagnostic(
+                provider=provider_name,
+                stage="search",
+                lane=query_plan.lane,
+                outcome="skipped",
+                message=str(exc),
+            )
+            return None
+        except Exception as exc:
+            logger.warning("%s_search_failed lane=%s error=%s", provider_name, query_plan.lane, exc)
+            self._record_provider_health_failure(provider_name, exc)
+            self._record_diagnostic(
+                provider=provider_name,
+                stage="search",
+                lane=query_plan.lane,
+                outcome=self._classify_error(exc),
+                message=str(exc),
+            )
+            return None
+        if results:
+            self._record_diagnostic(
+                provider=provider_name,
+                stage="search",
+                lane=query_plan.lane,
+                outcome="hit",
+                count=len(results),
+            )
+        else:
+            self._record_diagnostic(
+                provider=provider_name,
+                stage="search",
+                lane=query_plan.lane,
+                outcome="empty",
+            )
+        return results
+
+    def _candidate_from_provider(
+        self,
+        *,
+        provider_name: str,
+        raw_item: Dict[str, Any],
+        lane: str,
+        store: QAArtifactStore,
+    ) -> Optional[PaperCandidate]:
+        if provider_name == "openalex":
+            return self._candidate_from_openalex(raw_item=raw_item, lane=lane, store=store)
+        if provider_name == "semantic_scholar":
+            return self._candidate_from_semantic_scholar(raw_item=raw_item, lane=lane, store=store)
+        if provider_name == "crossref":
+            return self._candidate_from_crossref(raw_item=raw_item, lane=lane, store=store)
+        return None
 
     def _candidate_from_openalex(
         self,
@@ -175,6 +217,74 @@ class RetrieverNode:
             ranking_features={},
             provider_artifacts={"openalex": artifact_path},
             oa_url=oa_url,
+        )
+
+    def _candidate_from_semantic_scholar(
+        self,
+        raw_item: Dict[str, Any],
+        lane: str,
+        store: QAArtifactStore,
+    ) -> Optional[PaperCandidate]:
+        title = normalize_text(raw_item.get("title"))
+        if not title:
+            return None
+        doi = normalize_doi(((raw_item.get("externalIds") or {}).get("DOI")) or raw_item.get("doi"))
+        year = raw_item.get("year")
+        abstract = normalize_text(raw_item.get("abstract")) or None
+        authors = flatten_author_names(raw_item.get("authors"))
+        venue = normalize_text(raw_item.get("venue")) or None
+        oa_url = ((raw_item.get("openAccessPdf") or {}).get("url")) or raw_item.get("url")
+        paper_id = stable_paper_id(doi=doi, title=title, year=year)
+        artifact_path = store.write_json(f"provider_raw/semantic_scholar/{paper_id}.json", raw_item)
+        candidate = PaperCandidate(
+            paper_id=paper_id,
+            doi=doi,
+            title=title,
+            abstract=abstract,
+            authors=authors,
+            year=year,
+            venue=venue,
+            provider_hits=["semantic_scholar"],
+            lane_sources=[lane],
+            ranking_features={},
+            provider_artifacts={"semantic_scholar": artifact_path},
+            oa_url=oa_url,
+        )
+        citation_count = raw_item.get("citationCount")
+        if citation_count is not None:
+            candidate.ranking_features["citation_count"] = int(citation_count or 0)
+        return candidate
+
+    def _candidate_from_crossref(
+        self,
+        raw_item: Dict[str, Any],
+        lane: str,
+        store: QAArtifactStore,
+    ) -> Optional[PaperCandidate]:
+        titles = raw_item.get("title") or []
+        title = normalize_text(titles[0] if isinstance(titles, list) and titles else titles)
+        if not title:
+            return None
+        doi = normalize_doi(raw_item.get("DOI") or raw_item.get("doi"))
+        year = self._extract_crossref_year(raw_item)
+        authors = flatten_author_names(raw_item.get("author"))
+        venue_titles = raw_item.get("container-title") or []
+        venue = normalize_text(venue_titles[0] if isinstance(venue_titles, list) and venue_titles else venue_titles) or None
+        abstract = normalize_text(raw_item.get("abstract")) or None
+        paper_id = stable_paper_id(doi=doi, title=title, year=year)
+        artifact_path = store.write_json(f"provider_raw/crossref/{paper_id}.json", raw_item)
+        return PaperCandidate(
+            paper_id=paper_id,
+            doi=doi,
+            title=title,
+            abstract=abstract,
+            authors=authors,
+            year=year,
+            venue=venue,
+            provider_hits=["crossref"],
+            lane_sources=[lane],
+            ranking_features={},
+            provider_artifacts={"crossref": artifact_path},
         )
 
     def _extract_openalex_abstract(self, raw_item: Dict[str, Any]) -> Optional[str]:

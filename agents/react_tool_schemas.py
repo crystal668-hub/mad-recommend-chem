@@ -39,6 +39,19 @@ class SearchPapersToolInput(ToolArgsModel):
     )
 
 
+class ScreenPapersToolInput(ToolArgsModel):
+    paper_ids: List[StrictStr] = Field(
+        default_factory=list,
+        description="Optional stable paper identifiers to screen; defaults to the current cycle's searched papers.",
+    )
+    max_candidates: StrictInt = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum number of candidate papers to lock for acquisition after screening.",
+    )
+
+
 class ReviewerSearchPapersToolInput(SearchPapersToolInput):
     lane: StrictStr = Field(
         default="contrarian",
@@ -183,7 +196,12 @@ class AnswerSubmissionToolInput(ToolArgsModel):
 
 
 class ProposerConcludeToolInput(ToolArgsModel):
-    submission: AnswerSubmissionToolInput = Field(description="Final canonical AnswerSubmission payload.")
+    submission: AnswerSubmissionToolInput = Field(
+        description=(
+            "Final canonical AnswerSubmission payload. This is the only top-level conclude argument: "
+            "call conclude with exactly {'submission': {...}} and do not rename the wrapper key or pass a bare payload."
+        )
+    )
 
 
 class ReviewItemToolInput(ToolArgsModel):

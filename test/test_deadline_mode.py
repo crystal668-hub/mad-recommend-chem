@@ -189,7 +189,7 @@ class _DeadlineBlockedSearchBackend:
             return _AIMessage(content="Need more search.")
         if tool_choice == "conclude":
             saw_policy_tool_message = any(
-                "retrieval is disabled when only 2 steps remain" in str(getattr(message, "content", "") or "")
+                "broad discovery is disabled when only 2 steps remain" in str(getattr(message, "content", "") or "")
                 for message in list(messages or [])
             )
             if saw_policy_tool_message:
@@ -213,6 +213,88 @@ class _DeadlineBlockedSearchBackend:
                         "id": "call_search_1",
                         "name": "search_papers",
                         "args": {"query": "pt/c her"},
+                    }
+                ],
+            )
+        return _AIMessage(content="Thought.")
+
+
+class _DeadlineFollowupRetrievalBackend:
+    def __init__(self) -> None:
+        self.action_calls = 0
+
+    def invoke(self, messages, *, tool_choice: str | None = None):
+        history_text = "\n".join(str(getattr(message, "content", "") or "") for message in list(messages or []))
+        last_content = str(getattr(messages[-1], "content", "") or "")
+        if "CURRENT PHASE: THOUGHT" in last_content:
+            return _AIMessage(content="Acquire the best paper and extract evidence before conclude.")
+        if tool_choice == "conclude":
+            return _AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_conclude_structured",
+                        "name": "conclude",
+                        "args": {"submission": {"submission_id": "submission_cycle_1"}},
+                    }
+                ],
+            )
+        if "CURRENT PHASE: ACTION" in history_text:
+            self.action_calls += 1
+            return _AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_search_1",
+                        "name": "search_papers",
+                        "args": {"query": "pt/c her"},
+                    },
+                    {
+                        "id": "call_acquire_1",
+                        "name": "acquire_document",
+                        "args": {"paper_id": "paper-1"},
+                    },
+                    {
+                        "id": "call_extract_1",
+                        "name": "extract_evidence",
+                        "args": {"paper_id": "paper-1"},
+                    },
+                ],
+            )
+        return _AIMessage(content="Thought.")
+
+
+class _DeadlineLastChanceExtractBackend:
+    def __init__(self) -> None:
+        self.action_calls = 0
+        self.conclude_messages = []
+
+    def invoke(self, messages, *, tool_choice: str | None = None):
+        history_text = "\n".join(str(getattr(message, "content", "") or "") for message in list(messages or []))
+        last_content = str(getattr(messages[-1], "content", "") or "")
+        if "CURRENT PHASE: THOUGHT" in last_content:
+            return _AIMessage(content="Acquire a relevant paper before concluding.")
+        if tool_choice == "conclude":
+            self.conclude_messages = list(messages or [])
+            return _AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_conclude_structured",
+                        "name": "conclude",
+                        "args": {"submission": {"submission_id": "submission_cycle_1"}},
+                    }
+                ],
+            )
+        if "CURRENT PHASE: ACTION" in history_text:
+            self.action_calls += 1
+            return _AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_acquire_1",
+                        "name": "acquire_document",
+                        "args": {"paper_id": "paper-1"},
                     }
                 ],
             )
@@ -517,7 +599,168 @@ class DeadlineModeTests(unittest.TestCase):
         self.assertEqual({"kind": "submission", "payload": {"submission_id": "submission_cycle_1"}}, response.structured_output)
         self.assertEqual("conclude", trajectory.steps[-1].action)
 
+    def test_structured_deadline_allows_followup_retrieval_tools_before_forced_conclude(self):
+        from agents.react_agent import ReActAgent, ToolResult
+
+        backend = _DeadlineFollowupRetrievalBackend()
+        llm = _ReactiveLLM(backend)
+        executed: list[str] = []
+
+        def _search(_payload):
+            executed.append("search_papers")
+            return ToolResult(observation="[]", data=[])
+
+        def _acquire(_payload):
+            executed.append("acquire_document")
+            return ToolResult(observation='{"paper_id":"paper-1"}', data={"paper_id": "paper-1"})
+
+        def _extract(_payload):
+            executed.append("extract_evidence")
+            return ToolResult(observation='{"evidence":["ev-1"]}', data={"evidence": ["ev-1"]})
+
+        def _conclude(_payload):
+            return ToolResult(
+                observation='{"submission_id":"submission_cycle_1"}',
+                data={"__conclude_valid__": True, "submission": {"submission_id": "submission_cycle_1"}},
+            )
+
+        search_tool = _InvokeTool(_search)
+        acquire_tool = _InvokeTool(_acquire)
+        extract_tool = _InvokeTool(_extract)
+        conclude_tool = _InvokeTool(_conclude)
+
+        with patch(
+            "agents.react_agent._lazy_langchain_imports",
+            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
+        ):
+            agent = ReActAgent(
+                agent_id="t8",
+                name="test",
+                model_config={"deadline_mode": True},
+                rag_system=None,
+                experience_store=None,
+                system_prompt="",
+                max_react_steps=10,
+                verbose=False,
+                tools=[search_tool, acquire_tool, extract_tool, conclude_tool],
+                search_tool_names=["search_papers", "acquire_document", "extract_evidence"],
+                analysis_tool_names=["conclude"],
+                conclude_argument_name="submission",
+                conclude_output_kind="submission",
+            )
+
+            with patch.object(agent, "_get_llm", return_value=llm), patch.object(
+                agent,
+                "_build_tools",
+                return_value=(
+                    [search_tool, acquire_tool, extract_tool, conclude_tool],
+                    {
+                        "search_papers": search_tool,
+                        "acquire_document": acquire_tool,
+                        "extract_evidence": extract_tool,
+                        "conclude": conclude_tool,
+                    },
+                ),
+            ):
+                response, trajectory = agent.generate_response_with_react(
+                    query="Return a structured submission.",
+                    max_steps_override=2,
+                )
+
+        self.assertEqual(["acquire_document", "extract_evidence"], executed)
+        self.assertEqual({"kind": "submission", "payload": {"submission_id": "submission_cycle_1"}}, response.structured_output)
+        self.assertEqual("conclude", trajectory.steps[-1].action)
+
+    def test_structured_deadline_last_chance_extract_runs_before_forced_conclude(self):
+        from agents.react_agent import ReActAgent, ToolResult
+
+        backend = _DeadlineLastChanceExtractBackend()
+        llm = _ReactiveLLM(backend)
+        executed: list[str] = []
+
+        def _acquire(_payload):
+            executed.append("acquire_document")
+            return ToolResult(observation='{"paper_id":"paper-1"}', data={"paper_id": "paper-1"})
+
+        def _extract(_payload):
+            executed.append("extract_evidence")
+            return ToolResult(observation='{"evidence":["ev-1"]}', data={"evidence": [{"evidence_id": "ev-1"}]})
+
+        def _conclude(_payload):
+            return ToolResult(
+                observation='{"submission_id":"submission_cycle_1"}',
+                data={"__conclude_valid__": True, "submission": {"submission_id": "submission_cycle_1"}},
+            )
+
+        acquire_tool = _InvokeTool(_acquire)
+        extract_tool = _InvokeTool(_extract)
+        conclude_tool = _InvokeTool(_conclude)
+
+        with patch(
+            "agents.react_agent._lazy_langchain_imports",
+            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
+        ):
+            agent = ReActAgent(
+                agent_id="t9",
+                name="test",
+                model_config={"deadline_mode": True},
+                rag_system=None,
+                experience_store=None,
+                system_prompt="",
+                max_react_steps=10,
+                verbose=False,
+                tools=[acquire_tool, extract_tool, conclude_tool],
+                search_tool_names=["acquire_document", "extract_evidence"],
+                analysis_tool_names=["conclude"],
+                conclude_argument_name="submission",
+                conclude_output_kind="submission",
+            )
+
+            with patch.object(agent, "_get_llm", return_value=llm), patch.object(
+                agent,
+                "_build_tools",
+                return_value=(
+                    [acquire_tool, extract_tool, conclude_tool],
+                    {
+                        "acquire_document": acquire_tool,
+                        "extract_evidence": extract_tool,
+                        "conclude": conclude_tool,
+                    },
+                ),
+            ):
+                response, trajectory = agent.generate_response_with_react(
+                    query="Return a structured submission.",
+                    max_steps_override=2,
+                )
+
+        self.assertEqual(["acquire_document", "extract_evidence"], executed)
+        self.assertEqual({"kind": "submission", "payload": {"submission_id": "submission_cycle_1"}}, response.structured_output)
+        self.assertEqual("conclude", trajectory.steps[-1].action)
+        synthetic_message = next(
+            (
+                message
+                for message in backend.conclude_messages
+                if any(
+                    str((call or {}).get("name") or "") == "extract_evidence"
+                    for call in list(getattr(message, "tool_calls", None) or [])
+                )
+            ),
+            None,
+        )
+        self.assertIsNotNone(synthetic_message)
+        self.assertEqual({}, getattr(synthetic_message, "additional_kwargs", {}))
+        self.assertEqual(
+            [
+                {
+                    "id": "deadline_extract_1",
+                    "name": "extract_evidence",
+                    "args": {"paper_id": "paper-1", "preferred_sections": True},
+                    "type": "tool_call",
+                }
+            ],
+            getattr(synthetic_message, "tool_calls", None),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
-

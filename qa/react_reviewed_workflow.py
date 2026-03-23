@@ -60,6 +60,7 @@ MIN_REACT_REVIEWED_PROPOSER_STEPS = 6
 PROPOSER_TOOL_NAMES = (
     "plan_queries",
     "search_papers",
+    "screen_papers",
     "acquire_document",
     "read_sections",
     "extract_evidence",
@@ -114,6 +115,39 @@ DEFAULT_REVIEWER_BUDGET_BY_ROLE: Dict[ReviewerRole, int] = {
     "counterevidence": 2,
 }
 
+_SCREENING_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "be",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "it",
+    "media",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "under",
+    "vs",
+    "what",
+    "when",
+    "where",
+    "which",
+    "why",
+}
+
 
 def _lazy_structured_tool_import():
     try:
@@ -155,6 +189,271 @@ def _merge_unique_text(existing: Optional[Sequence[str]], extra: Optional[Sequen
         seen.add(key)
         merged.append(cleaned)
     return merged
+
+
+def _paper_title_fallback(workspace: "ReactReviewedWorkspace", paper_id: str) -> Optional[str]:
+    record = workspace.paper_records.get(str(paper_id or "").strip())
+    if record is not None and _compact_text(getattr(record, "title", None)):
+        return _compact_text(getattr(record, "title", None))
+    candidate = workspace.paper_candidates.get(str(paper_id or "").strip())
+    if candidate is not None and _compact_text(getattr(candidate, "title", None)):
+        return _compact_text(getattr(candidate, "title", None))
+    return None
+
+
+def _primary_screen_entity_terms(entity_pack: EntityPack) -> List[str]:
+    terms: List[str] = []
+    candidate_axes = {"catalyst", "material", "substrate", "electrode", "support"}
+    for condition in list(getattr(entity_pack, "condition_mentions", []) or []):
+        axis = str(getattr(condition, "axis", "") or "").strip().lower()
+        if axis not in candidate_axes:
+            continue
+        for value in (
+            getattr(condition, "raw_value", None),
+            getattr(condition, "normalized_value", None),
+        ):
+            cleaned = _compact_text(value).lower()
+            if cleaned:
+                terms.append(cleaned)
+    for entity in list(getattr(entity_pack, "entities", []) or []):
+        entity_type = str(getattr(entity, "entity_type", "") or "").strip().lower()
+        if entity_type not in {"catalyst", "material", "molecule", "electrode", "support"}:
+            continue
+        for value in (
+            getattr(entity, "canonical_name", None),
+            *(list(getattr(entity, "aliases", []) or [])),
+            *(list(getattr(entity, "query_anchors", []) or [])),
+        ):
+            cleaned = _compact_text(value).lower()
+            if cleaned:
+                terms.append(cleaned)
+    deduped: List[str] = []
+    seen = set()
+    for term in sorted(terms, key=len, reverse=True):
+        if term in seen:
+            continue
+        seen.add(term)
+        deduped.append(term)
+    return deduped
+
+
+def _is_review_like_title(title: Optional[str]) -> bool:
+    normalized_title = _compact_text(title).lower()
+    return any(
+        marker in normalized_title
+        for marker in ("review", "perspective", "overview", "progress", "advance", "advances", "descriptor")
+    )
+
+
+def _mentions_primary_entity_only_as_comparator(*, abstract: Optional[str], primary_terms: Sequence[str]) -> bool:
+    normalized_abstract = _compact_text(abstract).lower()
+    if not normalized_abstract:
+        return False
+    comparator_markers = (
+        "commercial ",
+        "benchmark ",
+        "compared to ",
+        "compared with ",
+        "than ",
+        "vs ",
+        "versus ",
+        "relative to ",
+    )
+    for term in list(primary_terms or [])[:4]:
+        normalized_term = _compact_text(term).lower()
+        if not normalized_term:
+            continue
+        start = normalized_abstract.find(normalized_term)
+        if start < 0:
+            continue
+        window_start = max(0, start - 32)
+        window_end = min(len(normalized_abstract), start + len(normalized_term) + 32)
+        window = normalized_abstract[window_start:window_end]
+        if any(marker in window for marker in comparator_markers):
+            return True
+    return False
+
+
+def _screen_query_terms(task_spec: TaskSpec, entity_pack: EntityPack) -> List[str]:
+    terms: List[str] = []
+    for entity in entity_pack.entities:
+        canonical = _compact_text(entity.canonical_name).lower()
+        if canonical:
+            terms.append(canonical)
+        for anchor in entity.query_anchors:
+            cleaned = _compact_text(anchor).lower()
+            if cleaned:
+                terms.append(cleaned)
+    for term in task_spec.query_constraints.must_include_terms:
+        cleaned = _compact_text(term).lower()
+        if cleaned:
+            terms.append(cleaned)
+    for token in re.findall(r"[a-z0-9][a-z0-9/+\-.]*", str(task_spec.normalized_question or "").lower()):
+        if len(token) < 3 and not any(char.isdigit() for char in token):
+            continue
+        if token in _SCREENING_STOPWORDS:
+            continue
+        terms.append(token)
+    deduped: List[str] = []
+    seen = set()
+    for term in terms:
+        if term in seen:
+            continue
+        seen.add(term)
+        deduped.append(term)
+    return deduped
+
+
+def _paper_relevance_metrics(
+    *,
+    task_spec: TaskSpec,
+    entity_pack: EntityPack,
+    title: Optional[str],
+    abstract: Optional[str],
+) -> Dict[str, Any]:
+    normalized_title = _compact_text(title).lower()
+    normalized_abstract = _compact_text(abstract).lower()
+    corpus = f"{normalized_title} {normalized_abstract}".strip()
+    query_terms = _screen_query_terms(task_spec, entity_pack)
+    title_matches = [term for term in query_terms if term and term in normalized_title]
+    abstract_matches = [term for term in query_terms if term and term in normalized_abstract]
+    corpus_matches = [term for term in query_terms if term and term in corpus]
+    question_terms = [
+        term
+        for term in re.findall(r"[a-z0-9][a-z0-9/+\-.]*", str(task_spec.normalized_question or "").lower())
+        if (len(term) >= 3 or any(char.isdigit() for char in term)) and term not in _SCREENING_STOPWORDS
+    ]
+    question_hits = [term for term in question_terms if term and term in corpus]
+    return {
+        "title_hits": len(title_matches),
+        "abstract_hits": len(abstract_matches),
+        "question_hits": len(question_hits),
+        "matched_terms": corpus_matches[:8],
+        "has_abstract": bool(normalized_abstract),
+    }
+
+
+def _paper_has_useful_abstract_support(
+    *,
+    task_spec: TaskSpec,
+    entity_pack: EntityPack,
+    title: Optional[str],
+    abstract: Optional[str],
+) -> bool:
+    metrics = _paper_relevance_metrics(
+        task_spec=task_spec,
+        entity_pack=entity_pack,
+        title=title,
+        abstract=abstract,
+    )
+    if not metrics["has_abstract"]:
+        return False
+    if metrics["abstract_hits"] >= 2:
+        return True
+    if metrics["abstract_hits"] >= 1 and metrics["title_hits"] >= 1:
+        return True
+    return metrics["question_hits"] >= 2
+
+
+def _review_item_priority_terms(open_review_items: Sequence[ReviewItem]) -> List[str]:
+    source_text = " ".join(
+        _compact_text(part)
+        for item in list(open_review_items or [])
+        for part in (item.critique, item.required_action)
+        if _compact_text(part)
+    ).lower()
+    candidate_terms = [
+        "overpotential",
+        "tafel",
+        "exchange current",
+        "mass activity",
+        "specific activity",
+        "pt foil",
+        "pt black",
+        "unsupported pt",
+        "commercial pt/c",
+        "baseline",
+        "comparator",
+        "1.0 m koh",
+        "0.1 m koh",
+        "koh",
+        "naoh",
+        "rde",
+        "mea",
+    ]
+    return [term for term in candidate_terms if term in source_text]
+
+
+def _evidence_item_priority_score(item: EvidenceItem) -> float:
+    snippet = _compact_text(item.snippet)
+    lowered_snippet = snippet.lower()
+    lowered_notes = _compact_text(item.extraction_notes).lower()
+    score = 4.0 * float(getattr(item, "extraction_confidence", 0.0) or 0.0)
+    if str(getattr(item, "source_layer", "") or "").strip().lower() == "fulltext":
+        score += 3.0
+    if str(getattr(item, "role", "") or "").strip().lower() == "observation":
+        score += 1.4
+    elif str(getattr(item, "role", "") or "").strip().lower() == "mechanism":
+        score += 1.0
+    elif str(getattr(item, "role", "") or "").strip().lower() == "condition":
+        score += 0.8
+    score += 0.7 * float(min(len(list(getattr(item, "metric_mentions", []) or [])), 3))
+    score += 0.45 * float(min(len(list(getattr(item, "conditions", {}) or {})), 3))
+    if str(getattr(item, "claim_polarity", "") or "").strip().lower() in {"support", "oppose"}:
+        score += 0.5
+    if str(getattr(item, "section_type", "") or "").strip().lower() in {"results", "discussion", "abstract"}:
+        score += 0.4
+    if len(snippet) < 40:
+        score -= 2.0
+    if len(snippet.split()) < 6:
+        score -= 1.5
+    if snippet.endswith(("0.", "between 0.", "between 0")):
+        score -= 1.0
+    if any(
+        marker in lowered_notes
+        for marker in ("administrative", "address-like", "truncated", "incomplete", "no comparative outcome")
+    ):
+        score -= 2.5
+    if any(marker in lowered_snippet for marker in ("institut universitaire", "boulevard", "paris - france")):
+        score -= 3.0
+    return round(score, 4)
+
+
+def _align_step_refs_to_trajectory(raw_payload: Dict[str, Any], trajectory_id: Optional[str]) -> Dict[str, Any]:
+    normalized_trajectory_id = _compact_text(trajectory_id)
+    if not normalized_trajectory_id:
+        return raw_payload
+
+    def _normalize_step_refs(values: Any) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for item in list(_normalize_list_payload(values) or []):
+            if isinstance(item, dict):
+                step_number = item.get("step_number")
+                try:
+                    parsed_step_number = max(1, int(step_number))
+                except (TypeError, ValueError):
+                    parsed_step_number = 1
+                normalized.append(
+                    {
+                        **item,
+                        "trajectory_id": normalized_trajectory_id,
+                        "step_number": parsed_step_number,
+                    }
+                )
+        return normalized or [{"trajectory_id": normalized_trajectory_id, "step_number": 1}]
+
+    raw_payload["trajectory_id"] = normalized_trajectory_id
+    raw_payload["step_refs"] = _normalize_step_refs(raw_payload.get("step_refs"))
+    normalized_sections: List[Dict[str, Any]] = []
+    for section_payload in list(_normalize_list_payload(raw_payload.get("sections")) or []):
+        if not isinstance(section_payload, dict):
+            continue
+        current = copy.deepcopy(section_payload)
+        current["step_refs"] = _normalize_step_refs(current.get("step_refs"))
+        normalized_sections.append(current)
+    if normalized_sections:
+        raw_payload["sections"] = normalized_sections
+    return raw_payload
 
 
 def _confidence(level_score: float, rationale: str) -> SubmissionConfidenceRating:
@@ -464,6 +763,7 @@ class ReactReviewedProposerExecutionError(RuntimeError):
 class _ProposerRunState:
     evidence_policy: str
     query_plan_ids: List[str] = field(default_factory=list)
+    search_ordered_paper_ids: List[str] = field(default_factory=list)
     searched_paper_ids: set[str] = field(default_factory=set)
     acquired_paper_ids: set[str] = field(default_factory=set)
     evidence_ids: set[str] = field(default_factory=set)
@@ -472,6 +772,11 @@ class _ProposerRunState:
     evidence_layers_by_id: Dict[str, str] = field(default_factory=dict)
     fulltext_status_by_paper: Dict[str, str] = field(default_factory=dict)
     fulltext_available_by_paper: Dict[str, bool] = field(default_factory=dict)
+    search_generation: int = 0
+    screening_generation: int = 0
+    locked_candidate_paper_ids: List[str] = field(default_factory=list)
+    dropped_candidate_paper_ids: List[str] = field(default_factory=list)
+    candidate_screening: List[Dict[str, Any]] = field(default_factory=list)
 
     def record_plan_queries(self, payload: Sequence[Dict[str, Any]]) -> None:
         for item in list(payload or []):
@@ -480,10 +785,31 @@ class _ProposerRunState:
                 self.query_plan_ids.append(query_plan_id)
 
     def record_search_results(self, payload: Sequence[Dict[str, Any]]) -> None:
+        self.search_generation += 1
         for item in list(payload or []):
             paper_id = str(item.get("paper_id") or "").strip()
             if paper_id:
                 self.searched_paper_ids.add(paper_id)
+                if paper_id not in self.search_ordered_paper_ids:
+                    self.search_ordered_paper_ids.append(paper_id)
+
+    def record_screening(self, payload: Dict[str, Any]) -> None:
+        self.screening_generation = self.search_generation
+        self.locked_candidate_paper_ids = [
+            str(paper_id).strip()
+            for paper_id in list((payload or {}).get("locked_paper_ids") or [])
+            if str(paper_id).strip()
+        ]
+        self.dropped_candidate_paper_ids = [
+            str(paper_id).strip()
+            for paper_id in list((payload or {}).get("dropped_paper_ids") or [])
+            if str(paper_id).strip()
+        ]
+        self.candidate_screening = [
+            copy.deepcopy(item)
+            for item in list((payload or {}).get("ranked_candidates") or [])
+            if isinstance(item, dict)
+        ]
 
     def record_acquisition(self, payload: Dict[str, Any]) -> None:
         paper_id = str((payload or {}).get("paper_id") or "").strip()
@@ -527,6 +853,9 @@ class _ProposerRunState:
     def has_any_evidence(self) -> bool:
         return bool(self.evidence_ids)
 
+    def screening_required(self) -> bool:
+        return bool(self.searched_paper_ids) and self.screening_generation < self.search_generation
+
     def fulltext_evidence_ids_for_paper(self, paper_id: str) -> set[str]:
         return {
             evidence_id
@@ -538,9 +867,15 @@ class _ProposerRunState:
         return {
             "evidence_policy": self.evidence_policy,
             "query_plan_ids": list(self.query_plan_ids),
+            "search_generation": self.search_generation,
+            "screening_generation": self.screening_generation,
             "searched_paper_ids": sorted(self.searched_paper_ids),
+            "search_ordered_paper_ids": list(self.search_ordered_paper_ids),
+            "locked_candidate_paper_ids": list(self.locked_candidate_paper_ids),
+            "dropped_candidate_paper_ids": list(self.dropped_candidate_paper_ids),
             "acquired_paper_ids": sorted(self.acquired_paper_ids),
             "evidence_ids": sorted(self.evidence_ids),
+            "candidate_screening": copy.deepcopy(self.candidate_screening),
             "fulltext_status_by_paper": {
                 paper_id: self.fulltext_status_by_paper.get(paper_id)
                 for paper_id in sorted(self.fulltext_status_by_paper)
@@ -1188,7 +1523,7 @@ class ReactReviewedWorkspace:
             exclude_terms=[],
             year_from=self.task_spec.year_from,
             year_to=self.task_spec.year_to,
-            preferred_sources=["openalex", "crossref", "semantic_scholar"],
+            preferred_sources=["openalex", "semantic_scholar", "crossref"],
         )
         ad_hoc_id = self._register_query_plan(query_plan, prefix="ad_hoc")
         with self._state_lock:
@@ -1644,12 +1979,27 @@ class ReactReviewedWorkspace:
             return evidence_item.model_dump(exclude_none=True)
         with self._state_lock:
             current_submission = self.current_submission
+            evidence_items = dict(self.evidence_items)
         if citation_id and current_submission is not None:
             citation = next(
                 (item for item in current_submission.citations if item.citation_id == str(citation_id)),
                 None,
             )
             if citation is not None:
+                if evidence_id is None and citation.evidence_ids:
+                    evidence_payloads = [
+                        evidence_items[evidence_ref].model_dump(exclude_none=True)
+                        for evidence_ref in list(citation.evidence_ids)
+                        if evidence_ref in evidence_items
+                    ]
+                    if evidence_payloads:
+                        return {
+                            "citation_id": citation.citation_id,
+                            "paper_id": citation.paper_id,
+                            "section_ids": list(citation.section_ids or []),
+                            "evidence_ids": list(citation.evidence_ids or []),
+                            "evidence": evidence_payloads,
+                        }
                 paper_id = citation.paper_id
                 if section_id is None and citation.section_ids:
                     section_id = citation.section_ids[0]
@@ -1865,6 +2215,279 @@ class ReactReviewedProposerAgent:
         self.repair_attempts = max(0, int(repair_attempts))
         self.evidence_policy = str(evidence_policy or "prefer_fulltext").strip().lower() or "prefer_fulltext"
 
+    def _score_screen_candidate(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        candidate: PaperCandidate,
+        open_review_items: Sequence[ReviewItem],
+    ) -> Dict[str, Any]:
+        metrics = _paper_relevance_metrics(
+            task_spec=workspace.task_spec,
+            entity_pack=workspace.entity_pack,
+            title=candidate.title,
+            abstract=candidate.abstract,
+        )
+        review_priority_terms = _review_item_priority_terms(open_review_items)
+        normalized_corpus = _compact_text(f"{candidate.title} {candidate.abstract or ''}").lower()
+        review_term_hits = [term for term in review_priority_terms if term and term in normalized_corpus]
+        primary_entity_terms = _primary_screen_entity_terms(workspace.entity_pack)
+        normalized_title = _compact_text(candidate.title).lower()
+        normalized_abstract = _compact_text(candidate.abstract).lower()
+        primary_title_hits = [term for term in primary_entity_terms if term and term in normalized_title]
+        primary_abstract_hits = [term for term in primary_entity_terms if term and term in normalized_abstract]
+        provider_count = len({str(item).strip().lower() for item in candidate.provider_hits if str(item).strip()})
+        provider_hits = {str(item).strip().lower() for item in candidate.provider_hits if str(item).strip()}
+        has_oa_url = bool(_compact_text(candidate.oa_url))
+        has_doi = bool(_compact_text(candidate.doi))
+        fulltext_signal_score = (3.0 if has_oa_url else 0.0) + (1.5 if has_doi else 0.0) + (
+            0.5 if provider_count >= 2 else 0.0
+        )
+        provider_priority_score = (
+            (1.25 if "openalex" in provider_hits else 0.0)
+            + (0.75 if "semantic_scholar" in provider_hits else 0.0)
+            - (0.75 if provider_hits == {"crossref"} else 0.0)
+        )
+        acquisition_risk = "low" if has_oa_url or (has_doi and provider_count >= 2) else "medium" if has_doi or has_oa_url else "high"
+        generic_abstract_penalty = 3.0 if metrics["has_abstract"] and metrics["abstract_hits"] == 0 and metrics["question_hits"] <= 1 else 0.0
+        missing_abstract_penalty = 1.5 if not metrics["has_abstract"] else 0.0
+        exact_primary_alignment = bool(primary_title_hits)
+        strong_primary_alignment = exact_primary_alignment or len(primary_abstract_hits) >= 2
+        weak_primary_alignment = not strong_primary_alignment and bool(primary_abstract_hits)
+        review_like = _is_review_like_title(candidate.title)
+        comparator_only_primary_reference = _mentions_primary_entity_only_as_comparator(
+            abstract=candidate.abstract,
+            primary_terms=primary_entity_terms,
+        )
+        score = (
+            4.0 * float(candidate.retrieval_score or 0.0)
+            + 2.5 * float(metrics["title_hits"])
+            + 2.0 * float(metrics["abstract_hits"])
+            + 1.5 * float(metrics["question_hits"])
+            + 1.25 * float(min(len(review_term_hits), 4))
+            + fulltext_signal_score
+            + provider_priority_score
+            + (4.5 if exact_primary_alignment else 1.5 if strong_primary_alignment else 0.0)
+            - generic_abstract_penalty
+            - missing_abstract_penalty
+            - (2.5 if weak_primary_alignment else 0.0)
+            - (3.5 if review_like and not exact_primary_alignment else 0.0)
+            - (4.5 if comparator_only_primary_reference and not exact_primary_alignment else 0.0)
+        )
+        should_drop = (
+            metrics["title_hits"] == 0
+            and metrics["abstract_hits"] == 0
+            and metrics["question_hits"] == 0
+        ) or (acquisition_risk == "high" and metrics["abstract_hits"] == 0 and metrics["question_hits"] <= 1) or (
+            bool(primary_entity_terms)
+            and not exact_primary_alignment
+            and not strong_primary_alignment
+            and not _paper_has_useful_abstract_support(
+                task_spec=workspace.task_spec,
+                entity_pack=workspace.entity_pack,
+                title=candidate.title,
+                abstract=candidate.abstract,
+            )
+        ) or (
+            review_like and not exact_primary_alignment and metrics["abstract_hits"] <= 2
+        ) or (
+            comparator_only_primary_reference and not exact_primary_alignment
+        )
+        return {
+            "paper_id": candidate.paper_id,
+            "title": candidate.title,
+            "retrieval_score": round(float(candidate.retrieval_score or 0.0), 4),
+            "screen_score": round(score, 4),
+            "decision": "drop" if should_drop else "lock",
+            "reason": (
+                "Low question relevance or weak acquisition signal."
+                if should_drop
+                else "Strong question alignment with better full-text acquisition signal."
+            ),
+            "matched_terms": metrics["matched_terms"],
+            "review_term_hits": review_term_hits,
+            "title_hits": metrics["title_hits"],
+            "abstract_hits": metrics["abstract_hits"],
+            "question_hits": metrics["question_hits"],
+            "has_abstract": metrics["has_abstract"],
+            "has_doi": has_doi,
+            "has_oa_url": has_oa_url,
+            "provider_count": provider_count,
+            "acquisition_risk": acquisition_risk,
+            "primary_title_hits": primary_title_hits,
+            "primary_abstract_hits": primary_abstract_hits,
+            "review_like": review_like,
+            "comparator_only_primary_reference": comparator_only_primary_reference,
+        }
+
+    def _llm_screen_candidate_papers(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        cycle_number: int,
+        open_review_items: Sequence[ReviewItem],
+        ranked_candidates: Sequence[Dict[str, Any]],
+        max_candidates: int,
+    ) -> Optional[Dict[str, Any]]:
+        provider, model_name, has_api_key = describe_chat_model_config(self.model_config)
+        if not provider or not model_name or not has_api_key:
+            return None
+        llm = build_chat_model_from_config(self.model_config)
+        raw_response = invoke_llm(
+            llm,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are screening retrieved chemistry papers before document acquisition.\n"
+                        "Return STRICT JSON only.\n"
+                        "Return EXACTLY {\"locked_paper_ids\": [...], \"dropped_paper_ids\": [...], \"decisions\": [...]}.\n"
+                        "Each decisions item must be {\"paper_id\": str, \"decision\": \"lock\"|\"drop\", \"reason\": str}.\n"
+                        "Prefer papers that are strongly relevant to the exact question and have better full-text acquisition signals.\n"
+                        "Drop papers whose abstract/metadata are generic, weakly related, or likely to fail acquisition.\n"
+                        f"Lock at most {max_candidates} papers.\n"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": _json_preview(
+                        {
+                            "cycle_number": cycle_number,
+                            "question": workspace.question,
+                            "task_spec": workspace.task_spec.model_dump(exclude_none=True),
+                            "entity_pack": workspace.entity_pack.model_dump(exclude_none=True),
+                            "open_review_items": [item.model_dump(exclude_none=True) for item in open_review_items],
+                            "candidates": list(ranked_candidates),
+                        },
+                        limit=16000,
+                    ),
+                },
+            ],
+        )
+        parsed = parse_json_payload(raw_response)
+        if not isinstance(parsed, dict):
+            return None
+        allowed_ids = {str(item.get("paper_id") or "").strip() for item in ranked_candidates if str(item.get("paper_id") or "").strip()}
+        decisions = []
+        decision_map: Dict[str, Dict[str, Any]] = {}
+        for item in list(parsed.get("decisions") or []):
+            if not isinstance(item, dict):
+                continue
+            paper_id = str(item.get("paper_id") or "").strip()
+            decision = str(item.get("decision") or "").strip().lower()
+            reason = _compact_text(item.get("reason"))
+            if paper_id not in allowed_ids or decision not in {"lock", "drop"} or not reason:
+                continue
+            current = {"paper_id": paper_id, "decision": decision, "reason": reason}
+            decisions.append(current)
+            decision_map[paper_id] = current
+        if not decisions:
+            return None
+        locked_paper_ids: List[str] = []
+        dropped_paper_ids: List[str] = []
+        ranked_payload: List[Dict[str, Any]] = []
+        for item in ranked_candidates:
+            paper_id = str(item.get("paper_id") or "").strip()
+            llm_decision = decision_map.get(paper_id)
+            base_decision = str(item.get("decision") or "drop")
+            decision = llm_decision["decision"] if llm_decision else base_decision
+            if base_decision == "drop":
+                decision = "drop"
+            reason = llm_decision["reason"] if llm_decision else _compact_text(item.get("reason"))
+            current = copy.deepcopy(item)
+            current["decision"] = decision
+            current["reason"] = reason
+            ranked_payload.append(current)
+            if decision == "lock" and paper_id not in locked_paper_ids and len(locked_paper_ids) < max_candidates:
+                locked_paper_ids.append(paper_id)
+            elif paper_id not in dropped_paper_ids:
+                dropped_paper_ids.append(paper_id)
+        if not locked_paper_ids:
+            return None
+        return {
+            "locked_paper_ids": locked_paper_ids,
+            "dropped_paper_ids": dropped_paper_ids,
+            "ranked_candidates": ranked_payload,
+            "llm_screening_used": True,
+        }
+
+    def _screen_candidate_papers(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        cycle_number: int,
+        open_review_items: Sequence[ReviewItem],
+        paper_ids: Sequence[str],
+        max_candidates: int,
+    ) -> Dict[str, Any]:
+        ordered_ids: List[str] = []
+        seen = set()
+        for paper_id in paper_ids:
+            normalized = str(paper_id or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered_ids.append(normalized)
+        ranked_candidates: List[Dict[str, Any]] = []
+        for paper_id in ordered_ids:
+            candidate = workspace.paper_candidates.get(paper_id)
+            if candidate is None:
+                continue
+            ranked_candidates.append(
+                self._score_screen_candidate(
+                    workspace=workspace,
+                    candidate=candidate,
+                    open_review_items=open_review_items,
+                )
+            )
+        ranked_candidates.sort(
+            key=lambda item: (
+                0 if str(item.get("decision") or "drop") == "lock" else 1,
+                -float(item.get("screen_score") or 0.0),
+                -float(item.get("retrieval_score") or 0.0),
+            )
+        )
+        deterministic_payload = {
+            "locked_paper_ids": [
+                str(item.get("paper_id"))
+                for item in ranked_candidates
+                if str(item.get("decision") or "") == "lock"
+            ][: max(1, int(max_candidates))],
+            "dropped_paper_ids": [
+                str(item.get("paper_id"))
+                for item in ranked_candidates
+                if str(item.get("paper_id") or "") and str(item.get("paper_id")) not in {
+                    str(locked_id) for locked_id in [
+                        str(candidate_id)
+                        for candidate_id in [
+                            str(item.get("paper_id"))
+                            for item in ranked_candidates
+                            if str(item.get("decision") or "") == "lock"
+                        ][: max(1, int(max_candidates))]
+                    ]
+                }
+            ],
+            "ranked_candidates": ranked_candidates,
+            "llm_screening_used": False,
+        }
+        try:
+            llm_payload = self._llm_screen_candidate_papers(
+                workspace=workspace,
+                cycle_number=cycle_number,
+                open_review_items=open_review_items,
+                ranked_candidates=ranked_candidates[:8],
+                max_candidates=max_candidates,
+            )
+        except Exception as exc:
+            workspace._merge_execution_warnings([f"candidate screening fell back to deterministic ranking: {exc}"])
+            llm_payload = None
+        payload = llm_payload or deterministic_payload
+        workspace.store.write_json(
+            f"proposer_cycle_{cycle_number}_candidate_screening.json",
+            payload,
+        )
+        return payload
+
     def run(
         self,
         *,
@@ -1947,6 +2570,21 @@ class ReactReviewedProposerAgent:
                     "plan_queries must be called before search_papers.",
                     code="plan_required_before_search",
                 )
+            if run_state.locked_candidate_paper_ids and not run_state.acquired_paper_ids and not run_state.screening_required():
+                return ToolResult(
+                    observation=_json_preview(
+                        {
+                            "error": "acquire_locked_candidates_before_more_search",
+                            "message": "screen_papers already locked candidates for this cycle; acquire them before running more search_papers.",
+                            "locked_paper_ids": list(run_state.locked_candidate_paper_ids),
+                        }
+                    ),
+                    data={
+                        "error": "acquire_locked_candidates_before_more_search",
+                        "message": "screen_papers already locked candidates for this cycle; acquire them before running more search_papers.",
+                        "locked_paper_ids": list(run_state.locked_candidate_paper_ids),
+                    },
+                )
             payload = workspace.search_papers(
                 query_plan_id=query_plan_id,
                 query_text=query_text,
@@ -1964,6 +2602,59 @@ class ReactReviewedProposerAgent:
                 data={"papers": payload},
             )
 
+        def screen_papers(
+            paper_ids: Optional[List[str]] = None,
+            max_candidates: int = 3,
+        ) -> ToolResult:
+            """Rank searched papers and lock the strongest candidates before acquisition."""
+            if not run_state.searched_paper_ids:
+                return _policy_block(
+                    "screen_papers requires prior search_papers results in this cycle.",
+                    code="screen_requires_search",
+                )
+            candidate_ids = [
+                paper_id
+                for paper_id in list(paper_ids or run_state.search_ordered_paper_ids or sorted(run_state.searched_paper_ids))
+                if str(paper_id or "").strip() in run_state.searched_paper_ids
+            ]
+            if not candidate_ids:
+                return _policy_block(
+                    "screen_papers received no valid paper_ids from this cycle's search results.",
+                    code="screen_requires_valid_candidates",
+                )
+            payload = self._screen_candidate_papers(
+                workspace=workspace,
+                cycle_number=cycle_number,
+                open_review_items=open_review_items,
+                paper_ids=candidate_ids,
+                max_candidates=max_candidates,
+            )
+            run_state.record_screening(payload)
+            observation_payload = {
+                "locked_candidates": [
+                    {
+                        "paper_id": item.get("paper_id"),
+                        "title": item.get("title"),
+                        "reason": item.get("reason"),
+                    }
+                    for item in list(payload.get("ranked_candidates") or [])
+                    if str(item.get("decision") or "") == "lock"
+                ],
+                "dropped_candidates": [
+                    {
+                        "paper_id": item.get("paper_id"),
+                        "title": item.get("title"),
+                        "reason": item.get("reason"),
+                    }
+                    for item in list(payload.get("ranked_candidates") or [])
+                    if str(item.get("decision") or "") == "drop"
+                ][:5],
+            }
+            return ToolResult(
+                observation=_json_preview(observation_payload),
+                data=payload,
+            )
+
         def acquire_document(paper_id: str) -> ToolResult:
             """Acquire the selected paper and build its section index."""
             normalized_paper_id = str(paper_id or "").strip()
@@ -1971,6 +2662,40 @@ class ReactReviewedProposerAgent:
                 return _policy_block(
                     f"acquire_document requires a paper selected from prior search_papers results; unknown paper_id={normalized_paper_id}.",
                     code="paper_not_searched",
+                )
+            if run_state.screening_required():
+                return _policy_block(
+                    "screen_papers must be called after the latest search_papers results and before acquire_document.",
+                    code="screen_required_before_acquire",
+                )
+            if run_state.locked_candidate_paper_ids and normalized_paper_id not in set(run_state.locked_candidate_paper_ids):
+                locked_payload = [
+                    {
+                        "paper_id": item.get("paper_id"),
+                        "title": item.get("title"),
+                    }
+                    for item in list(run_state.candidate_screening or [])
+                    if str(item.get("paper_id") or "") in set(run_state.locked_candidate_paper_ids)
+                ]
+                return ToolResult(
+                    observation=_json_preview(
+                        {
+                            "error": "paper_not_screen_locked",
+                            "message": (
+                                f"acquire_document requires a paper locked by screen_papers; "
+                                f"paper_id={normalized_paper_id} was not locked."
+                            ),
+                            "locked_candidates": locked_payload,
+                        }
+                    ),
+                    data={
+                        "error": "paper_not_screen_locked",
+                        "message": (
+                            f"acquire_document requires a paper locked by screen_papers; "
+                            f"paper_id={normalized_paper_id} was not locked."
+                        ),
+                        "locked_paper_ids": list(run_state.locked_candidate_paper_ids),
+                    },
                 )
             payload = workspace.acquire_document(paper_id=paper_id)
             run_state.record_acquisition(payload)
@@ -2105,6 +2830,7 @@ class ReactReviewedProposerAgent:
         tools = [
             StructuredTool.from_function(plan_queries, name="plan_queries", args_schema=tool_schemas.PlanQueriesToolInput),
             StructuredTool.from_function(search_papers, name="search_papers", args_schema=tool_schemas.SearchPapersToolInput),
+            StructuredTool.from_function(screen_papers, name="screen_papers", args_schema=tool_schemas.ScreenPapersToolInput),
             StructuredTool.from_function(acquire_document, name="acquire_document", args_schema=tool_schemas.AcquireDocumentToolInput),
             StructuredTool.from_function(read_sections, name="read_sections", args_schema=tool_schemas.SectionAccessToolInput),
             StructuredTool.from_function(extract_evidence, name="extract_evidence", args_schema=tool_schemas.SectionAccessToolInput),
@@ -2145,6 +2871,7 @@ class ReactReviewedProposerAgent:
                 search_tool_names=[
                     "plan_queries",
                     "search_papers",
+                    "screen_papers",
                     "acquire_document",
                     "read_sections",
                     "extract_evidence",
@@ -2164,14 +2891,96 @@ class ReactReviewedProposerAgent:
                 llm_timeout_seconds=self.llm_timeout_seconds,
             )
         except Exception as exc:
+            response_shim = SimpleNamespace(
+                content="",
+                structured_output=getattr(exc, "structured_output", None),
+                response_content=getattr(exc, "response_content", None),
+            )
+            partial_trajectory = getattr(exc, "trajectory", None) or getattr(agent_holder.get("agent"), "current_trajectory", None)
+            salvaged_submission, salvaged_payload, salvaged_error = self._try_validate_salvaged_submission_payload(
+                workspace=workspace,
+                response=response_shim,
+                cycle_number=cycle_number,
+                open_review_items=open_review_items,
+                trajectory=partial_trajectory,
+                run_state=run_state,
+                agent=agent_holder.get("agent"),
+            )
+            if salvaged_submission is not None:
+                logger.warning(
+                    "react_reviewed_proposer_payload_salvaged cycle=%s source=forced_conclude_exception",
+                    cycle_number,
+                )
+                return salvaged_submission, partial_trajectory
+            if salvaged_payload is not None:
+                error = ReactReviewedStructuredOutputError(
+                    stage="proposer",
+                    cycle_number=cycle_number,
+                    message=f"invalid proposer structured output: {salvaged_error or exc}",
+                    response_content=getattr(exc, "response_content", None),
+                    structured_output={"kind": "submission", "payload": salvaged_payload},
+                    trajectory=partial_trajectory,
+                )
+                _store_invalid_llm_output(
+                    artifact_store=workspace.store,
+                    prefix=f"proposer_cycle_{cycle_number}",
+                    error=error,
+                )
+                logger.warning(
+                    "react_reviewed_proposer_llm_failed cycle=%s source=forced_conclude_exception error=%s",
+                    cycle_number,
+                    salvaged_error or exc,
+                )
+                if self.repair_attempts > 0:
+                    return self._repair_submission_with_llm(
+                        workspace=workspace,
+                        cycle_number=cycle_number,
+                        open_review_items=open_review_items,
+                        error=error,
+                        trajectory=partial_trajectory,
+                        run_state=run_state,
+                    )
+                raise error
+            if self.repair_attempts > 0 and (
+                workspace.current_submission is not None
+                or run_state.has_any_evidence()
+                or bool(workspace.evidence_items)
+            ):
+                repair_error = ReactReviewedStructuredOutputError(
+                    stage="proposer",
+                    cycle_number=cycle_number,
+                    message=f"forced conclude execution failed before a valid payload was emitted: {salvaged_error or exc}",
+                    response_content=getattr(exc, "response_content", None),
+                    structured_output=getattr(exc, "structured_output", None),
+                    trajectory=partial_trajectory,
+                )
+                logger.warning(
+                    "react_reviewed_proposer_forced_conclude_exception_entering_repair cycle=%s",
+                    cycle_number,
+                )
+                return self._repair_submission_with_llm(
+                    workspace=workspace,
+                    cycle_number=cycle_number,
+                    open_review_items=open_review_items,
+                    error=repair_error,
+                    trajectory=partial_trajectory or ReActTrajectory(query=workspace.question),
+                    run_state=run_state,
+                )
             self._raise_execution_failure(
                 workspace=workspace,
                 cycle_number=cycle_number,
                 stage="proposer_execution",
-                message=f"Proposer failed during ReAct execution: {exc}",
-                details={"fallback_mode": self.fallback_mode},
+                message=f"Proposer failed during ReAct execution: {salvaged_error or exc}",
+                details={
+                    "fallback_mode": self.fallback_mode,
+                    "salvaged_payload_available": isinstance(salvaged_payload, dict),
+                },
                 response_content=getattr(exc, "response_content", None),
-                structured_output=getattr(exc, "structured_output", None),
+                structured_output=(
+                    {"kind": "submission", "payload": salvaged_payload}
+                    if isinstance(salvaged_payload, dict)
+                    else getattr(exc, "structured_output", None)
+                ),
             )
         try:
             payload = self._parse_submission_response(response=response)
@@ -2186,31 +2995,30 @@ class ReactReviewedProposerAgent:
             )
             return submission, trajectory
         except Exception as exc:
-            try:
-                salvaged_payload = self._salvage_submission_payload(response=response, trajectory=trajectory)
-                if salvaged_payload is not None:
-                    submission = self._validate_submission_payload(
-                        workspace=workspace,
-                        submission=salvaged_payload,
-                        cycle_number=cycle_number,
-                        open_review_items=open_review_items,
-                        agent=None,
-                        trajectory=trajectory,
-                        run_state=run_state,
-                    )
-                    logger.warning(
-                        "react_reviewed_proposer_payload_salvaged cycle=%s source=forced_conclude_diagnostics",
-                        cycle_number,
-                    )
-                    return submission, trajectory
-            except Exception:
-                pass
+            salvaged_submission, salvaged_payload, salvaged_error = self._try_validate_salvaged_submission_payload(
+                workspace=workspace,
+                response=response,
+                cycle_number=cycle_number,
+                open_review_items=open_review_items,
+                trajectory=trajectory,
+                run_state=run_state,
+            )
+            if salvaged_submission is not None:
+                logger.warning(
+                    "react_reviewed_proposer_payload_salvaged cycle=%s source=forced_conclude_diagnostics",
+                    cycle_number,
+                )
+                return salvaged_submission, trajectory
             error = ReactReviewedStructuredOutputError(
                 stage="proposer",
                 cycle_number=cycle_number,
-                message=f"invalid proposer structured output: {exc}",
+                message=f"invalid proposer structured output: {salvaged_error or exc}",
                 response_content=getattr(response, "response_content", getattr(response, "content", None)),
-                structured_output=getattr(response, "structured_output", None),
+                structured_output=(
+                    {"kind": "submission", "payload": salvaged_payload}
+                    if isinstance(salvaged_payload, dict)
+                    else getattr(response, "structured_output", None)
+                ),
                 trajectory=trajectory,
             )
             _store_invalid_llm_output(
@@ -2236,6 +3044,204 @@ class ReactReviewedProposerAgent:
             raise ValueError("submission payload must be a JSON object.")
         return payload
 
+    def _build_submission_prompt_scaffold(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        cycle_number: int,
+        open_review_items: Sequence[ReviewItem],
+    ) -> Dict[str, Any]:
+        issue_refs = [item.review_id for item in open_review_items if item.review_id]
+        return {
+            "submission_id": f"submission_cycle_{cycle_number}",
+            "question": workspace.question,
+            "version": cycle_number,
+            "sections": [
+                {
+                    "section_id": section.section_id,
+                    "title": section.title,
+                    "content": "<grounded section content>",
+                    "citation_ids": ["<citation_id_from_citations>"],
+                    "step_refs": [{"trajectory_id": "<trajectory_id>", "step_number": 1}],
+                    "issue_refs": list(issue_refs),
+                    "section_confidence": {
+                        "level": "medium",
+                        "score": 0.5,
+                        "rationale": "<brief section confidence rationale>",
+                    },
+                }
+                for section in workspace.task_spec.answer_sections
+            ],
+            "citations": [
+                {
+                    "citation_id": "CIT-1",
+                    "paper_id": "<paper_id_from_search_papers>",
+                    "doi": None,
+                    "title": "<paper_title_from_tools>",
+                    "year": None,
+                    "venue": None,
+                    "section_ids": ["<section_id_from_tools_or_sec_abstract>"],
+                    "evidence_ids": ["<evidence_id_from_tools>"],
+                }
+            ],
+            "limitations": ["<explicit limitation grounded in the current run>"],
+            "overall_confidence": {
+                "level": "medium",
+                "score": 0.5,
+                "rationale": "<overall confidence rationale grounded in retrieved evidence>",
+            },
+            "trajectory_id": "<trajectory_id>",
+            "step_refs": [{"trajectory_id": "<trajectory_id>", "step_number": 1}],
+            "issue_refs": issue_refs,
+        }
+
+    def _build_submission_prompt_contract(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        cycle_number: int,
+        open_review_items: Sequence[ReviewItem],
+    ) -> Dict[str, Any]:
+        submission_template = self._build_submission_prompt_scaffold(
+            workspace=workspace,
+            cycle_number=cycle_number,
+            open_review_items=open_review_items,
+        )
+        return {
+            "tool_name": "conclude",
+            "tool_call_rule": (
+                "Call conclude with exactly {\"submission\": {...}}. Do not send a bare payload and do not use "
+                "alternate top-level keys such as payload, answer_sections, or review."
+            ),
+            "canonical_submission_keys": [
+                "submission_id",
+                "question",
+                "version",
+                "sections",
+                "citations",
+                "limitations",
+                "overall_confidence",
+                "trajectory_id",
+                "step_refs",
+                "issue_refs",
+            ],
+            "required_section_ids": [section.section_id for section in workspace.task_spec.answer_sections],
+            "section_object_keys": [
+                "section_id",
+                "title",
+                "content",
+                "citation_ids",
+                "step_refs",
+                "issue_refs",
+                "section_confidence",
+            ],
+            "citation_object_keys": [
+                "citation_id",
+                "paper_id",
+                "doi",
+                "title",
+                "year",
+                "venue",
+                "section_ids",
+                "evidence_ids",
+            ],
+            "step_ref_keys": ["trajectory_id", "step_number"],
+            "confidence_object_keys": ["level", "score", "rationale"],
+            "tool_call_example": {"submission": submission_template},
+            "repair_json_example": {"kind": "submission", "payload": submission_template},
+        }
+
+    def _patch_submission_from_prior_context(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        raw_payload: Dict[str, Any],
+        open_review_items: Sequence[ReviewItem],
+    ) -> Dict[str, Any]:
+        prior_submission = workspace.current_submission
+        if prior_submission is None:
+            return raw_payload
+        prior_payload = prior_submission.model_dump(exclude_none=True)
+        if not _normalize_list_payload(raw_payload.get("citations")):
+            raw_payload["citations"] = copy.deepcopy(prior_payload.get("citations") or [])
+        if not _normalize_list_payload(raw_payload.get("limitations")):
+            raw_payload["limitations"] = copy.deepcopy(prior_payload.get("limitations") or [])
+        if not _normalize_list_payload(raw_payload.get("step_refs")):
+            raw_payload["step_refs"] = copy.deepcopy(prior_payload.get("step_refs") or [])
+        raw_payload["issue_refs"] = _merge_unique_text(
+            _normalize_list_payload(raw_payload.get("issue_refs")),
+            [item.review_id for item in open_review_items] + list(prior_submission.issue_refs or []),
+        )
+
+        raw_sections = [
+            copy.deepcopy(item)
+            for item in list(_normalize_list_payload(raw_payload.get("sections")) or [])
+            if isinstance(item, dict)
+        ]
+        raw_sections_by_id = {
+            str(item.get("section_id") or "").strip(): item
+            for item in raw_sections
+            if str(item.get("section_id") or "").strip()
+        }
+        for prior_section in prior_submission.sections:
+            current = raw_sections_by_id.get(prior_section.section_id)
+            if current is None:
+                cloned = prior_section.model_dump(exclude_none=True)
+                cloned["issue_refs"] = _merge_unique_text(
+                    cloned.get("issue_refs"),
+                    [item.review_id for item in open_review_items],
+                )
+                raw_sections.append(cloned)
+                raw_sections_by_id[prior_section.section_id] = cloned
+                continue
+            if not _compact_text(current.get("content")):
+                current["content"] = prior_section.content
+            if not _normalize_list_payload(current.get("citation_ids")):
+                current["citation_ids"] = list(prior_section.citation_ids or [])
+            if not _normalize_list_payload(current.get("step_refs")):
+                current["step_refs"] = [item.model_dump(exclude_none=True) for item in prior_section.step_refs]
+            if not isinstance(current.get("section_confidence"), dict):
+                current["section_confidence"] = prior_section.section_confidence.model_dump(exclude_none=True)
+            current["issue_refs"] = _merge_unique_text(
+                _normalize_list_payload(current.get("issue_refs")),
+                list(prior_section.issue_refs or []) + [item.review_id for item in open_review_items],
+            )
+        raw_payload["sections"] = raw_sections
+        if raw_payload.get("overall_confidence") in (None, "", []):
+            raw_payload["overall_confidence"] = prior_payload.get("overall_confidence")
+        return raw_payload
+
+    def _normalize_abstract_only_degradation(
+        self,
+        *,
+        raw_payload: Dict[str, Any],
+        run_state: Optional[_ProposerRunState],
+    ) -> Dict[str, Any]:
+        if run_state is None or not run_state.has_any_evidence() or run_state.has_fulltext_evidence():
+            return raw_payload
+        limitations = _normalize_list_payload(raw_payload.get("limitations"))
+        limitation_text = " ".join(str(item or "").strip().lower() for item in limitations)
+        if "abstract" not in limitation_text or ("full text" not in limitation_text and "full-text" not in limitation_text):
+            limitations = _merge_unique_text(
+                limitations,
+                [
+                    "This submission is degraded because only abstract-backed evidence was available and no usable full text could be recovered in this cycle."
+                ],
+            )
+        raw_payload["limitations"] = limitations
+        current_confidence = _normalize_confidence_payload(
+            raw_payload.get("overall_confidence"),
+            rationale="Overall confidence normalized for degraded abstract-only evidence.",
+        )
+        if current_confidence.get("score", 0.0) > 0.45 or current_confidence.get("level") == "high":
+            current_confidence["level"] = "low"
+            current_confidence["score"] = 0.4
+            current_confidence["rationale"] = (
+                "Only abstract-backed evidence was available in this cycle, so overall confidence was lowered."
+            )
+        raw_payload["overall_confidence"] = current_confidence
+        return raw_payload
+
     def _build_fallback_submission_citations(
         self,
         *,
@@ -2248,11 +3254,32 @@ class ReactReviewedProposerAgent:
         candidate_paper_ids = list(sorted(run_state.acquired_paper_ids or run_state.searched_paper_ids))
         for paper_id in candidate_paper_ids[:4]:
             paper_record = workspace.paper_records.get(paper_id)
+            paper_candidate = workspace.paper_candidates.get(paper_id)
             section_ids = list(sorted(run_state.section_ids_by_paper.get(paper_id, set())))
             evidence_ids = list(sorted(run_state.evidence_ids_by_paper.get(paper_id, set())))
             if not section_ids and not evidence_ids:
                 fulltext_status = str(run_state.fulltext_status_by_paper.get(paper_id) or "").strip().lower()
-                if fulltext_status == "abstract_only":
+                has_useful_abstract = _paper_has_useful_abstract_support(
+                    task_spec=workspace.task_spec,
+                    entity_pack=workspace.entity_pack,
+                    title=(
+                        getattr(paper_record, "title", None)
+                        if paper_record is not None
+                        else getattr(paper_candidate, "title", None)
+                    ),
+                    abstract=(
+                        getattr(paper_record, "abstract", None)
+                        if paper_record is not None
+                        else getattr(paper_candidate, "abstract", None)
+                    ),
+                )
+                if has_useful_abstract and (
+                    fulltext_status == "abstract_only"
+                    or (
+                        paper_id in run_state.acquired_paper_ids
+                        and fulltext_status in {"fulltext_unusable", "binary_only", "missing", "error"}
+                    )
+                ):
                     section_ids = ["sec_abstract"]
             if not section_ids and not evidence_ids:
                 continue
@@ -2261,7 +3288,12 @@ class ReactReviewedProposerAgent:
                     "citation_id": f"CIT-{len(fallback_citations) + 1}",
                     "paper_id": paper_id,
                     "doi": getattr(paper_record, "doi", None) if paper_record is not None else None,
-                    "title": getattr(paper_record, "title", None) if paper_record is not None else None,
+                    "title": (
+                        getattr(paper_record, "title", None)
+                        if paper_record is not None
+                        else getattr(paper_candidate, "title", None)
+                    )
+                    or paper_id,
                     "year": getattr(paper_record, "year", None) if paper_record is not None else None,
                     "venue": getattr(paper_record, "venue", None) if paper_record is not None else None,
                     "section_ids": section_ids,
@@ -2269,6 +3301,88 @@ class ReactReviewedProposerAgent:
                 }
             )
         return fallback_citations
+
+    def _normalize_submission_citations_for_run_state(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        raw_citations: Sequence[Any],
+        run_state: Optional[_ProposerRunState],
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        if run_state is None:
+            return [copy.deepcopy(item) for item in list(raw_citations or []) if isinstance(item, dict)]
+        for index, raw_item in enumerate(list(raw_citations or []), start=1):
+            if not isinstance(raw_item, dict):
+                continue
+            current = copy.deepcopy(raw_item)
+            paper_id = str(current.get("paper_id") or "").strip()
+            if not paper_id:
+                continue
+            if paper_id not in run_state.searched_paper_ids and paper_id not in run_state.acquired_paper_ids:
+                continue
+            valid_section_ids: List[str] = []
+            for section_id in list(current.get("section_ids") or []):
+                normalized_section_id = str(section_id or "").strip()
+                if not normalized_section_id:
+                    continue
+                if normalized_section_id == "sec_abstract":
+                    has_useful_abstract = _paper_has_useful_abstract_support(
+                        task_spec=workspace.task_spec,
+                        entity_pack=workspace.entity_pack,
+                        title=(
+                            getattr(workspace.paper_records.get(paper_id), "title", None)
+                            or getattr(workspace.paper_candidates.get(paper_id), "title", None)
+                        ),
+                        abstract=(
+                            getattr(workspace.paper_records.get(paper_id), "abstract", None)
+                            or getattr(workspace.paper_candidates.get(paper_id), "abstract", None)
+                        ),
+                    )
+                    if paper_id in run_state.acquired_paper_ids and has_useful_abstract:
+                        valid_section_ids.append("sec_abstract")
+                    continue
+                if normalized_section_id in run_state.section_ids_by_paper.get(paper_id, set()):
+                    valid_section_ids.append(normalized_section_id)
+            valid_evidence_ids: List[str] = []
+            valid_evidence_for_paper = run_state.evidence_ids_by_paper.get(paper_id, set())
+            for evidence_id in list(current.get("evidence_ids") or []):
+                normalized_evidence_id = str(evidence_id or "").strip()
+                if not normalized_evidence_id:
+                    continue
+                if normalized_evidence_id in run_state.evidence_ids and (
+                    not valid_evidence_for_paper or normalized_evidence_id in valid_evidence_for_paper
+                ):
+                    valid_evidence_ids.append(normalized_evidence_id)
+            if not valid_section_ids and not valid_evidence_ids:
+                fulltext_status = str(run_state.fulltext_status_by_paper.get(paper_id) or "").strip().lower()
+                has_useful_abstract = _paper_has_useful_abstract_support(
+                    task_spec=workspace.task_spec,
+                    entity_pack=workspace.entity_pack,
+                    title=(
+                        getattr(workspace.paper_records.get(paper_id), "title", None)
+                        or getattr(workspace.paper_candidates.get(paper_id), "title", None)
+                    ),
+                    abstract=(
+                        getattr(workspace.paper_records.get(paper_id), "abstract", None)
+                        or getattr(workspace.paper_candidates.get(paper_id), "abstract", None)
+                    ),
+                )
+                if paper_id in run_state.acquired_paper_ids and has_useful_abstract and fulltext_status in {
+                    "abstract_only",
+                    "fulltext_unusable",
+                    "binary_only",
+                    "missing",
+                    "error",
+                }:
+                    valid_section_ids = ["sec_abstract"]
+            current["citation_id"] = str(current.get("citation_id") or f"CIT-{index}").strip() or f"CIT-{index}"
+            current["paper_id"] = paper_id
+            current["title"] = _compact_text(current.get("title")) or _paper_title_fallback(workspace, paper_id) or paper_id
+            current["section_ids"] = _merge_unique_text([], valid_section_ids)
+            current["evidence_ids"] = _merge_unique_text([], valid_evidence_ids)
+            normalized.append(current)
+        return normalized
 
     def _salvage_submission_payload(
         self,
@@ -2331,6 +3445,34 @@ class ReactReviewedProposerAgent:
                 return submission_payload
         return None
 
+    def _try_validate_salvaged_submission_payload(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        response: Any,
+        cycle_number: int,
+        open_review_items: Sequence[ReviewItem],
+        trajectory: Optional[ReActTrajectory],
+        run_state: Optional[_ProposerRunState],
+        agent: Optional[ReActAgent] = None,
+    ) -> Tuple[Optional[AnswerSubmission], Optional[Dict[str, Any]], Optional[Exception]]:
+        salvaged_payload = self._salvage_submission_payload(response=response, trajectory=trajectory)
+        if salvaged_payload is None:
+            return None, None, None
+        try:
+            submission = self._validate_submission_payload(
+                workspace=workspace,
+                submission=salvaged_payload,
+                cycle_number=cycle_number,
+                open_review_items=open_review_items,
+                agent=agent,
+                trajectory=trajectory,
+                run_state=run_state,
+            )
+            return submission, salvaged_payload, None
+        except Exception as exc:
+            return None, salvaged_payload, exc
+
     def _repair_submission_with_llm(
         self,
         *,
@@ -2353,11 +3495,17 @@ class ReactReviewedProposerAgent:
                             "content": (
                                 "You are repairing an invalid AnswerSubmission for a chemistry QA proposer.\n"
                                 "Return STRICT JSON only.\n"
-                                "Return either {\"kind\":\"submission\",\"payload\":{...}} or the submission object itself.\n"
+                                "Return EXACTLY {\"kind\":\"submission\",\"payload\":{...}}.\n"
                                 "The canonical submission keys are submission_id, question, version, sections, citations, limitations, overall_confidence, trajectory_id, step_refs, and issue_refs.\n"
+                                "The payload object must be the same canonical inner object that would be passed to conclude as {\"submission\": payload}.\n"
                                 "Use only the supplied task_spec, entity_pack, review items, retrieval state, and cited IDs.\n"
                                 "Do not invent citations, evidence_ids, section_ids, or papers.\n"
+                                "If prior_submission is provided, treat it as the base canonical submission and patch only what the current validation error or new review items require.\n"
+                                "Preserve prior section structure, citation catalog shape, and issue links unless the current run state makes a prior anchor invalid.\n"
+                                "Do not copy angle-bracket placeholders, duplicate section entries, malformed fragments, or markdown fences from the invalid response.\n"
+                                "Rebuild a fresh canonical payload from grounded run state and keep only verifiable content.\n"
                                 "If the current run has only abstract-backed evidence, include an explicit degraded-evidence limitation and lower overall confidence.\n"
+                                "Keep the repaired payload concise. Each section should normally stay within 1-3 short sentences.\n"
                             ),
                         },
                         {
@@ -2370,13 +3518,31 @@ class ReactReviewedProposerAgent:
                                     "context": workspace.context,
                                     "task_spec": workspace.task_spec.model_dump(exclude_none=True),
                                     "entity_pack": workspace.entity_pack.model_dump(exclude_none=True),
+                                    "prior_submission": (
+                                        workspace.current_submission.model_dump(exclude_none=True)
+                                        if workspace.current_submission is not None
+                                        else None
+                                    ),
                                     "open_review_items": [item.model_dump(exclude_none=True) for item in open_review_items],
+                                    "conclude_call_contract": self._build_submission_prompt_contract(
+                                        workspace=workspace,
+                                        cycle_number=cycle_number,
+                                        open_review_items=open_review_items,
+                                    ),
                                     "retrieval_state": run_state.prompt_payload(),
                                     "validation_error": str(last_error),
-                                    "invalid_response_content": last_error.response_content,
-                                    "invalid_structured_output": last_error.structured_output,
+                                    "invalid_submission_payload": (
+                                        _coerce_salvaged_submission_payload(last_error.structured_output)
+                                        if isinstance(last_error.structured_output, dict)
+                                        else None
+                                    ),
+                                    "invalid_response_content": (
+                                        None
+                                        if isinstance(last_error.structured_output, dict)
+                                        else last_error.response_content
+                                    ),
                                 },
-                                limit=20000,
+                                limit=12000,
                             ),
                         },
                     ],
@@ -2406,45 +3572,59 @@ class ReactReviewedProposerAgent:
                 logger.info("react_reviewed_proposer_repair_succeeded cycle=%s attempt=%s", cycle_number, attempt_number)
                 return submission, trajectory
             except Exception as exc:
-                try:
-                    salvage_sources = [
-                        SimpleNamespace(content=raw_response, structured_output=None, response_content=raw_response),
-                        SimpleNamespace(
-                            content=raw_response,
-                            structured_output=last_error.structured_output,
-                            response_content=last_error.response_content,
-                        ),
-                    ]
-                    for salvage_source in salvage_sources:
-                        salvaged_payload = self._salvage_submission_payload(
-                            response=salvage_source,
-                            trajectory=trajectory,
-                        )
-                        if salvaged_payload is None:
-                            continue
-                        submission = self._validate_submission_payload(
-                            workspace=workspace,
-                            submission=salvaged_payload,
-                            cycle_number=cycle_number,
-                            open_review_items=open_review_items,
-                            agent=None,
-                            trajectory=trajectory,
-                            run_state=run_state,
-                        )
+                salvage_payload = None
+                salvage_error: Optional[Exception] = None
+                salvage_sources = [
+                    SimpleNamespace(content=raw_response, structured_output=None, response_content=raw_response),
+                    SimpleNamespace(
+                        content=raw_response,
+                        structured_output=last_error.structured_output,
+                        response_content=last_error.response_content,
+                    ),
+                ]
+                for salvage_source in salvage_sources:
+                    salvaged_submission, salvaged_payload, salvaged_error = self._try_validate_salvaged_submission_payload(
+                        workspace=workspace,
+                        response=salvage_source,
+                        cycle_number=cycle_number,
+                        open_review_items=open_review_items,
+                        trajectory=trajectory,
+                        run_state=run_state,
+                    )
+                    if salvaged_submission is not None:
                         logger.warning(
                             "react_reviewed_proposer_repair_salvaged cycle=%s attempt=%s source=invalid_payload",
                             cycle_number,
                             attempt_number,
                         )
-                        return submission, trajectory
-                except Exception:
-                    pass
+                        return salvaged_submission, trajectory
+                    if salvaged_payload is not None:
+                        salvage_payload = salvaged_payload
+                        salvage_error = salvaged_error
+                rebuilt_submission = self._try_rebuild_submission_from_workspace(
+                    workspace=workspace,
+                    cycle_number=cycle_number,
+                    open_review_items=open_review_items,
+                    trajectory=trajectory,
+                    run_state=run_state,
+                )
+                if rebuilt_submission is not None:
+                    logger.warning(
+                        "react_reviewed_proposer_repair_rebuilt_from_workspace cycle=%s attempt=%s",
+                        cycle_number,
+                        attempt_number,
+                    )
+                    return rebuilt_submission, trajectory
                 last_error = ReactReviewedStructuredOutputError(
                     stage="proposer_repair",
                     cycle_number=cycle_number,
-                    message=f"invalid proposer repair output: {exc}",
+                    message=f"invalid proposer repair output: {salvage_error or exc}",
                     response_content=raw_response,
-                    structured_output=None,
+                    structured_output=(
+                        {"kind": "submission", "payload": salvage_payload}
+                        if isinstance(salvage_payload, dict)
+                        else None
+                    ),
                     trajectory=trajectory,
                 )
                 _store_invalid_llm_output(
@@ -2515,12 +3695,49 @@ class ReactReviewedProposerAgent:
         raw_payload.pop("cycle_number", None)
         raw_payload.pop("normalized_question", None)
         raw_payload.pop("conditions", None)
+        raw_payload.pop("task_spec_version", None)
+        if "confidence" in raw_payload and "overall_confidence" not in raw_payload:
+            raw_payload["overall_confidence"] = raw_payload.pop("confidence")
+        else:
+            raw_payload.pop("confidence", None)
+        raw_payload = self._patch_submission_from_prior_context(
+            workspace=workspace,
+            raw_payload=raw_payload,
+            open_review_items=open_review_items,
+        )
         raw_payload.setdefault("submission_id", f"submission_cycle_{cycle_number}")
         raw_payload.setdefault("question", workspace.question)
         raw_payload.setdefault("version", cycle_number)
         raw_payload.setdefault("trajectory_id", trajectory_id or f"traj_placeholder_{cycle_number}")
+        raw_payload = _align_step_refs_to_trajectory(raw_payload, trajectory_id)
         raw_payload.setdefault("citations", [])
-        raw_payload["citations"] = _normalize_list_payload(raw_payload.get("citations"))
+        raw_payload["citations"] = self._normalize_submission_citations_for_run_state(
+            workspace=workspace,
+            raw_citations=list(_normalize_list_payload(raw_payload.get("citations")) or []),
+            run_state=run_state,
+        )
+        raw_citations_by_id = {
+            str(item.get("citation_id") or "").strip(): item
+            for item in list(raw_payload.get("citations") or [])
+            if isinstance(item, dict) and str(item.get("citation_id") or "").strip()
+        }
+        def _raw_citation_has_fulltext_anchor(citation_payload: Dict[str, Any]) -> bool:
+            paper_id = str(citation_payload.get("paper_id") or "").strip()
+            evidence_ids = {
+                str(item).strip()
+                for item in list(citation_payload.get("evidence_ids") or [])
+                if str(item).strip()
+            }
+            if run_state is None or not paper_id:
+                return False
+            if run_state.fulltext_evidence_ids_for_paper(paper_id).intersection(evidence_ids):
+                return True
+            if str(run_state.fulltext_status_by_paper.get(paper_id) or "").strip().lower() == "fulltext_indexed":
+                for section_id in list(citation_payload.get("section_ids") or []):
+                    normalized_section_id = str(section_id or "").strip()
+                    if normalized_section_id != "sec_abstract" and normalized_section_id in run_state.section_ids_by_paper.get(paper_id, set()):
+                        return True
+            return False
         raw_payload.setdefault("limitations", [])
         raw_payload["limitations"] = _normalize_list_payload(raw_payload.get("limitations"))
         raw_payload.setdefault("issue_refs", [item.review_id for item in open_review_items])
@@ -2532,6 +3749,10 @@ class ReactReviewedProposerAgent:
         raw_payload["overall_confidence"] = _normalize_confidence_payload(
             raw_payload.get("overall_confidence"),
             rationale="LLM proposer confidence normalized by conclude validator.",
+        )
+        raw_payload = self._normalize_abstract_only_degradation(
+            raw_payload=raw_payload,
+            run_state=run_state,
         )
         fallback_citations = self._build_fallback_submission_citations(workspace=workspace, run_state=run_state)
         raw_citations = list(raw_payload.get("citations") or [])
@@ -2566,6 +3787,10 @@ class ReactReviewedProposerAgent:
                 section_payload["content"] = section_payload.pop("text")
             else:
                 section_payload.pop("text", None)
+            if "confidence" in section_payload and "section_confidence" not in section_payload:
+                section_payload["section_confidence"] = section_payload.pop("confidence")
+            else:
+                section_payload.pop("confidence", None)
             section_payload.setdefault("content", "")
             section_payload.setdefault(
                 "section_confidence",
@@ -2601,6 +3826,28 @@ class ReactReviewedProposerAgent:
                 for citation_id in list(section_payload.get("citation_ids") or [])
                 if citation_id in citation_ids
             ]
+            if (
+                run_state is not None
+                and self.evidence_policy == "prefer_fulltext"
+                and run_state.has_fulltext_evidence()
+                and answer_section.section_id not in {"caveats", "causal_limitations", "open_questions"}
+            ):
+                current_citation_ids = list(section_payload.get("citation_ids") or [])
+                has_fulltext_anchor = any(
+                    _raw_citation_has_fulltext_anchor(raw_citations_by_id.get(citation_id, {}))
+                    for citation_id in current_citation_ids
+                )
+                if not has_fulltext_anchor:
+                    preferred_fulltext_ids = [
+                        citation_id
+                        for citation_id, citation_payload in raw_citations_by_id.items()
+                        if _raw_citation_has_fulltext_anchor(citation_payload)
+                    ]
+                    if preferred_fulltext_ids:
+                        section_payload["citation_ids"] = _merge_unique_text(
+                            preferred_fulltext_ids[:1],
+                            current_citation_ids,
+                        )[:2]
             normalized_sections.append(section_payload)
         raw_payload["sections"] = normalized_sections
         raw_payload["step_refs"] = [
@@ -2743,9 +3990,40 @@ class ReactReviewedProposerAgent:
             tool_calls=search_tool_calls,
         )
 
-        selected_paper_ids = [item.get("paper_id") for item in search_results if item.get("paper_id")][:2]
+        screened_payload = self._screen_candidate_papers(
+            workspace=workspace,
+            cycle_number=cycle_number,
+            open_review_items=open_review_items,
+            paper_ids=[item.get("paper_id") for item in search_results if item.get("paper_id")],
+            max_candidates=3,
+        )
+        screen_step = self._add_tool_step(
+            trajectory=trajectory,
+            thought="Screen the retrieved papers and lock the most relevant candidates before acquisition.",
+            tool_calls=[
+                ToolCallRecord(
+                    tool_name="screen_papers",
+                    tool_call_id=f"tc_{uuid.uuid4().hex[:8]}",
+                    tool_args={"paper_ids": [item.get("paper_id") for item in search_results if item.get("paper_id")], "max_candidates": 3},
+                    observation=_json_preview(screened_payload),
+                    observation_data=screened_payload,
+                )
+            ],
+        )
+
+        selected_paper_ids = list(screened_payload.get("locked_paper_ids") or [])
+        if not selected_paper_ids:
+            self._raise_execution_failure(
+                workspace=workspace,
+                cycle_number=cycle_number,
+                stage="proposer_screening",
+                message="Candidate screening did not lock any papers for acquisition.",
+                details={"screened_paper_count": len(screened_payload.get("ranked_candidates") or [])},
+                trajectory=trajectory,
+            )
         acquired_payloads: List[Dict[str, Any]] = []
         acquire_tool_calls: List[ToolCallRecord] = []
+        extracted_paper_ids: List[str] = []
         for paper_id in selected_paper_ids:
             payload = workspace.acquire_document(paper_id=str(paper_id))
             acquired_payloads.append(payload)
@@ -2758,15 +4036,35 @@ class ReactReviewedProposerAgent:
                     observation_data=payload,
                 )
             )
+            if str(payload.get("fulltext_status") or "").strip().lower() == "fulltext_indexed":
+                extracted_paper_ids.append(str(paper_id))
+            elif len(extracted_paper_ids) < 2 and _paper_has_useful_abstract_support(
+                task_spec=workspace.task_spec,
+                entity_pack=workspace.entity_pack,
+                title=getattr(workspace.paper_candidates.get(str(paper_id)), "title", None),
+                abstract=getattr(workspace.paper_candidates.get(str(paper_id)), "abstract", None),
+            ):
+                extracted_paper_ids.append(str(paper_id))
+            if len(extracted_paper_ids) >= 2:
+                break
         acquire_step = self._add_tool_step(
             trajectory=trajectory,
             thought="Acquire full text or abstract-backed section indices for the strongest papers.",
             tool_calls=acquire_tool_calls,
         )
+        if not extracted_paper_ids:
+            self._raise_execution_failure(
+                workspace=workspace,
+                cycle_number=cycle_number,
+                stage="proposer_acquisition",
+                message="Candidate acquisition did not yield any papers with usable full text or clearly relevant abstract support.",
+                details={"selected_paper_ids": selected_paper_ids},
+                trajectory=trajectory,
+            )
 
         extracted_evidence: List[Dict[str, Any]] = []
         extract_tool_calls: List[ToolCallRecord] = []
-        for paper_id in selected_paper_ids:
+        for paper_id in extracted_paper_ids:
             payload = workspace.extract_evidence(paper_id=str(paper_id), preferred_sections=True)
             extracted_evidence.extend(payload)
             extract_tool_calls.append(
@@ -2778,13 +4076,28 @@ class ReactReviewedProposerAgent:
                     observation_data=payload,
                 )
             )
+        if not extract_tool_calls:
+            self._raise_execution_failure(
+                workspace=workspace,
+                cycle_number=cycle_number,
+                stage="proposer_evidence",
+                message="No evidence extraction calls were possible after acquisition.",
+                details={"selected_paper_ids": extracted_paper_ids},
+                trajectory=trajectory,
+            )
         extract_step = self._add_tool_step(
             trajectory=trajectory,
             thought="Extract evidence snippets and stable evidence references for answer assembly.",
             tool_calls=extract_tool_calls,
         )
 
-        step_refs = [_step_ref(trajectory, plan_step), _step_ref(trajectory, search_step), _step_ref(trajectory, acquire_step), _step_ref(trajectory, extract_step)]
+        step_refs = [
+            _step_ref(trajectory, plan_step),
+            _step_ref(trajectory, search_step),
+            _step_ref(trajectory, screen_step),
+            _step_ref(trajectory, acquire_step),
+            _step_ref(trajectory, extract_step),
+        ]
         submission = self._build_submission_from_workspace(
             workspace=workspace,
             cycle_number=cycle_number,
@@ -2809,6 +4122,37 @@ class ReactReviewedProposerAgent:
         trajectory.finalize(json.dumps({"submission_id": submission.submission_id}, ensure_ascii=False))
         return submission, trajectory
 
+    def _try_rebuild_submission_from_workspace(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        cycle_number: int,
+        open_review_items: Sequence[ReviewItem],
+        trajectory: ReActTrajectory,
+        run_state: _ProposerRunState,
+    ) -> Optional[AnswerSubmission]:
+        if not run_state.has_any_evidence():
+            return None
+        try:
+            rebuilt = self._build_submission_from_workspace(
+                workspace=workspace,
+                cycle_number=cycle_number,
+                step_refs=[_step_ref(trajectory, max(1, len(trajectory.steps) or 1))],
+                open_review_items=open_review_items,
+                run_state=run_state,
+            )
+            return self._validate_submission_payload(
+                workspace=workspace,
+                submission=rebuilt.model_dump(exclude_none=True),
+                cycle_number=cycle_number,
+                open_review_items=open_review_items,
+                agent=None,
+                trajectory=trajectory,
+                run_state=run_state,
+            )
+        except Exception:
+            return None
+
     def _build_submission_from_workspace(
         self,
         *,
@@ -2816,9 +4160,16 @@ class ReactReviewedProposerAgent:
         cycle_number: int,
         step_refs: Sequence[SubmissionStepRef],
         open_review_items: Sequence[ReviewItem],
+        run_state: Optional[_ProposerRunState] = None,
     ) -> AnswerSubmission:
-        citations = self._build_submission_citations(workspace)
-        evidence_items = list(workspace.evidence_items.values())
+        citations = self._build_submission_citations(workspace, run_state=run_state)
+        allowed_paper_ids = {citation.paper_id for citation in citations}
+        evidence_items = [
+            item
+            for item in list(workspace.evidence_items.values())
+            if not allowed_paper_ids or item.paper_id in allowed_paper_ids
+        ]
+        evidence_items.sort(key=_evidence_item_priority_score, reverse=True)
         observations = [item for item in evidence_items if item.role in {"observation", "mechanism"}]
         limitations = [item for item in evidence_items if item.role == "limitation"]
         citation_ids = [item.citation_id for item in citations]
@@ -2886,12 +4237,67 @@ class ReactReviewedProposerAgent:
             issue_refs=issue_refs,
         )
 
-    def _build_submission_citations(self, workspace: ReactReviewedWorkspace) -> List[SubmissionCitation]:
+    def _build_submission_citations(
+        self,
+        workspace: ReactReviewedWorkspace,
+        *,
+        run_state: Optional[_ProposerRunState] = None,
+    ) -> List[SubmissionCitation]:
+        scored_records: List[Tuple[float, PaperRecord, List[EvidenceItem]]] = []
+        if run_state is not None and run_state.acquired_paper_ids:
+            paper_ids = [
+                paper_id
+                for paper_id in list(run_state.locked_candidate_paper_ids or [])
+                if paper_id in workspace.paper_records
+            ]
+            paper_ids.extend(
+                paper_id
+                for paper_id in sorted(run_state.acquired_paper_ids)
+                if paper_id in workspace.paper_records and paper_id not in set(paper_ids)
+            )
+        else:
+            paper_ids = [paper_record.paper_id for paper_record in list(workspace.paper_records.values())]
+        for paper_id in paper_ids:
+            paper_record = workspace.paper_records.get(paper_id)
+            if paper_record is None:
+                continue
+            paper_evidence = [
+                item for item in workspace.evidence_items.values()
+                if item.paper_id == paper_record.paper_id
+                and (run_state is None or item.evidence_id in run_state.evidence_ids)
+            ]
+            paper_evidence.sort(key=_evidence_item_priority_score, reverse=True)
+            has_useful_abstract = _paper_has_useful_abstract_support(
+                task_spec=workspace.task_spec,
+                entity_pack=workspace.entity_pack,
+                title=paper_record.title,
+                abstract=paper_record.abstract,
+            )
+            if not paper_evidence and not has_useful_abstract:
+                continue
+            paper_score = (max((_evidence_item_priority_score(item) for item in paper_evidence), default=0.0)) + (
+                2.0 if str(paper_record.fulltext_status or "").strip().lower() == "fulltext_indexed" else 0.0
+            ) + (
+                1.0 if has_useful_abstract else 0.0
+            )
+            scored_records.append((paper_score, paper_record, paper_evidence))
+        scored_records.sort(key=lambda item: item[0], reverse=True)
         citations: List[SubmissionCitation] = []
-        for paper_record in list(workspace.paper_records.values())[:4]:
-            paper_evidence = [item for item in workspace.evidence_items.values() if item.paper_id == paper_record.paper_id]
-            section_ids = _merge_unique_text([], [item.section_id for item in paper_evidence])
-            evidence_ids = _merge_unique_text([], [item.evidence_id for item in paper_evidence])
+        for _score, paper_record, paper_evidence in scored_records[:4]:
+            useful_evidence = [item for item in paper_evidence if _evidence_item_priority_score(item) > 1.5] or paper_evidence[:2]
+            section_ids = _merge_unique_text([], [item.section_id for item in useful_evidence])
+            evidence_ids = _merge_unique_text([], [item.evidence_id for item in useful_evidence])
+            if (
+                not section_ids
+                and not evidence_ids
+                and _paper_has_useful_abstract_support(
+                    task_spec=workspace.task_spec,
+                    entity_pack=workspace.entity_pack,
+                    title=paper_record.title,
+                    abstract=paper_record.abstract,
+                )
+            ):
+                section_ids = ["sec_abstract"]
             citations.append(
                 SubmissionCitation(
                     citation_id=f"CIT-{len(citations) + 1}",
@@ -2928,6 +4334,9 @@ class ReactReviewedProposerAgent:
         workspace: ReactReviewedWorkspace,
         related_issues: Sequence[str],
     ) -> str:
+        ranked_observations = sorted(list(observations or []), key=_evidence_item_priority_score, reverse=True)
+        useful_observations = [item for item in ranked_observations if _evidence_item_priority_score(item) > 1.5]
+        ranked_limitations = sorted(list(limitations or []), key=_evidence_item_priority_score, reverse=True)
         if answer_section_id in {"representative_papers"}:
             if not citations:
                 return "Representative papers could not be confirmed from the current retrieval set."
@@ -2937,21 +4346,30 @@ class ReactReviewedProposerAgent:
             ]
             return "Representative papers in the current run include " + "; ".join(fragments) + "."
         if answer_section_id in {"caveats", "causal_limitations", "open_questions"}:
-            if limitations:
-                return _compact_text(limitations[0].snippet)
+            if ranked_limitations:
+                return _compact_text(ranked_limitations[0].snippet)
             if related_issues:
                 return "Open review items remain attached to this section: " + ", ".join(related_issues) + "."
             return "Current evidence remains incomplete, so this section stays conservative."
         if answer_section_id in {"conditions"}:
             conditions: List[str] = []
-            for evidence_item in observations[:3]:
+            condition_items = [
+                item for item in useful_observations
+                if item.role == "condition" or bool(item.conditions)
+            ] or useful_observations[:3]
+            for evidence_item in condition_items[:3]:
                 for axis_name, axis_value in evidence_item.conditions.items():
                     conditions.append(f"{axis_name}: {axis_value}")
             if conditions:
                 return "Material conditions mentioned in the current evidence include " + "; ".join(conditions[:4]) + "."
-        if observations:
-            first = observations[0]
-            return _compact_text(first.snippet)
+        if useful_observations:
+            fragments = [
+                _compact_text(item.snippet)
+                for item in useful_observations[:2]
+                if _compact_text(item.snippet)
+            ]
+            if fragments:
+                return " ".join(fragments)
         if citations:
             return (
                 f"The retrieved literature set for '{workspace.question}' contains usable citations, "
@@ -2965,12 +4383,18 @@ class ReactReviewedProposerAgent:
             "Fixed upstream inputs are RouterAgent TaskSpec and EntityResolverAgent outputs; do not challenge them.\n"
             "You are the primary retrieval orchestrator for this cycle.\n"
             "You must build an AnswerSubmission already sectioned according to TaskSpec.answer_sections.\n"
-            "Required phase order: 1) plan_queries, 2) search_papers, 3) choose candidate papers, 4) acquire_document, 5) read_sections/extract_evidence, 6) conclude.\n"
+            "When you call conclude, the tool arguments must be exactly {\"submission\": <AnswerSubmission>}.\n"
+            "Do not send a bare payload and do not rename the wrapper key to payload, answer_sections, or any other alias.\n"
+            "Required phase order: 1) plan_queries, 2) search_papers, 3) screen_papers, 4) acquire_document, 5) read_sections/extract_evidence, 6) conclude.\n"
             "Never skip directly to conclude before evidence extraction succeeds.\n"
             "You may refine retrieval with additional ad hoc searches after plan_queries, but every paper you acquire must come from prior search_papers results in this cycle.\n"
+            "screen_papers is mandatory after each new search result set. Only papers locked by screen_papers may be acquired.\n"
+            "Once screen_papers locks candidates, acquire those locked papers before running more search_papers.\n"
+            "Metadata-source priority: use OpenAlex first, then Semantic Scholar, and treat Crossref mainly as supplemental metadata and verification.\n"
             "Selection rubric, in order: entity/condition alignment with TaskSpec; question-type and lane fit; full-text availability signal; evidence density after extraction; coverage diversity when multiple papers are needed.\n"
             "Prefer full-text evidence. If usable full-text evidence exists, use fulltext-backed citations in substantive sections.\n"
-            "If only abstract-backed evidence is available, you may submit a degraded answer only if you explicitly disclose the degradation in limitations and lower overall confidence.\n"
+            "If only abstract-backed evidence is available, you may submit a degraded answer only if the abstract is clearly relevant to the question, you explicitly disclose the degradation in limitations, and you lower overall confidence.\n"
+            "If prior_submission is provided for a revision cycle, patch that prior canonical submission instead of rewriting the entire answer from scratch.\n"
             "Only use citations, section_ids, and evidence_ids returned by tools in this cycle.\n"
             "There is no deterministic fallback. If the run cannot produce a valid evidence-backed submission within budget, fail explicitly.\n"
             "If conclude returns a validation error, fix the submission object rather than inventing unsupported anchors.\n"
@@ -2985,6 +4409,11 @@ class ReactReviewedProposerAgent:
         cycle_number: int,
         open_review_items: Sequence[ReviewItem],
     ) -> str:
+        conclude_call_contract = self._build_submission_prompt_contract(
+            workspace=workspace,
+            cycle_number=cycle_number,
+            open_review_items=open_review_items,
+        )
         return _json_preview(
             {
                 "cycle_number": cycle_number,
@@ -2992,18 +4421,29 @@ class ReactReviewedProposerAgent:
                 "context": workspace.context,
                 "task_spec": workspace.task_spec.model_dump(exclude_none=True),
                 "entity_pack": workspace.entity_pack.model_dump(exclude_none=True),
+                "prior_submission": (
+                    workspace.current_submission.model_dump(exclude_none=True)
+                    if workspace.current_submission is not None
+                    else None
+                ),
+                "prior_proposer_trajectory": (
+                    workspace.current_proposer_trajectory.to_dict()
+                    if workspace.current_proposer_trajectory is not None
+                    else None
+                ),
                 "open_review_items": [item.model_dump(exclude_none=True) for item in open_review_items],
+                "conclude_call_contract": conclude_call_contract,
                 "retrieval_policy": {
                     "fallback_mode": self.fallback_mode,
                     "repair_attempts": self.repair_attempts,
                     "evidence_policy": self.evidence_policy,
-                    "phase_order": [
-                        "plan_queries",
-                        "search_papers",
-                        "candidate_locking",
-                        "acquire_document",
-                        "read_sections_or_extract_evidence",
-                        "conclude",
+                        "phase_order": [
+                            "plan_queries",
+                            "search_papers",
+                            "screen_papers",
+                            "acquire_document",
+                            "read_sections_or_extract_evidence",
+                            "conclude",
                     ],
                     "selection_rubric": [
                         "entity_and_condition_alignment",
@@ -3031,9 +4471,12 @@ class ReactReviewedProposerAgent:
             "You must call tools instead of answering in free text.\n"
             f"Allowed tools: {', '.join(tool_names)}.\n"
             f"Treat these as retrieval/inspection tools: {', '.join(retrieval_tools)}.\n"
-            "Call plan_queries before any search. Call acquire_document only for papers returned by search_papers in this cycle.\n"
+            "Call plan_queries before any search. Call screen_papers after each new search result set. Once screen_papers locks candidates, call acquire_document on those locked paper_ids before any more search_papers. Call acquire_document only for papers returned by search_papers and locked by screen_papers in this cycle.\n"
+            "Prefer metadata screening from OpenAlex and Semantic Scholar; use Crossref as a supplement and verifier rather than the primary discovery source.\n"
             "Call extract_evidence before conclude. Prefer fulltext-backed evidence when it exists.\n"
             "Do not mix retrieval tools with conclude in the same step.\n"
+            "For conclude, the tool args object must be exactly {\"submission\": {...}}.\n"
+            "Do not pass a bare submission object and do not use alternate top-level keys such as payload or answer_sections.\n"
             "Use conclude only when the submission object is ready.\n"
             "The final step must call the conclude tool with the completed submission payload.\n"
         )
@@ -3358,6 +4801,28 @@ class ReactReviewedReviewerAgent:
                 llm_timeout_seconds=self.llm_timeout_seconds,
             )
         except Exception as exc:
+            response_content = getattr(exc, "response_content", None)
+            partial_trajectory = getattr(exc, "trajectory", None) or getattr(agent_holder.get("agent"), "current_trajectory", None)
+            response_shim = SimpleNamespace(
+                content="",
+                structured_output=getattr(exc, "structured_output", None),
+                response_content=response_content,
+            )
+            salvaged_items = self._salvage_review_payload(
+                response=response_shim,
+                trajectory=partial_trajectory,
+                proposer_trajectory=proposer_trajectory,
+                submission=submission,
+                max_items=self.max_items,
+            )
+            if salvaged_items:
+                logger.warning(
+                    "react_reviewed_reviewer_payload_salvaged role=%s cycle=%s source=forced_conclude_exception count=%s",
+                    self.reviewer_role,
+                    cycle_number,
+                    len(salvaged_items),
+                )
+                return salvaged_items, partial_trajectory, "salvaged"
             error = ReactReviewedStructuredOutputError(
                 stage="reviewer",
                 cycle_number=cycle_number,
@@ -3441,13 +4906,15 @@ class ReactReviewedReviewerAgent:
         for index, raw_item in enumerate(list(raw_items or [])[: self.max_items], start=1):
             if not isinstance(raw_item, dict):
                 continue
+            if not _compact_text(raw_item.get("critique")) or not _compact_text(raw_item.get("required_action")):
+                continue
+            flaw_type = _compact_text(raw_item.get("flaw_type"))
+            if not flaw_type or flaw_type == "needs_manual_review":
+                continue
             raw_item.setdefault("review_id", f"{self.reviewer_role}_{index}")
             raw_item.setdefault("reviewer_role", self.reviewer_role)
             raw_item.setdefault("severity", "warning")
             raw_item.setdefault("anchor_kind", "global")
-            raw_item.setdefault("flaw_type", "needs_manual_review")
-            raw_item.setdefault("critique", "Reviewer output did not provide critique text.")
-            raw_item.setdefault("required_action", "Re-check the anchored section.")
             if raw_item.get("anchor_kind") == "step_section":
                 raw_item["target_trajectory_id"] = raw_item.get("target_trajectory_id") or proposer_trajectory.trajectory_id
                 raw_item["target_step_number"] = raw_item.get("target_step_number") or 1
@@ -3470,6 +4937,14 @@ class ReactReviewedReviewerAgent:
         candidate_payloads: List[Any] = []
         candidate_payloads.extend(_extract_json_candidates(getattr(response, "structured_output", None)))
         candidate_payloads.extend(_extract_json_candidates(getattr(response, "content", None)))
+        response_content = getattr(response, "response_content", None)
+        if isinstance(response_content, dict):
+            candidate_payloads.extend(_extract_json_candidates(response_content))
+            for value in response_content.values():
+                candidate_payloads.extend(_extract_json_candidates(value))
+                if isinstance(value, dict):
+                    candidate_payloads.extend(_extract_json_candidates(value.get("content")))
+                    candidate_payloads.extend(_extract_json_candidates(value.get("additional_kwargs")))
         for step in reversed(list(getattr(trajectory, "steps", []) or [])):
             candidate_payloads.extend(_extract_json_candidates(getattr(step, "observation_data", None)))
             candidate_payloads.extend(_extract_json_candidates(getattr(step, "observation", None)))
@@ -3529,6 +5004,14 @@ class ReactReviewedReviewerAgent:
                 normalized["critique"] = normalized.pop("issue")
             if "comment" in normalized and "critique" not in normalized:
                 normalized["critique"] = normalized.pop("comment")
+            if "notes" in normalized and "critique" not in normalized:
+                notes = normalized.pop("notes")
+                if isinstance(notes, list):
+                    notes_text = "; ".join(str(item).strip() for item in notes if str(item).strip())
+                else:
+                    notes_text = str(notes).strip()
+                if notes_text:
+                    normalized["critique"] = notes_text
             if "recommendation" in normalized and "required_action" not in normalized:
                 normalized["required_action"] = normalized.pop("recommendation")
             if "required_fix" in normalized and "required_action" not in normalized:
@@ -3538,12 +5021,14 @@ class ReactReviewedReviewerAgent:
             severity = str(normalized.get("severity") or "").strip().lower()
             if severity in severity_map:
                 normalized["severity"] = severity_map[severity]
+            if not _compact_text(normalized.get("critique")) or not _compact_text(normalized.get("required_action")):
+                continue
+            flaw_type = _compact_text(normalized.get("flaw_type"))
+            if not flaw_type or flaw_type == "needs_manual_review":
+                continue
             normalized.setdefault("review_id", f"{self.reviewer_role}_{index}")
             normalized.setdefault("reviewer_role", self.reviewer_role)
             normalized.setdefault("severity", "warning")
-            normalized.setdefault("flaw_type", "needs_manual_review")
-            normalized.setdefault("critique", "Reviewer identified an issue that required salvage normalization.")
-            normalized.setdefault("required_action", "Re-check the anchored section.")
             if normalized.get("target_section_id"):
                 normalized.setdefault("anchor_kind", "section_only")
             else:
@@ -4010,8 +5495,8 @@ class ReactReviewedWorkflow:
         }
         self.proposer = ReactReviewedProposerAgent(
             model_config=proposer_model_config,
-            max_steps_initial=react_config.get("max_propose_steps_initial", 6),
-            max_steps_revision=react_config.get("max_propose_steps_revision", 6),
+            max_steps_initial=react_config.get("max_propose_steps_initial", 7),
+            max_steps_revision=react_config.get("max_propose_steps_revision", 7),
             llm_timeout_seconds=self.qa_config.get("model_timeout_seconds", 45.0),
             fallback_mode=react_config.get("proposer_fallback_mode", "fail_fast_only"),
             repair_attempts=react_config.get("proposer_repair_attempts", 1),
@@ -4277,6 +5762,70 @@ class ReactReviewedWorkflow:
             reviewer_status=error_status,
         )
 
+    def _build_failure_submission(
+        self,
+        *,
+        task_spec: TaskSpec,
+        question: str,
+        cycle_number: int,
+        message: str,
+        prior_submission: Optional[AnswerSubmission],
+        trajectory_id: str,
+    ) -> AnswerSubmission:
+        if prior_submission is not None:
+            limitations = list(prior_submission.limitations)
+            failure_note = _compact_text(message)
+            if failure_note:
+                limitations = _merge_unique_text(limitations, [f"Workflow failure: {failure_note}"])
+            failed_submission = prior_submission.model_copy(
+                update={
+                    "limitations": limitations,
+                    "trajectory_id": trajectory_id or prior_submission.trajectory_id,
+                }
+            )
+            aligned_step_refs = [SubmissionStepRef(trajectory_id=failed_submission.trajectory_id, step_number=1)]
+            aligned_sections = [
+                section.model_copy(update={"step_refs": list(aligned_step_refs)})
+                for section in failed_submission.sections
+            ]
+            return failed_submission.model_copy(
+                update={
+                    "sections": aligned_sections,
+                    "step_refs": aligned_step_refs,
+                }
+            )
+        sections: List[SubmissionSection] = []
+        for answer_section in task_spec.answer_sections:
+            sections.append(
+                SubmissionSection(
+                    section_id=answer_section.section_id,
+                    title=answer_section.title,
+                    content="Workflow failed before a grounded submission could be completed.",
+                    citation_ids=[],
+                    step_refs=[SubmissionStepRef(trajectory_id=trajectory_id, step_number=1)],
+                    issue_refs=[],
+                    section_confidence=_confidence(
+                        0.05,
+                        "Confidence is minimal because the workflow terminated before producing a validated submission.",
+                    ),
+                )
+            )
+        return AnswerSubmission(
+            submission_id=f"submission_cycle_{max(1, int(cycle_number))}",
+            question=question,
+            version=max(1, int(cycle_number)),
+            sections=sections,
+            citations=[],
+            limitations=[f"Workflow failure: {_compact_text(message) or 'unknown error'}"],
+            overall_confidence=_confidence(
+                0.05,
+                "Confidence is minimal because the workflow terminated before producing a validated submission.",
+            ),
+            trajectory_id=trajectory_id,
+            step_refs=[SubmissionStepRef(trajectory_id=trajectory_id, step_number=1)],
+            issue_refs=[],
+        )
+
     def run(
         self,
         *,
@@ -4329,118 +5878,156 @@ class ReactReviewedWorkflow:
         acceptance_decision = AcceptanceDecision(status="rejected", blocker_codes=["not_evaluated"], blocker_messages=["Acceptance not yet evaluated."])
         latest_reviewers: Dict[str, ReActTrajectory] = {}
         latest_statuses: List[ReviewerRunStatus] = []
-
-        for cycle_number in range(1, max_review_cycles + 1):
-            workspace.set_review_context(
-                submission=None,
-                proposer_trajectory=None,
-                open_review_items=open_review_items,
-                cycle_number=cycle_number,
-            )
-            submission, proposer_trajectory = self.proposer.run(
-                workspace=workspace,
-                cycle_number=cycle_number,
-                open_review_items=open_review_items,
-            )
-            latest_submission = submission
-            latest_proposer_trajectory = proposer_trajectory
-            workspace.set_review_context(
-                submission=submission,
-                proposer_trajectory=proposer_trajectory,
-                open_review_items=open_review_items,
-                cycle_number=cycle_number,
-            )
-
-            reviewer_items: List[ReviewItem] = []
-            reviewer_trajectories: Dict[str, ReActTrajectory] = {}
-            reviewer_statuses: List[ReviewerRunStatus] = []
-            reviewer_roles = [role for role in self.reviewer_role_order if role in self.reviewers]
-            reviewer_sessions = {
-                reviewer_role: self._build_reviewer_session(
-                    store=store,
-                    reviewer_role=reviewer_role,
+        workflow_error: Optional[BaseException] = None
+        failing_cycle_number = 1
+        try:
+            for cycle_number in range(1, max_review_cycles + 1):
+                failing_cycle_number = cycle_number
+                workspace.set_review_context(
+                    submission=latest_submission,
+                    proposer_trajectory=latest_proposer_trajectory,
+                    open_review_items=open_review_items,
                     cycle_number=cycle_number,
                 )
-                for reviewer_role in reviewer_roles
-            }
-            max_workers = min(self.reviewer_max_concurrency, len(reviewer_roles)) if reviewer_roles else 1
-            reviewer_results: Dict[str, ReviewerExecutionResult] = {}
-            if reviewer_roles:
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    future_map: Dict[Future[ReviewerExecutionResult], ReviewerRole] = {
-                        executor.submit(
-                            self._run_reviewer_with_retries,
-                            reviewer_role=reviewer_role,
-                            reviewer=self.reviewers[reviewer_role],
-                            workspace=workspace,
-                            submission=submission,
-                            proposer_trajectory=proposer_trajectory,
-                            cycle_number=cycle_number,
-                            review_call_retry_limit=review_call_retry_limit,
-                            session=reviewer_sessions[reviewer_role],
-                        ): reviewer_role
-                        for reviewer_role in reviewer_roles
-                    }
-                    wait(list(future_map.keys()))
-                    for future, reviewer_role in future_map.items():
-                        reviewer_results[reviewer_role] = future.result()
-            workspace.write_shared_snapshot()
-            for reviewer_role in reviewer_roles:
-                execution_result = reviewer_results.get(reviewer_role)
-                if execution_result is None:
-                    continue
-                reviewer_items.extend(execution_result.review_items)
-                if execution_result.reviewer_trajectory is not None:
-                    reviewer_trajectories[reviewer_role] = execution_result.reviewer_trajectory
-                reviewer_statuses.append(execution_result.reviewer_status)
-
-            latest_reviewers = reviewer_trajectories
-            latest_statuses = reviewer_statuses
-            normalized_items = self._normalize_review_items(
-                items=reviewer_items,
-                proposer_trajectory=proposer_trajectory,
-                max_items_per_step_section=max_items_per_step_section,
-            )
-            review_responses = self._build_review_responses(
-                prior_review_items=open_review_items,
-                submission=submission,
-            )
-            cycle_states.append(
-                SubmissionCycleState(
+                submission, proposer_trajectory = self.proposer.run(
+                    workspace=workspace,
                     cycle_number=cycle_number,
-                    current_submission=submission,
-                    proposer_trajectory=proposer_trajectory.to_dict(),
-                    reviewer_trajectories={
-                        role: trajectory.to_dict()
-                        for role, trajectory in reviewer_trajectories.items()
-                    },
-                    open_review_items=normalized_items,
-                    review_responses=review_responses,
+                    open_review_items=open_review_items,
+                )
+                latest_submission = submission
+                latest_proposer_trajectory = proposer_trajectory
+                workspace.set_review_context(
+                    submission=submission,
+                    proposer_trajectory=proposer_trajectory,
+                    open_review_items=open_review_items,
+                    cycle_number=cycle_number,
+                )
+
+                reviewer_items: List[ReviewItem] = []
+                reviewer_trajectories: Dict[str, ReActTrajectory] = {}
+                reviewer_statuses: List[ReviewerRunStatus] = []
+                reviewer_roles = [role for role in self.reviewer_role_order if role in self.reviewers]
+                reviewer_sessions = {
+                    reviewer_role: self._build_reviewer_session(
+                        store=store,
+                        reviewer_role=reviewer_role,
+                        cycle_number=cycle_number,
+                    )
+                    for reviewer_role in reviewer_roles
+                }
+                max_workers = min(self.reviewer_max_concurrency, len(reviewer_roles)) if reviewer_roles else 1
+                reviewer_results: Dict[str, ReviewerExecutionResult] = {}
+                if reviewer_roles:
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_map: Dict[Future[ReviewerExecutionResult], ReviewerRole] = {
+                            executor.submit(
+                                self._run_reviewer_with_retries,
+                                reviewer_role=reviewer_role,
+                                reviewer=self.reviewers[reviewer_role],
+                                workspace=workspace,
+                                submission=submission,
+                                proposer_trajectory=proposer_trajectory,
+                                cycle_number=cycle_number,
+                                review_call_retry_limit=review_call_retry_limit,
+                                session=reviewer_sessions[reviewer_role],
+                            ): reviewer_role
+                            for reviewer_role in reviewer_roles
+                        }
+                        wait(list(future_map.keys()))
+                        for future, reviewer_role in future_map.items():
+                            reviewer_results[reviewer_role] = future.result()
+                workspace.write_shared_snapshot()
+                for reviewer_role in reviewer_roles:
+                    execution_result = reviewer_results.get(reviewer_role)
+                    if execution_result is None:
+                        continue
+                    reviewer_items.extend(execution_result.review_items)
+                    if execution_result.reviewer_trajectory is not None:
+                        reviewer_trajectories[reviewer_role] = execution_result.reviewer_trajectory
+                    reviewer_statuses.append(execution_result.reviewer_status)
+
+                latest_reviewers = reviewer_trajectories
+                latest_statuses = reviewer_statuses
+                normalized_items = self._normalize_review_items(
+                    items=reviewer_items,
+                    proposer_trajectory=proposer_trajectory,
+                    max_items_per_step_section=max_items_per_step_section,
+                )
+                review_responses = self._build_review_responses(
+                    prior_review_items=open_review_items,
+                    submission=submission,
+                )
+                cycle_states.append(
+                    SubmissionCycleState(
+                        cycle_number=cycle_number,
+                        current_submission=submission,
+                        proposer_trajectory=proposer_trajectory.to_dict(),
+                        reviewer_trajectories={
+                            role: trajectory.to_dict()
+                            for role, trajectory in reviewer_trajectories.items()
+                        },
+                        open_review_items=normalized_items,
+                        review_responses=review_responses,
+                        reviewer_statuses=reviewer_statuses,
+                    )
+                )
+                open_review_items = normalized_items
+
+                all_reviewers_completed = all(_is_reviewer_llm_completed(status) for status in reviewer_statuses)
+                review_completion_status = "completed" if all_reviewers_completed else "incomplete"
+                acceptance_decision = self._evaluate_acceptance(
+                    task_spec=task_spec,
+                    entity_pack=entity_pack,
+                    submission=submission,
+                    proposer_trajectory=proposer_trajectory,
+                    review_items=open_review_items,
                     reviewer_statuses=reviewer_statuses,
+                    require_all_reviewers=require_all_reviewers,
+                    review_failure_blocks_acceptance=review_failure_blocks_acceptance,
                 )
+                if acceptance_decision.accepted:
+                    accepted_submission = submission
+                    accepted_proposer_trajectory = proposer_trajectory
+                    break
+                if review_failure_blocks_acceptance and "reviewer_incomplete" in acceptance_decision.blocker_codes:
+                    break
+                if stop_on_no_blocking_items and not acceptance_decision.blocking_review_ids:
+                    break
+        except Exception as exc:
+            workflow_error = exc
+            review_completion_status = "incomplete"
+            blocker_message = _compact_text(str(exc)) or "Workflow execution failed."
+            acceptance_decision = AcceptanceDecision(
+                status="rejected",
+                blocker_codes=["workflow_execution_failed"],
+                blocker_messages=[blocker_message],
+                blocking_review_ids=[
+                    item.review_id
+                    for item in open_review_items
+                    if item.status == "open" and item.severity == "blocking"
+                ],
             )
-            open_review_items = normalized_items
-
-            all_reviewers_completed = all(_is_reviewer_llm_completed(status) for status in reviewer_statuses)
-            review_completion_status = "completed" if all_reviewers_completed else "incomplete"
-            acceptance_decision = self._evaluate_acceptance(
+            if latest_proposer_trajectory is None:
+                trajectory_id = str(
+                    getattr(exc, "trajectory", None).trajectory_id
+                    if getattr(exc, "trajectory", None) is not None
+                    else f"traj_failure_cycle_{max(1, failing_cycle_number)}"
+                )
+                latest_proposer_trajectory = ReActTrajectory(query=question, trajectory_id=trajectory_id)
+                latest_proposer_trajectory.finalize(json.dumps({"error": blocker_message}, ensure_ascii=False))
+            latest_submission = self._build_failure_submission(
                 task_spec=task_spec,
-                entity_pack=entity_pack,
-                submission=submission,
-                proposer_trajectory=proposer_trajectory,
-                review_items=open_review_items,
-                reviewer_statuses=reviewer_statuses,
-                require_all_reviewers=require_all_reviewers,
-                review_failure_blocks_acceptance=review_failure_blocks_acceptance,
+                question=question,
+                cycle_number=max(1, failing_cycle_number),
+                message=blocker_message,
+                prior_submission=latest_submission,
+                trajectory_id=latest_proposer_trajectory.trajectory_id,
             )
-            if acceptance_decision.accepted:
-                accepted_submission = submission
-                accepted_proposer_trajectory = proposer_trajectory
-                break
-            if review_failure_blocks_acceptance and "reviewer_incomplete" in acceptance_decision.blocker_codes:
-                break
-            if stop_on_no_blocking_items and not acceptance_decision.blocking_review_ids:
-                break
+            logger.warning(
+                "react_reviewed_workflow_returning_rejected_result error=%s cycle=%s",
+                blocker_message,
+                failing_cycle_number,
+            )
 
         final_submission = accepted_submission if accepted_submission is not None else latest_submission
         final_proposer_trajectory = accepted_proposer_trajectory if accepted_proposer_trajectory is not None else latest_proposer_trajectory
@@ -4492,8 +6079,14 @@ class ReactReviewedWorkflow:
                 [item.model_dump(exclude_none=True) for item in open_review_items],
             ),
             "final_answer": store.write_text("final_answer.md", final_result.final_answer),
+            "workflow_error": (
+                store.write_text("workflow_error.txt", _compact_text(str(workflow_error)))
+                if workflow_error is not None
+                else None
+            ),
             "qa_result": str(store.path("qa_result.json")),
         }
+        artifact_paths = {key: value for key, value in artifact_paths.items() if value is not None}
         if acceptance_decision.accepted:
             artifact_paths["final_submission"] = store.write_json(
                 "final_submission.json",
@@ -4519,10 +6112,16 @@ class ReactReviewedWorkflow:
         deduped: List[ReviewItem] = []
         seen = set()
         anchor_counts: Dict[Tuple[str, str, int, str], int] = {}
+        placeholder_critiques = {
+            "Reviewer output did not provide critique text.",
+            "Reviewer identified an issue that required salvage normalization.",
+        }
         for item in items:
             current = item
             if item.anchor_kind == "step_section" and item.target_trajectory_id != proposer_trajectory.trajectory_id:
                 current = item.model_copy(update={"target_trajectory_id": proposer_trajectory.trajectory_id})
+            if current.flaw_type == "needs_manual_review" or str(current.critique or "").strip() in placeholder_critiques:
+                continue
             key = (
                 current.reviewer_role,
                 current.anchor_kind,
