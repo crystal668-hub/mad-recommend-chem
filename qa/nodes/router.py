@@ -134,6 +134,36 @@ COMPARISON_CUES_PATTERN = re.compile(r"\b(?:vs\.?|versus|compared with|compare|b
 METRIC_AMBIGUITY_DEFAULT_TERMS: Sequence[str] = ("overpotential", "Tafel slope", "exchange current density")
 
 
+class RouterExecutionError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        stage: str,
+        reason: str,
+        question: str,
+        normalized_question: str,
+        context: Optional[str],
+        debug_payload: Dict[str, Any],
+    ) -> None:
+        super().__init__(reason)
+        self.stage = str(stage or "").strip() or "unknown"
+        self.reason = str(reason or "").strip() or "router execution failed"
+        self.question = str(question or "")
+        self.normalized_question = str(normalized_question or "")
+        self.context = context
+        self.debug_payload = dict(debug_payload or {})
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "error": "router_execution_failed",
+            "stage": self.stage,
+            "reason": self.reason,
+            "question": self.question,
+            "normalized_question": self.normalized_question,
+            "context_present": bool((self.context or "").strip()),
+        }
+
+
 class RouterNode:
     def __init__(self, llm: Any = None, current_year: Optional[int] = None) -> None:
         self.llm = llm
@@ -154,7 +184,8 @@ class RouterNode:
         }
 
         if self.llm is None:
-            return self._finalize_rule_fallback(
+            self._raise_failure(
+                stage="startup",
                 question=question,
                 normalized_question=normalized_question,
                 context=context,
@@ -168,7 +199,8 @@ class RouterNode:
                 auxiliary_signals=auxiliary_signals,
             )
         except Exception as exc:
-            return self._finalize_rule_fallback(
+            self._raise_failure(
+                stage="semantic",
                 question=question,
                 normalized_question=normalized_question,
                 context=context,
@@ -176,7 +208,8 @@ class RouterNode:
             )
 
         if semantic_payload is None:
-            return self._finalize_rule_fallback(
+            self._raise_failure(
+                stage="semantic",
                 question=question,
                 normalized_question=normalized_question,
                 context=context,
@@ -192,7 +225,8 @@ class RouterNode:
                 semantic_payload=semantic_payload,
             )
         except Exception as exc:
-            return self._finalize_rule_fallback(
+            self._raise_failure(
+                stage="localization",
                 question=question,
                 normalized_question=normalized_question,
                 context=context,
@@ -200,7 +234,8 @@ class RouterNode:
             )
 
         if task_spec is None:
-            return self._finalize_rule_fallback(
+            self._raise_failure(
+                stage="localization",
                 question=question,
                 normalized_question=normalized_question,
                 context=context,
@@ -261,29 +296,34 @@ class RouterNode:
         )
         repaired = self._repair_llm_payload(parsed, baseline_payload)
         self.last_run_debug["localization_stage"] = repaired
-        if self._should_use_rule_fallback(semantic_payload=semantic_payload, repaired_payload=repaired):
+        if self._should_reject_llm_payload(semantic_payload=semantic_payload, repaired_payload=repaired):
             return None
         return TaskSpec.model_validate(repaired)
 
-    def _finalize_rule_fallback(
+    def _raise_failure(
         self,
         *,
+        stage: str,
         question: str,
         normalized_question: str,
         context: Optional[str],
         reason: str,
-    ) -> TaskSpec:
-        fallback_payload = self._build_rule_fallback_payload(
+    ) -> None:
+        failure_payload = {
+            "error": "router_execution_failed",
+            "stage": str(stage or "").strip() or "unknown",
+            "reason": str(reason or "").strip() or "router execution failed",
+        }
+        self.last_run_debug["failure"] = failure_payload
+        self.last_run_debug.pop("output", None)
+        raise RouterExecutionError(
+            stage=failure_payload["stage"],
+            reason=failure_payload["reason"],
             question=question,
             normalized_question=normalized_question,
             context=context,
+            debug_payload=self.last_run_debug,
         )
-        fallback_payload = self._append_fallback_flag(fallback_payload, reason=reason)
-        task_spec = TaskSpec.model_validate(fallback_payload)
-        self.last_run_debug["fallback_reason"] = {"reason": reason}
-        self.last_run_debug["fallback_payload"] = task_spec.model_dump(exclude_none=True)
-        self.last_run_debug["output"] = task_spec.model_dump(exclude_none=True)
-        return task_spec
 
     def _build_auxiliary_signals(
         self,
@@ -323,50 +363,6 @@ class RouterNode:
             "currentness_cues_detected": bool(re.search(r"\bcurrent|today|now\b", question, re.I)),
             "referential_entity_cues_detected": bool(REFERENTIAL_ENTITY_SIGNALS.search(question)),
             "auxiliary_ambiguity_flags": [flag.model_dump() for flag in auxiliary_ambiguity_flags],
-        }
-
-    def _build_rule_fallback_payload(
-        self,
-        *,
-        question: str,
-        normalized_question: str,
-        context: Optional[str],
-    ) -> Dict[str, Any]:
-        question_type, question_type_score = self._detect_question_type(question)
-        recency_policy, year_from, year_to, time_score, time_flags = self._detect_time_window(
-            question,
-            question_type=question_type,
-            allow_frontier_default=True,
-        )
-        required_condition_axes = self._extract_required_condition_axes(question)
-        ambiguity_flags = self._build_ambiguity_flags(question, question_type, recency_policy, time_flags)
-        preferred_entity_types = self._extract_preferred_entity_types(question, question_type=question_type)
-        query_constraints = QueryConstraints(
-            must_include_terms=self._extract_must_include_terms(question, year_from, year_to, recency_policy),
-            should_include_terms=self._extract_should_include_terms(question, question_type),
-            exclude_terms=[],
-            preferred_entity_types=preferred_entity_types,
-            allow_broad_expansion=len(ambiguity_flags) > 0 or question_type in {"frontier", "comparison"},
-        )
-        router_confidence = self._estimate_rule_confidence(
-            question_type_score=question_type_score,
-            time_score=time_score,
-            required_condition_axes=required_condition_axes,
-            ambiguity_count=len(ambiguity_flags),
-        )
-        return {
-            "version": "1.0",
-            "question": question,
-            "normalized_question": normalized_question,
-            "question_type": question_type,
-            "recency_policy": recency_policy,
-            "year_from": year_from,
-            "year_to": year_to,
-            "answer_sections": [section.model_dump() for section in self._build_answer_sections(question_type)],
-            "required_condition_axes": required_condition_axes,
-            "query_constraints": query_constraints.model_dump(),
-            "ambiguity_flags": [flag.model_dump() for flag in ambiguity_flags],
-            "router_confidence": router_confidence,
         }
 
     def _build_llm_baseline_payload(
@@ -419,20 +415,6 @@ class RouterNode:
             "ambiguity_flags": [flag.model_dump() for flag in ambiguity_flags],
             "router_confidence": router_confidence,
         }
-
-    def _append_fallback_flag(self, payload: Dict[str, Any], *, reason: str) -> Dict[str, Any]:
-        repaired = dict(payload)
-        ambiguity_flags = list(payload.get("ambiguity_flags") or [])
-        ambiguity_flags.append(
-            AmbiguityFlag(
-                flag_type="task_ambiguous",
-                target="router",
-                note=f"Router used deterministic fallback because {reason}.",
-                severity="low",
-            ).model_dump()
-        )
-        repaired["ambiguity_flags"] = self._dedupe_ambiguity_flag_payloads(ambiguity_flags)
-        return repaired
 
     def _detect_question_type(self, question: str) -> Tuple[str, float]:
         if re.search(r"^\s*why\s+does\b", question, re.I) and any(
@@ -965,7 +947,7 @@ class RouterNode:
                 )
         return self._dedupe_ambiguity_flag_payloads(repaired)
 
-    def _should_use_rule_fallback(
+    def _should_reject_llm_payload(
         self,
         *,
         semantic_payload: Dict[str, Any],

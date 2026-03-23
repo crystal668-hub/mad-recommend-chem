@@ -9,6 +9,7 @@ from qa.nodes.claim_revision import ClaimRevisionNode
 from qa.nodes.contradiction_reviewer import ContradictionReviewer
 from qa.nodes.methodology_reviewer import MethodologyReviewer
 from qa.nodes.review_merge import ReviewMergeNode
+from qa.peer_review_errors import PeerReviewExecutionError
 from qa.review_utils import (
     build_evidence_lookup,
     condition_scope_is_ambiguous,
@@ -56,7 +57,7 @@ class StructuredPeerReviewPipeline:
         max_claims_for_llm_review: int = 40,
         max_second_round_claims: int = 15,
         disable_llm_review_when_abstract_only: bool = True,
-        fallback_mode: str = "deterministic_only",
+        fallback_mode: str = "fail_fast_only",
         progress_log_every_claims: int = 10,
     ) -> None:
         self.methodology_reviewer = methodology_reviewer or MethodologyReviewer()
@@ -67,7 +68,7 @@ class StructuredPeerReviewPipeline:
         self.max_claims_for_llm_review = max(1, int(max_claims_for_llm_review))
         self.max_second_round_claims = max(1, int(max_second_round_claims))
         self.disable_llm_review_when_abstract_only = bool(disable_llm_review_when_abstract_only)
-        self.fallback_mode = str(fallback_mode or "deterministic_only").strip().lower() or "deterministic_only"
+        self.fallback_mode = str(fallback_mode or "fail_fast_only").strip().lower() or "fail_fast_only"
         self.progress_log_every_claims = max(1, int(progress_log_every_claims))
         self.last_execution_warnings: List[str] = []
         self.last_run_stats: Dict[str, object] = {}
@@ -81,13 +82,8 @@ class StructuredPeerReviewPipeline:
         ledger = evidence_ledger.model_copy(deep=True)
         self.last_execution_warnings = []
         self.last_run_stats = self._summarize_ledger(ledger)
-        use_llm_review = self._should_use_llm_review(self.last_run_stats)
-        if not use_llm_review:
-            reason_text = " / ".join(self._llm_disable_reasons(self.last_run_stats))
-            if reason_text:
-                self.last_execution_warnings.append(
-                    f"Peer review degraded to deterministic_only because {reason_text}."
-                )
+        self._ensure_llm_review_ready(self.last_run_stats)
+        use_llm_review = True
         logger.info(
             "qa_peer_review_start claims=%s evidence=%s abstract_only_ratio=%.2f fulltext_sections=%s use_llm=%s",
             self.last_run_stats["claim_count"],
@@ -322,7 +318,7 @@ class StructuredPeerReviewPipeline:
         ledger.ledger_notes = self._merge_notes(
             ledger.ledger_notes,
             [
-                "Module 4 applies structured peer review with deterministic merge rules.",
+                "Module 4 applies structured peer review with validator-gated LLM adjudication.",
                 "Claims may receive at most one conservative revision and at most one targeted second review.",
             ],
         )
@@ -364,18 +360,39 @@ class StructuredPeerReviewPipeline:
             "fulltext_section_count": fulltext_section_count,
         }
 
-    def _should_use_llm_review(self, run_stats: Dict[str, object]) -> bool:
-        if self.fallback_mode != "deterministic_only":
-            return True
-        if int(run_stats.get("claim_count") or 0) > self.max_claims_for_llm_review:
-            return False
-        if (
-            self.disable_llm_review_when_abstract_only
-            and float(run_stats.get("abstract_only_ratio") or 0.0) >= 0.95
-            and int(run_stats.get("fulltext_section_count") or 0) == 0
-        ):
-            return False
-        return True
+    def _ensure_llm_review_ready(self, run_stats: Dict[str, object]) -> None:
+        if self.fallback_mode != "fail_fast_only":
+            raise ValueError(f"Unsupported peer review fallback mode: {self.fallback_mode!r}.")
+        disable_reasons = self._llm_disable_reasons(run_stats)
+        if disable_reasons:
+            raise PeerReviewExecutionError(
+                stage="peer_review_policy",
+                message="Peer review cannot proceed under fail-fast policy.",
+                details={"disable_reasons": disable_reasons},
+                run_stats=dict(run_stats),
+            )
+        missing_nodes = self._missing_llm_nodes()
+        if missing_nodes:
+            raise PeerReviewExecutionError(
+                stage="peer_review_startup",
+                message="Peer review cannot start because one or more reviewer LLMs are unavailable.",
+                details={"missing_nodes": missing_nodes},
+                run_stats=dict(run_stats),
+            )
+
+    def _missing_llm_nodes(self) -> List[str]:
+        nodes = [
+            self.methodology_reviewer,
+            self.citation_reviewer,
+            self.contradiction_reviewer,
+            self.claim_revision_node,
+            self.review_merge_node,
+        ]
+        return [
+            getattr(node, "reviewer_type", node.__class__.__name__)
+            for node in nodes
+            if getattr(node, "llm", None) is None
+        ]
 
     def _llm_disable_reasons(self, run_stats: Dict[str, object]) -> List[str]:
         reasons: List[str] = []

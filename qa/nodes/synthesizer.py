@@ -12,19 +12,80 @@ from qa.synthesis_state import (
 )
 
 
+class SynthesizerExecutionError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        stage: str,
+        reason: str,
+        input_pack: SynthesisInputPack,
+        debug_payload: Dict[str, Any],
+    ) -> None:
+        super().__init__(reason)
+        self.stage = str(stage or "").strip() or "unknown"
+        self.reason = str(reason or "").strip() or "synthesizer execution failed"
+        self.question = str(input_pack.question or "")
+        self.question_type = str(input_pack.task_spec.question_type or "")
+        self.debug_payload = dict(debug_payload or {})
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "error": "synthesizer_execution_failed",
+            "stage": self.stage,
+            "reason": self.reason,
+            "question": self.question,
+            "question_type": self.question_type,
+        }
+
+
 class SynthesizerNode:
     def __init__(self, llm: Any = None) -> None:
         self.llm = llm
+        self.last_run_debug: Dict[str, Any] = {}
 
     def run(self, input_pack: SynthesisInputPack) -> QAResult:
-        deterministic = self.build_deterministic_result(input_pack)
+        self.last_run_debug = {
+            "input_pack": input_pack.model_dump(exclude_none=True),
+        }
         if self.llm is None:
-            return deterministic
+            self._raise_failure(
+                stage="startup",
+                reason="synthesizer LLM is unavailable",
+                input_pack=input_pack,
+            )
 
         candidate = self._synthesize_with_llm(input_pack)
-        return candidate or deterministic
+        if candidate is None:
+            self._raise_failure(
+                stage="synthesis",
+                reason="synthesizer returned unusable output",
+                input_pack=input_pack,
+            )
+        self.last_run_debug["output"] = candidate.model_dump(exclude_none=True)
+        return candidate
 
     __call__ = run
+
+    def _raise_failure(
+        self,
+        *,
+        stage: str,
+        reason: str,
+        input_pack: SynthesisInputPack,
+    ) -> None:
+        failure_payload = {
+            "error": "synthesizer_execution_failed",
+            "stage": str(stage or "").strip() or "unknown",
+            "reason": str(reason or "").strip() or "synthesizer execution failed",
+        }
+        self.last_run_debug["failure"] = failure_payload
+        self.last_run_debug.pop("output", None)
+        raise SynthesizerExecutionError(
+            stage=failure_payload["stage"],
+            reason=failure_payload["reason"],
+            input_pack=input_pack,
+            debug_payload=self.last_run_debug,
+        )
 
     def build_deterministic_result(self, input_pack: SynthesisInputPack) -> QAResult:
         sections: List[AnswerSectionOutput] = []
@@ -87,9 +148,11 @@ class SynthesizerNode:
             {"role": "user", "content": build_synthesizer_user_prompt(input_pack.model_dump(exclude_none=True))},
         ]
         try:
-            parsed = parse_json_object(invoke_llm(self.llm, messages))
+            raw_output = invoke_llm(self.llm, messages)
         except Exception:
             return None
+        self.last_run_debug["raw_output"] = raw_output
+        parsed = parse_json_object(raw_output)
         if parsed is None:
             return None
 

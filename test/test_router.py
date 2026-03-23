@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from qa.nodes.router import RouterNode
+from qa.nodes.router import RouterExecutionError, RouterNode
 
 
 def _semantic_response(
@@ -238,19 +238,20 @@ class RouterNodeTests(unittest.TestCase):
         self.assertEqual(2024, result.year_from)
         self.assertEqual(2026, result.year_to)
 
-    def test_semantic_stage_failure_triggers_rule_fallback(self):
+    def test_semantic_stage_failure_raises_typed_error(self):
         question = "Why does Pt/C improve HER activity in 1 M KOH?"
         llm = _FakeLLM(["not json"])
         router = RouterNode(llm=llm, current_year=2026)
 
-        result = router.run(question)
+        with self.assertRaises(RouterExecutionError) as ctx:
+            router.run(question)
 
-        self.assertEqual("mechanism", result.question_type)
         self.assertEqual(1, len(llm.calls))
-        self.assertIn("semantic stage returned unusable output", router.last_run_debug["fallback_reason"]["reason"])
-        self.assertTrue(any("deterministic fallback" in flag.note for flag in result.ambiguity_flags))
+        self.assertEqual("semantic", ctx.exception.stage)
+        self.assertIn("semantic stage returned unusable output", ctx.exception.reason)
+        self.assertIn("semantic stage returned unusable output", router.last_run_debug["failure"]["reason"])
 
-    def test_localization_stage_failure_triggers_rule_fallback(self):
+    def test_localization_stage_failure_raises_typed_error(self):
         question = "What has been the recent progress in alkaline HER catalysts beyond Pt/C?"
         llm = _FakeLLM(
             [
@@ -264,11 +265,13 @@ class RouterNodeTests(unittest.TestCase):
         )
         router = RouterNode(llm=llm, current_year=2026)
 
-        result = router.run(question)
+        with self.assertRaises(RouterExecutionError) as ctx:
+            router.run(question)
 
-        self.assertEqual("frontier", result.question_type)
         self.assertEqual(2, len(llm.calls))
-        self.assertIn("localization stage returned unusable output", router.last_run_debug["fallback_reason"]["reason"])
+        self.assertEqual("localization", ctx.exception.stage)
+        self.assertIn("localization stage returned unusable output", ctx.exception.reason)
+        self.assertIn("localization stage returned unusable output", router.last_run_debug["failure"]["reason"])
 
     def test_field_level_repair_keeps_llm_mainline_result(self):
         question = "Why is Pt/C more active for alkaline HER in 1 M KOH?"

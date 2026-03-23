@@ -4,8 +4,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from prompts.qa_prompts import CLAIM_REVISION_SYSTEM_PROMPT, build_claim_revision_user_prompt
 from qa.llm_utils import invoke_llm, parse_json_object
+from qa.peer_review_errors import PeerReviewExecutionError
 from qa.review_utils import (
-    build_conservative_claim_text,
     build_evidence_lookup,
     common_condition_scope,
     compatible_with_scope,
@@ -92,22 +92,7 @@ class ClaimRevisionNode:
             opposing_items=valid_evidence_items(updated_oppose_ids, evidence_lookup=evidence_lookup),
         )
         revised_support_items = valid_evidence_items(updated_support_ids, evidence_lookup=evidence_lookup)
-        speculative = (
-            need_downgrade
-            or speculative_text(claim.claim_text)
-            or any(speculative_text(item.snippet) for item in revised_support_items)
-        )
         revised_text = claim.claim_text
-        if updated_scope != claim.condition_scope or need_downgrade or invalid_ref_present:
-            revised_text = build_conservative_claim_text(
-                claim,
-                condition_scope=updated_scope,
-                direction=direction,
-                downgrade=need_downgrade or claim.claim_type in {"causal", "mechanism"},
-                speculative=speculative,
-            )
-            if revised_text != claim.claim_text:
-                notes.append("Rephrased the claim conservatively without changing its topic.")
 
         llm_revision = self._revise_with_llm(
             claim=claim,
@@ -116,19 +101,25 @@ class ClaimRevisionNode:
             conflict_edges=conflict_edges,
             supporting_items=revised_support_items,
             allowed_condition_scope=updated_scope,
-            fallback_claim_text=revised_text,
             use_llm=use_llm,
         )
-        if llm_revision is not None:
-            llm_scope = llm_revision["condition_scope"]
-            filtered_support = [item.evidence_id for item in revised_support_items if compatible_with_scope(item, llm_scope)]
-            filtered_oppose = [item.evidence_id for item in valid_oppose if compatible_with_scope(item, llm_scope)]
-            if filtered_support:
-                updated_scope = llm_scope
-                updated_support_ids = filtered_support
-                updated_oppose_ids = filtered_oppose
-                revised_text = llm_revision["claim_text"]
-                notes.append("LLM revision rewrote the claim conservatively within the allowed scope.")
+        llm_scope = llm_revision["condition_scope"]
+        filtered_support = [item.evidence_id for item in revised_support_items if compatible_with_scope(item, llm_scope)]
+        filtered_oppose = [item.evidence_id for item in valid_oppose if compatible_with_scope(item, llm_scope)]
+        if revised_support_items and not filtered_support:
+            raise PeerReviewExecutionError(
+                stage="claim_revision_invalid_response",
+                message="Claim revision removed all supporting evidence from the allowed scope.",
+                reviewer_type=self.reviewer_type,
+                claim_id=claim.claim_id,
+                response_content=llm_revision,
+            )
+        updated_scope = llm_scope
+        updated_support_ids = filtered_support or updated_support_ids
+        updated_oppose_ids = filtered_oppose
+        revised_text = llm_revision["claim_text"]
+        if revised_text != claim.claim_text:
+            notes.append("LLM revision rewrote the claim conservatively within the allowed scope.")
 
         revision_action = "keep"
         if updated_scope != claim.condition_scope:
@@ -196,11 +187,22 @@ class ClaimRevisionNode:
         conflict_edges: Sequence[ConflictEdge],
         supporting_items: Sequence[object],
         allowed_condition_scope: Dict[str, str],
-        fallback_claim_text: str,
         use_llm: bool,
-    ) -> Optional[Dict[str, Any]]:
-        if self.llm is None or not use_llm:
-            return None
+    ) -> Dict[str, Any]:
+        if not use_llm:
+            raise PeerReviewExecutionError(
+                stage="claim_revision_policy",
+                message="Claim revision requires LLM generation.",
+                reviewer_type=self.reviewer_type,
+                claim_id=claim.claim_id,
+            )
+        if self.llm is None:
+            raise PeerReviewExecutionError(
+                stage="claim_revision_startup",
+                message="Claim revision LLM is unavailable.",
+                reviewer_type=self.reviewer_type,
+                claim_id=claim.claim_id,
+            )
         messages = [
             {"role": "system", "content": CLAIM_REVISION_SYSTEM_PROMPT},
             {
@@ -223,29 +225,58 @@ class ClaimRevisionNode:
             },
         ]
         try:
-            parsed = parse_json_object(invoke_llm(self.llm, messages))
-        except Exception:
-            return None
+            response_content = invoke_llm(self.llm, messages)
+        except Exception as exc:
+            raise PeerReviewExecutionError(
+                stage="claim_revision_invoke",
+                message="Claim revision LLM call failed.",
+                details={"error_type": type(exc).__name__, "error": str(exc)},
+                reviewer_type=self.reviewer_type,
+                claim_id=claim.claim_id,
+            ) from exc
+        parsed = parse_json_object(response_content)
         if not isinstance(parsed, dict):
-            return None
+            raise PeerReviewExecutionError(
+                stage="claim_revision_invalid_response",
+                message="Claim revision returned a non-object payload.",
+                reviewer_type=self.reviewer_type,
+                claim_id=claim.claim_id,
+                response_content=response_content,
+            )
 
         claim_text = str(parsed.get("claim_text") or "").strip()
         if not claim_text:
-            return None
+            raise PeerReviewExecutionError(
+                stage="claim_revision_invalid_response",
+                message="Claim revision returned an empty claim_text.",
+                reviewer_type=self.reviewer_type,
+                claim_id=claim.claim_id,
+                response_content=response_content,
+            )
         if claim.main_entity and claim.main_entity.lower() not in claim_text.lower():
-            return None
+            raise PeerReviewExecutionError(
+                stage="claim_revision_invalid_response",
+                message="Claim revision removed the main entity from the revised claim text.",
+                reviewer_type=self.reviewer_type,
+                claim_id=claim.claim_id,
+                response_content=response_content,
+            )
 
         repaired_scope = self._repair_condition_scope(
             raw_scope=parsed.get("condition_scope"),
             allowed_condition_scope=allowed_condition_scope,
         )
         if repaired_scope is None:
-            return None
+            raise PeerReviewExecutionError(
+                stage="claim_revision_invalid_response",
+                message="Claim revision returned an invalid condition_scope.",
+                reviewer_type=self.reviewer_type,
+                claim_id=claim.claim_id,
+                response_content=response_content,
+            )
 
         if not repaired_scope and allowed_condition_scope:
             repaired_scope = dict(allowed_condition_scope)
-        if claim_text == fallback_claim_text and repaired_scope == allowed_condition_scope:
-            return None
         return {
             "claim_text": claim_text.rstrip(".") + ".",
             "condition_scope": repaired_scope,

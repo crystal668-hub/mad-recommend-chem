@@ -74,8 +74,46 @@ def _build_usable_attempt(
 
 
 class PDFExtractionPipelineTests(unittest.TestCase):
-    def test_process_uses_docling_when_pymupdf_quality_is_rejected(self):
+    def test_process_indexes_born_digital_pdf_with_pymupdf_by_default(self):
         pipeline = PDFExtractionPipeline()
+        pipeline._extract_with_docling = lambda pdf_path: self.fail("docling should be disabled by default")  # type: ignore[method-assign]
+
+        tmpdir = _workspace_tmpdir()
+        try:
+            result = pipeline.process(
+                paper_id="paper-1",
+                pdf_bytes=_make_pdf_bytes(
+                    [
+                        (
+                            "Introduction\nPt/C catalysts remain a common HER benchmark in alkaline electrolyte. "
+                            "Recent reports compare carbon support morphology, metal dispersion, and interfacial water structure. "
+                            "Several studies note that activity trends depend on catalyst loading, KOH concentration, and current-density regime."
+                        ),
+                        (
+                            "Results\nIn 1 M KOH, Pt/C delivered lower overpotential at 10 mA cm-2 than bare carbon and retained stable current "
+                            "over repeated sweeps. Electrochemical impedance suggested faster charge transfer, while Tafel analysis indicated "
+                            "improved apparent kinetics under matched loading and ink formulation."
+                        ),
+                        (
+                            "Discussion\nThe advantage appears to arise from better utilization of exposed Pt sites together with support-enabled "
+                            "wetting and gas release. However, comparisons across papers remain sensitive to normalization choice, catalyst layer "
+                            "thickness, and uncompensated resistance treatment."
+                        ),
+                    ]
+                ),
+                artifact_store=QAArtifactStore(base_dir=tmpdir),
+            )
+            self.assertEqual("fulltext_indexed", result.fulltext_status)
+            self.assertEqual("pymupdf", result.extractor)
+            self.assertFalse(result.ocr_applied)
+            self.assertTrue(Path(result.fulltext_artifact_path).exists())
+            self.assertTrue(Path(result.sections_artifact_path).exists())
+            self.assertTrue(Path(result.snippets_artifact_path).exists())
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_process_uses_docling_when_explicitly_enabled_and_pymupdf_quality_is_rejected(self):
+        pipeline = PDFExtractionPipeline(config={"secondary_backend": "docling"})
         pipeline._extract_with_docling = lambda pdf_path: _build_usable_attempt(pipeline, extractor="docling")  # type: ignore[method-assign]
 
         tmpdir = _workspace_tmpdir()
@@ -94,44 +132,9 @@ class PDFExtractionPipelineTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def test_process_accepts_ocr_output_when_fallback_succeeds(self):
+    def test_process_reports_pymupdf_quality_failure_when_docling_is_disabled(self):
         pipeline = PDFExtractionPipeline()
-        pipeline._extract_with_docling = lambda pdf_path: ExtractionAttempt(  # type: ignore[method-assign]
-            extractor="docling",
-            succeeded=False,
-            failure_reason="docling unavailable",
-        )
-        pipeline._extract_with_ocr = lambda pdf_path: _build_usable_attempt(  # type: ignore[method-assign]
-            pipeline,
-            extractor="pymupdf",
-            ocr_applied=True,
-        )
-
-        tmpdir = _workspace_tmpdir()
-        try:
-            result = pipeline.process(
-                paper_id="paper-1",
-                pdf_bytes=_make_pdf_bytes(["1", "2", "3"]),
-                artifact_store=QAArtifactStore(base_dir=tmpdir),
-            )
-            self.assertEqual("fulltext_indexed", result.fulltext_status)
-            self.assertTrue(result.ocr_applied)
-            self.assertEqual("pymupdf", result.extractor)
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-    def test_process_surfaces_ocr_unavailable_as_warning(self):
-        pipeline = PDFExtractionPipeline()
-        pipeline._extract_with_docling = lambda pdf_path: ExtractionAttempt(  # type: ignore[method-assign]
-            extractor="docling",
-            succeeded=False,
-            failure_reason="docling unavailable",
-        )
-        pipeline._extract_with_ocr = lambda pdf_path: ExtractionAttempt(  # type: ignore[method-assign]
-            extractor="ocrmypdf",
-            succeeded=False,
-            failure_reason="ocr_unavailable",
-        )
+        pipeline._extract_with_docling = lambda pdf_path: self.fail("docling should be disabled by default")  # type: ignore[method-assign]
 
         tmpdir = _workspace_tmpdir()
         try:
@@ -141,7 +144,8 @@ class PDFExtractionPipelineTests(unittest.TestCase):
                 artifact_store=QAArtifactStore(base_dir=tmpdir),
             )
             self.assertEqual("fulltext_unusable", result.fulltext_status)
-            self.assertTrue(any("ocr fallback" in warning.lower() for warning in result.warnings))
+            self.assertEqual([], result.report["attempts"][1:])
+            self.assertTrue(any("pymupdf extraction was rejected by quality gates" in warning.lower() for warning in result.warnings))
             self.assertTrue(Path(result.extraction_report_path).exists())
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)

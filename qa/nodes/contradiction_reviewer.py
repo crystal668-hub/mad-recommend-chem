@@ -7,6 +7,7 @@ from prompts.qa_prompts import (
     build_contradiction_reviewer_user_prompt,
 )
 from qa.llm_utils import invoke_llm, parse_json_object
+from qa.peer_review_errors import PeerReviewExecutionError
 from qa.review_utils import (
     build_evidence_lookup,
     conflict_pair_key,
@@ -169,13 +170,18 @@ class ContradictionReviewer:
         differing_axes: Sequence[str],
         use_llm: bool,
     ) -> Tuple[Optional[str], str, str, str]:
-        default = self._deterministic_conflict_type(
-            left_claim=left_claim,
-            right_claim=right_claim,
-            differing_axes=differing_axes,
-        )
-        if self.llm is None or not use_llm:
-            return default
+        if not use_llm:
+            raise PeerReviewExecutionError(
+                stage="contradiction_reviewer_policy",
+                message="Contradiction reviewer requires LLM adjudication.",
+                reviewer_type=self.reviewer_type,
+            )
+        if self.llm is None:
+            raise PeerReviewExecutionError(
+                stage="contradiction_reviewer_startup",
+                message="Contradiction reviewer LLM is unavailable.",
+                reviewer_type=self.reviewer_type,
+            )
 
         messages = [
             {"role": "system", "content": CONTRADICTION_REVIEWER_SYSTEM_PROMPT},
@@ -198,37 +204,44 @@ class ContradictionReviewer:
             },
         ]
         try:
-            parsed = parse_json_object(invoke_llm(self.llm, messages))
-        except Exception:
-            return default
+            response_content = invoke_llm(self.llm, messages)
+        except Exception as exc:
+            raise PeerReviewExecutionError(
+                stage="contradiction_reviewer_invoke",
+                message="Contradiction reviewer LLM call failed.",
+                details={"error_type": type(exc).__name__, "error": str(exc)},
+                reviewer_type=self.reviewer_type,
+                response_content={
+                    "left_claim_id": left_claim.claim_id,
+                    "right_claim_id": right_claim.claim_id,
+                },
+            ) from exc
+        parsed = parse_json_object(response_content)
+        if not isinstance(parsed, dict):
+            raise PeerReviewExecutionError(
+                stage="contradiction_reviewer_invalid_response",
+                message="Contradiction reviewer returned a non-object payload.",
+                reviewer_type=self.reviewer_type,
+                response_content=response_content,
+            )
         conflict_type = (parsed or {}).get("conflict_type")
         if conflict_type == "no_conflict":
             return None, "info", "LLM adjudication found no actionable conflict after pair prefiltering.", ""
         if conflict_type in {"true_conflict", "condition_divergence"}:
+            reason = str((parsed or {}).get("reason") or "").strip()
+            if not reason:
+                raise PeerReviewExecutionError(
+                    stage="contradiction_reviewer_invalid_response",
+                    message="Contradiction reviewer omitted the required reason field.",
+                    reviewer_type=self.reviewer_type,
+                    response_content=response_content,
+                )
             if conflict_type == "true_conflict":
-                reason = str((parsed or {}).get("reason") or "").strip() or default[2]
                 return "true_conflict", "warning", reason, "True_Conflict"
-            reason = str((parsed or {}).get("reason") or "").strip() or default[2]
             return "condition_divergence", "info", reason, "Condition_Divergence"
-        return default
-
-    def _deterministic_conflict_type(
-        self,
-        *,
-        left_claim: ClaimRecord,
-        right_claim: ClaimRecord,
-        differing_axes: Sequence[str],
-    ) -> Tuple[str, str, str, str]:
-        if scopes_highly_overlap(left_claim.condition_scope, right_claim.condition_scope) and not differing_axes:
-            return (
-                "true_conflict",
-                "warning",
-                "Claims assert opposite directions under materially overlapping conditions.",
-                "True_Conflict",
-            )
-        return (
-            "condition_divergence",
-            "info",
-            "Claims move in opposite directions but differ in condition scope.",
-            "Condition_Divergence",
+        raise PeerReviewExecutionError(
+            stage="contradiction_reviewer_invalid_response",
+            message="Contradiction reviewer returned an unsupported conflict_type.",
+            reviewer_type=self.reviewer_type,
+            response_content=response_content,
         )

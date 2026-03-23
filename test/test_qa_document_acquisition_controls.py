@@ -174,11 +174,21 @@ class DocumentAcquisitionTests(unittest.TestCase):
         pdf_bytes = _make_pdf_bytes(
             [
                 (
-                    "Abstract\n"
-                    + " ".join(["Pt/C improves HER activity in 1 M KOH with stable current density."] * 30)
-                    + "\n\nResults\n"
-                    + " ".join(["The catalyst maintained high activity over repeated cycles in alkaline media."] * 25)
-                )
+                    "Abstract\nPt/C remains a standard HER benchmark in alkaline electrolyte, and recent studies "
+                    "compare dispersion, support morphology, local water structure, and catalyst-layer transport under "
+                    "matched catalyst loading, electrolyte composition, and normalization conventions."
+                ),
+                (
+                    "Results\nIn 1 M KOH, Pt/C delivered lower overpotential at 10 mA cm-2 than bare carbon, "
+                    "retained stable current during repeated sweeps, and showed reduced charge-transfer resistance "
+                    "in impedance measurements under comparable ink formulation, loading, and support surface area."
+                ),
+                (
+                    "Discussion\nThe observed advantage is consistent with improved utilization of exposed Pt sites, "
+                    "faster interfacial charge transfer, and more favorable bubble release, while comparisons remain "
+                    "sensitive to normalization choice, uncompensated resistance treatment, catalyst-layer thickness, "
+                    "and the specific current-density regime used for benchmarking."
+                ),
             ]
         )
         node = DocumentAcquirerNode(
@@ -199,7 +209,7 @@ class DocumentAcquisitionTests(unittest.TestCase):
             self.assertTrue(record.fulltext_available)
             self.assertEqual("fulltext_indexed", record.fulltext_status)
             self.assertEqual("application/pdf", record.fulltext_format)
-            self.assertIn(record.fulltext_extractor, {"pymupdf", "docling"})
+            self.assertEqual("pymupdf", record.fulltext_extractor)
             self.assertTrue(str(record.source_artifact_path).endswith(".pdf"))
             self.assertTrue(str(record.fulltext_artifact_path).endswith(".fulltext.txt"))
             self.assertTrue(str(record.sections_artifact_path).endswith(".sections.json"))

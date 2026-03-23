@@ -24,6 +24,7 @@ from qa.retrieval_state import (
 )
 from qa.runtime import DEFAULT_QA_MODEL_ALIASES
 from qa.state import EntityPack, GroundingState, SourceSpan, TaskSpec
+from qa.synthesis_state import AnswerSectionOutput, QAResult
 from qa.synthesis_pipeline import VerifiedSynthesisPipeline
 from utils import Logger
 import utils.logger as logger_mod
@@ -314,6 +315,84 @@ class StaticPeerReviewPipeline:
         return reviewed
 
 
+class StaticSynthesizer:
+    def run(self, input_pack):
+        sections = []
+        referenced_ids: list[str] = []
+        confidence_lookup = {item.section_id: item.confidence for item in input_pack.section_confidence}
+        title_lookup = {item.section_id: item.title for item in input_pack.section_confidence}
+        for section_pack in input_pack.section_claims:
+            content = section_pack.claim_summaries[0] if section_pack.claim_summaries else "Supported answer unavailable."
+            citation_ids = list(section_pack.core_citation_ids)
+            sections.append(
+                AnswerSectionOutput(
+                    section_id=section_pack.section_id,
+                    title=section_pack.title,
+                    content=content,
+                    citation_ids=citation_ids,
+                    section_confidence=section_pack.section_confidence,
+                )
+            )
+            for citation_id in citation_ids:
+                if citation_id not in referenced_ids:
+                    referenced_ids.append(citation_id)
+
+        limitations_required = bool(
+            input_pack.contested_claims
+            or input_pack.insufficient_evidence
+            or input_pack.overall_confidence.level == "low"
+            or input_pack.retrieval_diagnostics_summary
+        )
+        if limitations_required:
+            limitations_section_id = next(
+                (
+                    item.section_id
+                    for item in input_pack.section_confidence
+                    if item.title == "Limitations / Controversies"
+                ),
+                "limitations_controversies",
+            )
+            sections.append(
+                AnswerSectionOutput(
+                    section_id=limitations_section_id,
+                    title=title_lookup.get(limitations_section_id, "Limitations / Controversies"),
+                    content="Residual uncertainty remains and is preserved explicitly.",
+                    citation_ids=[],
+                    section_confidence=confidence_lookup.get(limitations_section_id, input_pack.overall_confidence),
+                )
+            )
+
+        citation_lookup = {citation.citation_id: citation for citation in input_pack.citation_catalog}
+        claim_trace = [
+            item
+            for item in input_pack.claim_trace
+            if item.section_id in {section.section_id for section in sections}
+        ]
+        final_answer = "\n\n".join(f"## {section.title}\n{section.content}" for section in sections).strip()
+        limitations_summary = next(
+            (section.content for section in sections if section.title == "Limitations / Controversies"),
+            "",
+        )
+        return QAResult(
+            question=input_pack.question,
+            language="en",
+            final_answer=final_answer,
+            sections=sections,
+            citations=[citation_lookup[citation_id] for citation_id in referenced_ids if citation_id in citation_lookup],
+            claim_trace=claim_trace,
+            overall_confidence=input_pack.overall_confidence,
+            section_confidence=[
+                item for item in input_pack.section_confidence if item.section_id in {section.section_id for section in sections}
+            ],
+            insufficient_evidence=input_pack.insufficient_evidence,
+            limitations_summary=limitations_summary,
+            retrieval_diagnostics_summary=input_pack.retrieval_diagnostics_summary,
+            execution_warnings=list(input_pack.execution_warnings),
+            artifact_paths={},
+            time_elapsed=0.0,
+        )
+
+
 class NullLedgerRetrievalPipeline:
     def run_from_grounding(self, grounding_state: GroundingState, *, artifact_dir: str | None = None):
         from qa.retrieval_state import RetrievalState
@@ -367,7 +446,7 @@ def build_ledger_system(
         ledger_builder=EvidenceLedgerBuilder(),
         peer_review_pipeline=None,
     )
-    synthesis_pipeline = VerifiedSynthesisPipeline()
+    synthesis_pipeline = VerifiedSynthesisPipeline(synthesizer=StaticSynthesizer())
     return QASystem(
         config=config,
         grounding_pipeline=grounding_pipeline,

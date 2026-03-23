@@ -23,17 +23,58 @@ QUESTION_TYPE_TERMS: Dict[str, Sequence[str]] = {
     "comparison": ("comparison", "versus"),
     "frontier": ("recent", "advances"),
 }
+PLAN_LANES: Sequence[str] = ("review", "frontier", "data", "contrarian")
+
+
+class QueryPlannerExecutionError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        stage: str,
+        reason: str,
+        task_spec: TaskSpec,
+        debug_payload: Dict[str, Any],
+    ) -> None:
+        super().__init__(reason)
+        self.stage = str(stage or "").strip() or "unknown"
+        self.reason = str(reason or "").strip() or "query planner execution failed"
+        self.question = str(task_spec.question or "")
+        self.normalized_question = str(task_spec.normalized_question or "")
+        self.question_type = str(task_spec.question_type or "")
+        self.debug_payload = dict(debug_payload or {})
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "error": "query_planner_execution_failed",
+            "stage": self.stage,
+            "reason": self.reason,
+            "question": self.question,
+            "normalized_question": self.normalized_question,
+            "question_type": self.question_type,
+        }
 
 
 class QueryPlannerNode:
     def __init__(self, llm: Any = None, current_year: int = 2026) -> None:
         self.llm = llm
         self.current_year = current_year
+        self.last_run_debug: Dict[str, Any] = {}
 
     def run(self, task_spec: TaskSpec, entity_pack: EntityPack) -> List[QueryPlan]:
         baseline = self._build_rule_plans(task_spec=task_spec, entity_pack=entity_pack)
+        self.last_run_debug = {
+            "input": {
+                "task_spec": task_spec.model_dump(exclude_none=True),
+                "entity_pack": entity_pack.model_dump(exclude_none=True),
+            },
+            "prompt_baseline_plans": [plan.model_dump(exclude_none=True) for plan in baseline],
+        }
         if self.llm is None:
-            return baseline
+            self._raise_failure(
+                stage="startup",
+                reason="query planner LLM is unavailable",
+                task_spec=task_spec,
+            )
         try:
             raw_output = invoke_llm(
                 self.llm,
@@ -50,15 +91,55 @@ class QueryPlannerNode:
                     },
                 ],
             )
-            parsed = parse_json_object(raw_output)
-            repaired = self._repair_llm_plans(parsed, baseline)
-            if repaired:
-                return repaired
-        except Exception:
-            pass
-        return baseline
+        except Exception as exc:
+            self._raise_failure(
+                stage="planning",
+                reason=f"query planner LLM call failed: {exc}",
+                task_spec=task_spec,
+            )
+
+        self.last_run_debug["raw_output"] = raw_output
+        parsed = parse_json_object(raw_output)
+        if parsed is None:
+            self._raise_failure(
+                stage="planning",
+                reason="query planner returned unusable output",
+                task_spec=task_spec,
+            )
+
+        repaired = self._validate_llm_plans(parsed)
+        if repaired is None:
+            self._raise_failure(
+                stage="planning",
+                reason="query planner returned unusable output",
+                task_spec=task_spec,
+            )
+
+        self.last_run_debug["output"] = [plan.model_dump(exclude_none=True) for plan in repaired]
+        return repaired
 
     __call__ = run
+
+    def _raise_failure(
+        self,
+        *,
+        stage: str,
+        reason: str,
+        task_spec: TaskSpec,
+    ) -> None:
+        failure_payload = {
+            "error": "query_planner_execution_failed",
+            "stage": str(stage or "").strip() or "unknown",
+            "reason": str(reason or "").strip() or "query planner execution failed",
+        }
+        self.last_run_debug["failure"] = failure_payload
+        self.last_run_debug.pop("output", None)
+        raise QueryPlannerExecutionError(
+            stage=failure_payload["stage"],
+            reason=failure_payload["reason"],
+            task_spec=task_spec,
+            debug_payload=self.last_run_debug,
+        )
 
     def _build_rule_plans(self, task_spec: TaskSpec, entity_pack: EntityPack) -> List[QueryPlan]:
         base_terms = self._collect_base_terms(task_spec=task_spec, entity_pack=entity_pack)
@@ -169,49 +250,52 @@ class QueryPlannerNode:
             must_terms.append(cleaned)
         return must_terms
 
-    def _repair_llm_plans(self, parsed: Optional[Dict[str, Any]], baseline: Sequence[QueryPlan]) -> List[QueryPlan]:
+    def _validate_llm_plans(self, parsed: Optional[Dict[str, Any]]) -> Optional[List[QueryPlan]]:
         if not isinstance(parsed, dict):
-            return list(baseline)
+            return None
         raw_plans = parsed.get("plans")
         if not isinstance(raw_plans, list):
-            return list(baseline)
+            return None
+        if len(raw_plans) != len(PLAN_LANES):
+            return None
 
-        baseline_by_lane = {plan.lane: plan for plan in baseline}
         repaired_by_lane: Dict[str, QueryPlan] = {}
         for raw_plan in raw_plans:
             if not isinstance(raw_plan, dict):
-                continue
+                return None
             lane = str(raw_plan.get("lane") or "").strip()
-            baseline_plan = baseline_by_lane.get(lane)
-            if baseline_plan is None:
-                continue
-            repaired_payload = baseline_plan.model_dump(exclude_none=True)
-            repaired_payload.update(
-                {
-                    "query_text": self._safe_text(raw_plan.get("query_text"), fallback=baseline_plan.query_text),
-                    "must_terms": self._repair_text_list(raw_plan.get("must_terms"), baseline_plan.must_terms),
-                    "exclude_terms": self._repair_text_list(raw_plan.get("exclude_terms"), baseline_plan.exclude_terms),
-                    "year_from": self._safe_year(raw_plan.get("year_from"), fallback=baseline_plan.year_from),
-                    "year_to": self._safe_year(raw_plan.get("year_to"), fallback=baseline_plan.year_to),
-                    "preferred_sources": self._repair_sources(
-                        raw_plan.get("preferred_sources"),
-                        baseline_plan.preferred_sources,
-                    ),
+            if lane not in PLAN_LANES or lane in repaired_by_lane:
+                return None
+            query_text = normalize_text(raw_plan.get("query_text"))
+            must_terms = self._validate_text_list(raw_plan.get("must_terms"))
+            exclude_terms = self._validate_text_list(raw_plan.get("exclude_terms"))
+            preferred_sources = self._validate_sources(raw_plan.get("preferred_sources"))
+            if not query_text or must_terms is None or exclude_terms is None or preferred_sources is None:
+                return None
+            try:
+                repaired_payload = {
+                    "lane": lane,
+                    "query_text": query_text,
+                    "must_terms": must_terms,
+                    "exclude_terms": exclude_terms,
+                    "year_from": self._validate_year(raw_plan.get("year_from")),
+                    "year_to": self._validate_year(raw_plan.get("year_to")),
+                    "preferred_sources": preferred_sources,
                 }
-            )
+            except ValueError:
+                return None
             try:
                 repaired_by_lane[lane] = QueryPlan.model_validate(repaired_payload)
             except Exception:
-                repaired_by_lane[lane] = baseline_plan
+                return None
 
-        return [
-            repaired_by_lane.get(plan.lane, plan)
-            for plan in baseline
-        ]
+        if set(repaired_by_lane) != set(PLAN_LANES):
+            return None
+        return [repaired_by_lane[lane] for lane in PLAN_LANES]
 
-    def _repair_text_list(self, value: Any, fallback: Sequence[str]) -> List[str]:
+    def _validate_text_list(self, value: Any) -> Optional[List[str]]:
         if not isinstance(value, list):
-            return list(fallback)
+            return None
         repaired: List[str] = []
         seen = set()
         for item in value:
@@ -223,26 +307,26 @@ class QueryPlannerNode:
                 continue
             seen.add(key)
             repaired.append(cleaned)
-        return repaired or list(fallback)
+        return repaired
 
-    def _repair_sources(self, value: Any, fallback: Sequence[str]) -> List[str]:
+    def _validate_sources(self, value: Any) -> Optional[List[str]]:
         if not isinstance(value, list):
-            return list(fallback)
+            return None
         allowed = {"openalex", "crossref", "semantic_scholar"}
         repaired = []
         for item in value:
             cleaned = normalize_text(item).lower()
             if cleaned in allowed and cleaned not in repaired:
                 repaired.append(cleaned)
-        return repaired or list(fallback)
+        return repaired or None
 
-    def _safe_year(self, value: Any, fallback: Optional[int]) -> Optional[int]:
+    def _validate_year(self, value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
         try:
             year = int(value)
         except (TypeError, ValueError):
-            return fallback
-        return year if 1900 <= year <= 2100 else fallback
-
-    def _safe_text(self, value: Any, *, fallback: str) -> str:
-        cleaned = normalize_text(value)
-        return cleaned or fallback
+            raise ValueError("invalid year")
+        if not 1900 <= year <= 2100:
+            raise ValueError("invalid year")
+        return year

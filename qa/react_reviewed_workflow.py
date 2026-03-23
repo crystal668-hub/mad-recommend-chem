@@ -17,15 +17,30 @@ from agents.chat_models import build_chat_model_from_config, describe_chat_model
 from agents import react_tool_schemas as tool_schemas
 from agents.react_agent import AgentResponse, ReActAgent, ToolResult
 from agents.react_reasoning import ReActStep, ReActTrajectory, ToolCallRecord
+from prompts.react_reviewed import (
+    build_proposer_action_prompt,
+    build_proposer_repair_system_prompt,
+    build_proposer_system_prompt,
+    build_proposer_thought_prompt,
+    build_proposer_user_prompt,
+    build_review_prompt_contract,
+    build_reviewer_action_prompt,
+    build_reviewer_system_prompt,
+    build_reviewer_thought_prompt,
+    build_reviewer_user_prompt,
+    build_screening_system_prompt,
+    build_submission_prompt_contract,
+    build_submission_prompt_scaffold,
+)
 from qa.artifacts import QAArtifactStore
 from qa.evidence import EvidenceExtractor
 from qa.handoff import EvidenceExtractorHandoff
 from qa.llm_utils import invoke_llm, parse_json_payload
 from qa.nodes.document_acquirer import DocumentAcquirerNode
 from qa.nodes.entity_resolver import EntityResolverNode
-from qa.nodes.query_planner import QueryPlannerNode
+from qa.nodes.query_planner import QueryPlannerExecutionError, QueryPlannerNode
 from qa.nodes.retriever import RetrieverNode
-from qa.nodes.router import RouterNode
+from qa.nodes.router import RouterExecutionError, RouterNode
 from qa.react_reviewed_state import (
     AnswerSubmission,
     ReviewCompletionStatus,
@@ -759,6 +774,29 @@ class ReactReviewedProposerExecutionError(RuntimeError):
         self.trajectory = trajectory
 
 
+class ReactReviewedReviewerExecutionError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        stage: str,
+        cycle_number: int,
+        message: str,
+        reviewer_role: ReviewerRole,
+        details: Optional[Dict[str, Any]] = None,
+        response_content: Any = None,
+        structured_output: Any = None,
+        trajectory: Optional[ReActTrajectory] = None,
+    ) -> None:
+        super().__init__(str(message))
+        self.stage = str(stage)
+        self.cycle_number = int(cycle_number)
+        self.reviewer_role = reviewer_role
+        self.details = dict(details or {})
+        self.response_content = response_content
+        self.structured_output = structured_output
+        self.trajectory = trajectory
+
+
 @dataclass
 class _ProposerRunState:
     evidence_policy: str
@@ -963,6 +1001,29 @@ def _store_execution_failure(
         )
 
 
+def _store_reviewer_execution_failure(
+    *,
+    artifact_store: QAArtifactStore,
+    prefix: str,
+    error: ReactReviewedReviewerExecutionError,
+) -> None:
+    payload = {
+        "stage": error.stage,
+        "cycle_number": error.cycle_number,
+        "reviewer_role": error.reviewer_role,
+        "message": str(error),
+        "details": error.details,
+        "response_content": error.response_content,
+        "structured_output": error.structured_output,
+    }
+    artifact_store.write_json(f"diagnostics/{prefix}_failure.json", payload)
+    if error.trajectory is not None:
+        artifact_store.write_json(
+            f"diagnostics/{prefix}_failure_trajectory.json",
+            error.trajectory.to_dict(),
+        )
+
+
 def _extract_stage_payload(
     *,
     response: Any,
@@ -1048,7 +1109,42 @@ class RouterAgentWrapper:
         context: Optional[str],
         artifact_store: QAArtifactStore,
     ) -> Tuple[TaskSpec, Dict[str, str]]:
-        task_spec = self.router.run(question=question, context=context)
+        try:
+            task_spec = self.router.run(question=question, context=context)
+        except RouterExecutionError as exc:
+            debug_payload = dict(exc.debug_payload or {})
+            semantic_stage_path = None
+            localization_stage_path = None
+            if isinstance(debug_payload.get("semantic_stage"), dict):
+                semantic_stage_path = artifact_store.write_json(
+                    "router/semantic_stage.json",
+                    debug_payload["semantic_stage"],
+                )
+            if isinstance(debug_payload.get("localization_stage"), dict):
+                localization_stage_path = artifact_store.write_json(
+                    "router/localization_stage.json",
+                    debug_payload["localization_stage"],
+                )
+            failure_path = artifact_store.write_json(
+                "router/failure.json",
+                exc.to_payload(),
+            )
+            artifact_store.write_json(
+                "router/agent_run.json",
+                {
+                    "agent": "RouterAgent",
+                    "input": {"question": question, "context": context},
+                    "error": exc.to_payload(),
+                    "debug": debug_payload,
+                },
+            )
+            if semantic_stage_path:
+                debug_payload["semantic_stage_artifact"] = semantic_stage_path
+            if localization_stage_path:
+                debug_payload["localization_stage_artifact"] = localization_stage_path
+            debug_payload["failure_artifact"] = failure_path
+            raise
+
         debug_payload = dict(getattr(self.router, "last_run_debug", {}) or {})
         task_spec_path = artifact_store.write_json(
             "router/task_spec.json",
@@ -1056,7 +1152,6 @@ class RouterAgentWrapper:
         )
         semantic_stage_path = None
         localization_stage_path = None
-        fallback_reason_path = None
         if isinstance(debug_payload.get("semantic_stage"), dict):
             semantic_stage_path = artifact_store.write_json(
                 "router/semantic_stage.json",
@@ -1066,11 +1161,6 @@ class RouterAgentWrapper:
             localization_stage_path = artifact_store.write_json(
                 "router/localization_stage.json",
                 debug_payload["localization_stage"],
-            )
-        if isinstance(debug_payload.get("fallback_reason"), dict):
-            fallback_reason_path = artifact_store.write_json(
-                "router/fallback_reason.json",
-                debug_payload["fallback_reason"],
             )
         audit_path = artifact_store.write_json(
             "router/agent_run.json",
@@ -1089,8 +1179,6 @@ class RouterAgentWrapper:
             artifacts["router_semantic_stage"] = semantic_stage_path
         if localization_stage_path:
             artifacts["router_localization_stage"] = localization_stage_path
-        if fallback_reason_path:
-            artifacts["router_fallback_reason"] = fallback_reason_path
         return task_spec, artifacts
 
 
@@ -1482,7 +1570,11 @@ class ReactReviewedWorkspace:
         return self.document_acquirer
 
     def plan_queries(self, *, focus: str = "initial") -> List[Dict[str, Any]]:
-        plans = self.query_planner.run(task_spec=self.task_spec, entity_pack=self.entity_pack)
+        try:
+            plans = self.query_planner.run(task_spec=self.task_spec, entity_pack=self.entity_pack)
+        except QueryPlannerExecutionError as exc:
+            self._write_query_planner_failure_artifacts(error=exc)
+            raise
         payloads: List[Dict[str, Any]] = []
         for plan in plans:
             query_plan_id = self._find_registered_query_plan_id(plan, prefix="qp")
@@ -1497,6 +1589,25 @@ class ReactReviewedWorkspace:
             )
         self._write_retrieval_snapshot()
         return payloads
+
+    def _write_query_planner_failure_artifacts(self, *, error: QueryPlannerExecutionError) -> None:
+        debug_payload = dict(error.debug_payload or {})
+        self.store.write_json(
+            "query_planner/failure.json",
+            error.to_payload(),
+        )
+        self.store.write_json(
+            "query_planner/agent_run.json",
+            {
+                "agent": "QueryPlannerNode",
+                "input": {
+                    "task_spec": self.task_spec.model_dump(exclude_none=True),
+                    "entity_pack": self.entity_pack.model_dump(exclude_none=True),
+                },
+                "error": error.to_payload(),
+                "debug": debug_payload,
+            },
+        )
 
     def _ensure_query_plan(self, query_plan_id: Optional[str], query_text: Optional[str], lane: str) -> Tuple[str, QueryPlan]:
         normalized_lane = lane if lane in {"review", "frontier", "data", "contrarian"} else "data"
@@ -2328,25 +2439,17 @@ class ReactReviewedProposerAgent:
         open_review_items: Sequence[ReviewItem],
         ranked_candidates: Sequence[Dict[str, Any]],
         max_candidates: int,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Tuple[Optional[Dict[str, Any]], Any]:
         provider, model_name, has_api_key = describe_chat_model_config(self.model_config)
         if not provider or not model_name or not has_api_key:
-            return None
+            return None, None
         llm = build_chat_model_from_config(self.model_config)
         raw_response = invoke_llm(
             llm,
             [
                 {
                     "role": "system",
-                    "content": (
-                        "You are screening retrieved chemistry papers before document acquisition.\n"
-                        "Return STRICT JSON only.\n"
-                        "Return EXACTLY {\"locked_paper_ids\": [...], \"dropped_paper_ids\": [...], \"decisions\": [...]}.\n"
-                        "Each decisions item must be {\"paper_id\": str, \"decision\": \"lock\"|\"drop\", \"reason\": str}.\n"
-                        "Prefer papers that are strongly relevant to the exact question and have better full-text acquisition signals.\n"
-                        "Drop papers whose abstract/metadata are generic, weakly related, or likely to fail acquisition.\n"
-                        f"Lock at most {max_candidates} papers.\n"
-                    ),
+                    "content": build_screening_system_prompt(max_candidates=max_candidates),
                 },
                 {
                     "role": "user",
@@ -2366,7 +2469,7 @@ class ReactReviewedProposerAgent:
         )
         parsed = parse_json_payload(raw_response)
         if not isinstance(parsed, dict):
-            return None
+            return None, raw_response
         allowed_ids = {str(item.get("paper_id") or "").strip() for item in ranked_candidates if str(item.get("paper_id") or "").strip()}
         decisions = []
         decision_map: Dict[str, Dict[str, Any]] = {}
@@ -2382,7 +2485,7 @@ class ReactReviewedProposerAgent:
             decisions.append(current)
             decision_map[paper_id] = current
         if not decisions:
-            return None
+            return None, raw_response
         locked_paper_ids: List[str] = []
         dropped_paper_ids: List[str] = []
         ranked_payload: List[Dict[str, Any]] = []
@@ -2403,13 +2506,16 @@ class ReactReviewedProposerAgent:
             elif paper_id not in dropped_paper_ids:
                 dropped_paper_ids.append(paper_id)
         if not locked_paper_ids:
-            return None
-        return {
-            "locked_paper_ids": locked_paper_ids,
-            "dropped_paper_ids": dropped_paper_ids,
-            "ranked_candidates": ranked_payload,
-            "llm_screening_used": True,
-        }
+            return None, raw_response
+        return (
+            {
+                "locked_paper_ids": locked_paper_ids,
+                "dropped_paper_ids": dropped_paper_ids,
+                "ranked_candidates": ranked_payload,
+                "llm_screening_used": True,
+            },
+            raw_response,
+        )
 
     def _screen_candidate_papers(
         self,
@@ -2447,41 +2553,95 @@ class ReactReviewedProposerAgent:
                 -float(item.get("retrieval_score") or 0.0),
             )
         )
-        deterministic_payload = {
-            "locked_paper_ids": [
-                str(item.get("paper_id"))
-                for item in ranked_candidates
-                if str(item.get("decision") or "") == "lock"
-            ][: max(1, int(max_candidates))],
-            "dropped_paper_ids": [
-                str(item.get("paper_id"))
-                for item in ranked_candidates
-                if str(item.get("paper_id") or "") and str(item.get("paper_id")) not in {
-                    str(locked_id) for locked_id in [
-                        str(candidate_id)
-                        for candidate_id in [
-                            str(item.get("paper_id"))
-                            for item in ranked_candidates
-                            if str(item.get("decision") or "") == "lock"
-                        ][: max(1, int(max_candidates))]
-                    ]
-                }
-            ],
-            "ranked_candidates": ranked_candidates,
-            "llm_screening_used": False,
-        }
+        provider, model_name, has_api_key = describe_chat_model_config(self.model_config)
+        if not provider or not model_name or not has_api_key:
+            payload = {
+                "stage": "proposer_screening",
+                "cycle_number": cycle_number,
+                "message": "candidate screening requires an LLM model configuration",
+                "ranked_candidates": ranked_candidates,
+                "llm_screening_used": False,
+            }
+            workspace.store.write_json(
+                f"proposer_cycle_{cycle_number}_candidate_screening.json",
+                payload,
+            )
+            self._raise_execution_failure(
+                workspace=workspace,
+                cycle_number=cycle_number,
+                stage="proposer_screening",
+                message="Candidate screening requires an enabled LLM configuration.",
+                details={
+                    "reason": "missing_model_config",
+                    "ranked_candidate_count": len(ranked_candidates),
+                    "max_candidates": int(max_candidates),
+                },
+                structured_output=payload,
+            )
         try:
-            llm_payload = self._llm_screen_candidate_papers(
+            llm_result = self._llm_screen_candidate_papers(
                 workspace=workspace,
                 cycle_number=cycle_number,
                 open_review_items=open_review_items,
                 ranked_candidates=ranked_candidates[:8],
                 max_candidates=max_candidates,
             )
+            if isinstance(llm_result, tuple) and len(llm_result) == 2:
+                llm_payload, screening_raw_response = llm_result
+            else:
+                llm_payload = llm_result
+                screening_raw_response = None
         except Exception as exc:
-            workspace._merge_execution_warnings([f"candidate screening fell back to deterministic ranking: {exc}"])
-            llm_payload = None
-        payload = llm_payload or deterministic_payload
+            payload = {
+                "stage": "proposer_screening",
+                "cycle_number": cycle_number,
+                "message": f"candidate screening LLM execution failed: {exc}",
+                "ranked_candidates": ranked_candidates,
+                "llm_screening_used": False,
+            }
+            workspace.store.write_json(
+                f"proposer_cycle_{cycle_number}_candidate_screening.json",
+                payload,
+            )
+            self._raise_execution_failure(
+                workspace=workspace,
+                cycle_number=cycle_number,
+                stage="proposer_screening",
+                message=f"Candidate screening LLM execution failed: {exc}",
+                details={
+                    "reason": "llm_screening_exception",
+                    "ranked_candidate_count": len(ranked_candidates),
+                    "max_candidates": int(max_candidates),
+                },
+                response_content=getattr(exc, "response_content", None),
+                structured_output=payload,
+            )
+        if not isinstance(llm_payload, dict):
+            payload = {
+                "stage": "proposer_screening",
+                "cycle_number": cycle_number,
+                "message": "candidate screening produced no valid structured payload",
+                "ranked_candidates": ranked_candidates,
+                "llm_screening_used": False,
+            }
+            workspace.store.write_json(
+                f"proposer_cycle_{cycle_number}_candidate_screening.json",
+                payload,
+            )
+            self._raise_execution_failure(
+                workspace=workspace,
+                cycle_number=cycle_number,
+                stage="proposer_screening",
+                message="Candidate screening produced no valid structured payload.",
+                details={
+                    "reason": "invalid_screening_payload",
+                    "ranked_candidate_count": len(ranked_candidates),
+                    "max_candidates": int(max_candidates),
+                },
+                response_content=screening_raw_response,
+                structured_output=payload,
+            )
+        payload = llm_payload
         workspace.store.write_json(
             f"proposer_cycle_{cycle_number}_candidate_screening.json",
             payload,
@@ -2856,7 +3016,12 @@ class ReactReviewedProposerAgent:
             ),
             StructuredTool.from_function(conclude, name="conclude", args_schema=tool_schemas.ProposerConcludeToolInput),
         ]
-        system_prompt = self._build_system_prompt()
+        conclude_call_contract = self._build_submission_prompt_contract(
+            workspace=workspace,
+            cycle_number=cycle_number,
+            open_review_items=open_review_items,
+        )
+        system_prompt = self._build_system_prompt(conclude_call_contract=conclude_call_contract)
         try:
             agent = ReActAgent(
                 agent_id="qa_react_proposer",
@@ -2867,7 +3032,10 @@ class ReactReviewedProposerAgent:
                 verbose=False,
                 tools=tools,
                 thought_phase_instruction=self._thought_instruction(),
-                action_phase_instruction=self._action_instruction(PROPOSER_TOOL_NAMES),
+                action_phase_instruction=self._action_instruction(
+                    PROPOSER_TOOL_NAMES,
+                    conclude_call_contract=conclude_call_contract,
+                ),
                 search_tool_names=[
                     "plan_queries",
                     "search_papers",
@@ -2885,7 +3053,12 @@ class ReactReviewedProposerAgent:
             )
             agent_holder["agent"] = agent
             response, trajectory = agent.generate_response_with_react(
-                query=self._build_user_prompt(workspace=workspace, cycle_number=cycle_number, open_review_items=open_review_items),
+                query=self._build_user_prompt(
+                    workspace=workspace,
+                    cycle_number=cycle_number,
+                    open_review_items=open_review_items,
+                    conclude_call_contract=conclude_call_contract,
+                ),
                 system_prompt_override=system_prompt,
                 max_steps_override=self.max_steps_initial if cycle_number == 1 else self.max_steps_revision,
                 llm_timeout_seconds=self.llm_timeout_seconds,
@@ -3051,49 +3224,15 @@ class ReactReviewedProposerAgent:
         cycle_number: int,
         open_review_items: Sequence[ReviewItem],
     ) -> Dict[str, Any]:
-        issue_refs = [item.review_id for item in open_review_items if item.review_id]
-        return {
-            "submission_id": f"submission_cycle_{cycle_number}",
-            "question": workspace.question,
-            "version": cycle_number,
-            "sections": [
-                {
-                    "section_id": section.section_id,
-                    "title": section.title,
-                    "content": "<grounded section content>",
-                    "citation_ids": ["<citation_id_from_citations>"],
-                    "step_refs": [{"trajectory_id": "<trajectory_id>", "step_number": 1}],
-                    "issue_refs": list(issue_refs),
-                    "section_confidence": {
-                        "level": "medium",
-                        "score": 0.5,
-                        "rationale": "<brief section confidence rationale>",
-                    },
-                }
+        return build_submission_prompt_scaffold(
+            question=workspace.question,
+            cycle_number=cycle_number,
+            answer_sections=[
+                {"section_id": section.section_id, "title": section.title}
                 for section in workspace.task_spec.answer_sections
             ],
-            "citations": [
-                {
-                    "citation_id": "CIT-1",
-                    "paper_id": "<paper_id_from_search_papers>",
-                    "doi": None,
-                    "title": "<paper_title_from_tools>",
-                    "year": None,
-                    "venue": None,
-                    "section_ids": ["<section_id_from_tools_or_sec_abstract>"],
-                    "evidence_ids": ["<evidence_id_from_tools>"],
-                }
-            ],
-            "limitations": ["<explicit limitation grounded in the current run>"],
-            "overall_confidence": {
-                "level": "medium",
-                "score": 0.5,
-                "rationale": "<overall confidence rationale grounded in retrieved evidence>",
-            },
-            "trajectory_id": "<trajectory_id>",
-            "step_refs": [{"trajectory_id": "<trajectory_id>", "step_number": 1}],
-            "issue_refs": issue_refs,
-        }
+            issue_refs=[item.review_id for item in open_review_items if item.review_id],
+        )
 
     def _build_submission_prompt_contract(
         self,
@@ -3102,54 +3241,15 @@ class ReactReviewedProposerAgent:
         cycle_number: int,
         open_review_items: Sequence[ReviewItem],
     ) -> Dict[str, Any]:
-        submission_template = self._build_submission_prompt_scaffold(
-            workspace=workspace,
+        return build_submission_prompt_contract(
+            question=workspace.question,
             cycle_number=cycle_number,
-            open_review_items=open_review_items,
+            answer_sections=[
+                {"section_id": section.section_id, "title": section.title}
+                for section in workspace.task_spec.answer_sections
+            ],
+            issue_refs=[item.review_id for item in open_review_items if item.review_id],
         )
-        return {
-            "tool_name": "conclude",
-            "tool_call_rule": (
-                "Call conclude with exactly {\"submission\": {...}}. Do not send a bare payload and do not use "
-                "alternate top-level keys such as payload, answer_sections, or review."
-            ),
-            "canonical_submission_keys": [
-                "submission_id",
-                "question",
-                "version",
-                "sections",
-                "citations",
-                "limitations",
-                "overall_confidence",
-                "trajectory_id",
-                "step_refs",
-                "issue_refs",
-            ],
-            "required_section_ids": [section.section_id for section in workspace.task_spec.answer_sections],
-            "section_object_keys": [
-                "section_id",
-                "title",
-                "content",
-                "citation_ids",
-                "step_refs",
-                "issue_refs",
-                "section_confidence",
-            ],
-            "citation_object_keys": [
-                "citation_id",
-                "paper_id",
-                "doi",
-                "title",
-                "year",
-                "venue",
-                "section_ids",
-                "evidence_ids",
-            ],
-            "step_ref_keys": ["trajectory_id", "step_number"],
-            "confidence_object_keys": ["level", "score", "rationale"],
-            "tool_call_example": {"submission": submission_template},
-            "repair_json_example": {"kind": "submission", "payload": submission_template},
-        }
 
     def _patch_submission_from_prior_context(
         self,
@@ -3493,19 +3593,13 @@ class ReactReviewedProposerAgent:
                         {
                             "role": "system",
                             "content": (
-                                "You are repairing an invalid AnswerSubmission for a chemistry QA proposer.\n"
-                                "Return STRICT JSON only.\n"
-                                "Return EXACTLY {\"kind\":\"submission\",\"payload\":{...}}.\n"
-                                "The canonical submission keys are submission_id, question, version, sections, citations, limitations, overall_confidence, trajectory_id, step_refs, and issue_refs.\n"
-                                "The payload object must be the same canonical inner object that would be passed to conclude as {\"submission\": payload}.\n"
-                                "Use only the supplied task_spec, entity_pack, review items, retrieval state, and cited IDs.\n"
-                                "Do not invent citations, evidence_ids, section_ids, or papers.\n"
-                                "If prior_submission is provided, treat it as the base canonical submission and patch only what the current validation error or new review items require.\n"
-                                "Preserve prior section structure, citation catalog shape, and issue links unless the current run state makes a prior anchor invalid.\n"
-                                "Do not copy angle-bracket placeholders, duplicate section entries, malformed fragments, or markdown fences from the invalid response.\n"
-                                "Rebuild a fresh canonical payload from grounded run state and keep only verifiable content.\n"
-                                "If the current run has only abstract-backed evidence, include an explicit degraded-evidence limitation and lower overall confidence.\n"
-                                "Keep the repaired payload concise. Each section should normally stay within 1-3 short sentences.\n"
+                                build_proposer_repair_system_prompt(
+                                    conclude_contract=self._build_submission_prompt_contract(
+                                        workspace=workspace,
+                                        cycle_number=cycle_number,
+                                        open_review_items=open_review_items,
+                                    )
+                                )
                             ),
                         },
                         {
@@ -4377,30 +4471,8 @@ class ReactReviewedProposerAgent:
             )
         return "Evidence remains insufficient to support a stronger section-level answer."
 
-    def _build_system_prompt(self) -> str:
-        return (
-            "You are ProposerAgent in a chemistry QA workflow.\n"
-            "Fixed upstream inputs are RouterAgent TaskSpec and EntityResolverAgent outputs; do not challenge them.\n"
-            "You are the primary retrieval orchestrator for this cycle.\n"
-            "You must build an AnswerSubmission already sectioned according to TaskSpec.answer_sections.\n"
-            "When you call conclude, the tool arguments must be exactly {\"submission\": <AnswerSubmission>}.\n"
-            "Do not send a bare payload and do not rename the wrapper key to payload, answer_sections, or any other alias.\n"
-            "Required phase order: 1) plan_queries, 2) search_papers, 3) screen_papers, 4) acquire_document, 5) read_sections/extract_evidence, 6) conclude.\n"
-            "Never skip directly to conclude before evidence extraction succeeds.\n"
-            "You may refine retrieval with additional ad hoc searches after plan_queries, but every paper you acquire must come from prior search_papers results in this cycle.\n"
-            "screen_papers is mandatory after each new search result set. Only papers locked by screen_papers may be acquired.\n"
-            "Once screen_papers locks candidates, acquire those locked papers before running more search_papers.\n"
-            "Metadata-source priority: use OpenAlex first, then Semantic Scholar, and treat Crossref mainly as supplemental metadata and verification.\n"
-            "Selection rubric, in order: entity/condition alignment with TaskSpec; question-type and lane fit; full-text availability signal; evidence density after extraction; coverage diversity when multiple papers are needed.\n"
-            "Prefer full-text evidence. If usable full-text evidence exists, use fulltext-backed citations in substantive sections.\n"
-            "If only abstract-backed evidence is available, you may submit a degraded answer only if the abstract is clearly relevant to the question, you explicitly disclose the degradation in limitations, and you lower overall confidence.\n"
-            "If prior_submission is provided for a revision cycle, patch that prior canonical submission instead of rewriting the entire answer from scratch.\n"
-            "Only use citations, section_ids, and evidence_ids returned by tools in this cycle.\n"
-            "There is no deterministic fallback. If the run cannot produce a valid evidence-backed submission within budget, fail explicitly.\n"
-            "If conclude returns a validation error, fix the submission object rather than inventing unsupported anchors.\n"
-            "When finished, call the conclude tool with the final structured submission payload.\n"
-            "Do not output free text instead of the conclude tool call.\n"
-        )
+    def _build_system_prompt(self, *, conclude_call_contract: Dict[str, Any]) -> str:
+        return build_proposer_system_prompt(conclude_contract=conclude_call_contract)
 
     def _build_user_prompt(
         self,
@@ -4408,77 +4480,63 @@ class ReactReviewedProposerAgent:
         workspace: ReactReviewedWorkspace,
         cycle_number: int,
         open_review_items: Sequence[ReviewItem],
+        conclude_call_contract: Optional[Dict[str, Any]] = None,
     ) -> str:
-        conclude_call_contract = self._build_submission_prompt_contract(
-            workspace=workspace,
+        if conclude_call_contract is None:
+            conclude_call_contract = self._build_submission_prompt_contract(
+                workspace=workspace,
+                cycle_number=cycle_number,
+                open_review_items=open_review_items,
+            )
+        return build_proposer_user_prompt(
             cycle_number=cycle_number,
-            open_review_items=open_review_items,
-        )
-        return _json_preview(
-            {
-                "cycle_number": cycle_number,
-                "question": workspace.question,
-                "context": workspace.context,
-                "task_spec": workspace.task_spec.model_dump(exclude_none=True),
-                "entity_pack": workspace.entity_pack.model_dump(exclude_none=True),
-                "prior_submission": (
-                    workspace.current_submission.model_dump(exclude_none=True)
-                    if workspace.current_submission is not None
-                    else None
-                ),
-                "prior_proposer_trajectory": (
-                    workspace.current_proposer_trajectory.to_dict()
-                    if workspace.current_proposer_trajectory is not None
-                    else None
-                ),
-                "open_review_items": [item.model_dump(exclude_none=True) for item in open_review_items],
-                "conclude_call_contract": conclude_call_contract,
-                "retrieval_policy": {
-                    "fallback_mode": self.fallback_mode,
-                    "repair_attempts": self.repair_attempts,
-                    "evidence_policy": self.evidence_policy,
-                        "phase_order": [
-                            "plan_queries",
-                            "search_papers",
-                            "screen_papers",
-                            "acquire_document",
-                            "read_sections_or_extract_evidence",
-                            "conclude",
-                    ],
-                    "selection_rubric": [
-                        "entity_and_condition_alignment",
-                        "question_type_and_lane_fit",
-                        "fulltext_availability_signal",
-                        "evidence_density_after_extraction",
-                        "coverage_diversity",
-                    ],
-                },
+            question=workspace.question,
+            context=workspace.context,
+            task_spec=workspace.task_spec.model_dump(exclude_none=True),
+            entity_pack=workspace.entity_pack.model_dump(exclude_none=True),
+            prior_submission=(
+                workspace.current_submission.model_dump(exclude_none=True)
+                if workspace.current_submission is not None
+                else None
+            ),
+            prior_proposer_trajectory=(
+                workspace.current_proposer_trajectory.to_dict()
+                if workspace.current_proposer_trajectory is not None
+                else None
+            ),
+            open_review_items=[item.model_dump(exclude_none=True) for item in open_review_items],
+            conclude_call_contract=conclude_call_contract,
+            retrieval_policy={
+                "fallback_mode": self.fallback_mode,
+                "repair_attempts": self.repair_attempts,
+                "evidence_policy": self.evidence_policy,
+                "phase_order": [
+                    "plan_queries",
+                    "search_papers",
+                    "screen_papers",
+                    "acquire_document",
+                    "read_sections_or_extract_evidence",
+                    "conclude",
+                ],
+                "selection_rubric": [
+                    "entity_and_condition_alignment",
+                    "question_type_and_lane_fit",
+                    "fulltext_availability_signal",
+                    "evidence_density_after_extraction",
+                    "coverage_diversity",
+                ],
             },
-            limit=12000,
         )
 
     def _thought_instruction(self) -> str:
-        return (
-            "CURRENT PHASE: THOUGHT\n"
-            "State the next retrieval or revision intent in 1-2 short sentences.\n"
-            "Do not output JSON.\n"
-        )
+        return build_proposer_thought_prompt()
 
-    def _action_instruction(self, tool_names: Sequence[str]) -> str:
+    def _action_instruction(self, tool_names: Sequence[str], *, conclude_call_contract: Dict[str, Any]) -> str:
         retrieval_tools = [name for name in tool_names if name not in {"analyze_submission_gap", "conclude"}]
-        return (
-            "CURRENT PHASE: ACTION\n"
-            "You must call tools instead of answering in free text.\n"
-            f"Allowed tools: {', '.join(tool_names)}.\n"
-            f"Treat these as retrieval/inspection tools: {', '.join(retrieval_tools)}.\n"
-            "Call plan_queries before any search. Call screen_papers after each new search result set. Once screen_papers locks candidates, call acquire_document on those locked paper_ids before any more search_papers. Call acquire_document only for papers returned by search_papers and locked by screen_papers in this cycle.\n"
-            "Prefer metadata screening from OpenAlex and Semantic Scholar; use Crossref as a supplement and verifier rather than the primary discovery source.\n"
-            "Call extract_evidence before conclude. Prefer fulltext-backed evidence when it exists.\n"
-            "Do not mix retrieval tools with conclude in the same step.\n"
-            "For conclude, the tool args object must be exactly {\"submission\": {...}}.\n"
-            "Do not pass a bare submission object and do not use alternate top-level keys such as payload or answer_sections.\n"
-            "Use conclude only when the submission object is ready.\n"
-            "The final step must call the conclude tool with the completed submission payload.\n"
+        return build_proposer_action_prompt(
+            tool_names=tool_names,
+            retrieval_tools=retrieval_tools,
+            conclude_contract=conclude_call_contract,
         )
 
     def _add_tool_step(
@@ -4552,29 +4610,14 @@ class ReactReviewedReviewerAgent:
                 retrieval_budget_limit=session.budget_state.budget_limit,
                 budget_blocked_calls=session.budget_state.blocked_calls,
             )
-        if agent_output is not None:
-            items, trajectory, completion_status = agent_output
-            return items, trajectory, ReviewerRunStatus(
-                reviewer_role=self.reviewer_role,
-                status=completion_status,
-                message="completed" if completion_status == "completed" else "salvaged reviewer output",
-                cycle_number=cycle_number,
-                retrieval_actions_used=session.budget_state.actions_used,
-                retrieval_budget_limit=session.budget_state.budget_limit,
-                budget_blocked_calls=session.budget_state.blocked_calls,
-            )
-        workspace.restore_mutable_state(stage_snapshot)
-        items, trajectory = self._run_deterministic(
-            workspace=workspace,
-            submission=submission,
-            proposer_trajectory=proposer_trajectory,
-            cycle_number=cycle_number,
-            session=session,
-        )
+        except ReactReviewedReviewerExecutionError:
+            workspace.restore_mutable_state(stage_snapshot, write_snapshot=True)
+            raise
+        items, trajectory, completion_status = agent_output
         return items, trajectory, ReviewerRunStatus(
             reviewer_role=self.reviewer_role,
-            status="completed",
-            message="completed",
+            status=completion_status,
+            message="completed" if completion_status == "completed" else "salvaged reviewer output",
             cycle_number=cycle_number,
             retrieval_actions_used=session.budget_state.actions_used,
             retrieval_budget_limit=session.budget_state.budget_limit,
@@ -4589,11 +4632,28 @@ class ReactReviewedReviewerAgent:
         proposer_trajectory: ReActTrajectory,
         cycle_number: int,
         session: ReviewerSession,
-    ) -> Optional[Tuple[List[ReviewItem], ReActTrajectory, str]]:
+    ) -> Tuple[List[ReviewItem], Optional[ReActTrajectory], str]:
         StructuredTool = _lazy_structured_tool_import()
         provider, model_name, has_api_key = describe_chat_model_config(self.model_config)
         if StructuredTool is None or not has_api_key or not provider or not model_name:
-            return None
+            error = ReactReviewedReviewerExecutionError(
+                stage="reviewer_startup",
+                cycle_number=cycle_number,
+                reviewer_role=self.reviewer_role,
+                message="Reviewer requires an enabled LLM configuration and StructuredTool support.",
+                details={
+                    "structured_tool_available": StructuredTool is not None,
+                    "provider": provider,
+                    "model": model_name,
+                    "has_api_key": has_api_key,
+                },
+            )
+            _store_reviewer_execution_failure(
+                artifact_store=session.artifact_store,
+                prefix=f"{self.reviewer_role}_cycle_{cycle_number}",
+                error=error,
+            )
+            raise error
 
         allowed_tool_names = REVIEWER_TOOL_NAMES[self.reviewer_role]
         agent_holder: Dict[str, Any] = {}
@@ -4766,7 +4826,11 @@ class ReactReviewedReviewerAgent:
             StructuredTool.from_function(tool_builders[name], name=name, args_schema=tool_args_schemas[name])
             for name in allowed_tool_names
         ]
-        system_prompt = self._build_system_prompt()
+        conclude_call_contract = self._build_review_prompt_contract(
+            submission=submission,
+            proposer_trajectory=proposer_trajectory,
+        )
+        system_prompt = self._build_system_prompt(conclude_call_contract=conclude_call_contract)
         try:
             agent = ReActAgent(
                 agent_id=f"qa_reviewer_{self.reviewer_role}",
@@ -4776,13 +4840,11 @@ class ReactReviewedReviewerAgent:
                 max_react_steps=self.max_steps,
                 verbose=False,
                 tools=tools,
-                thought_phase_instruction="CURRENT PHASE: THOUGHT\nState the next audit target in one short sentence.\n",
-                action_phase_instruction=(
-                    "CURRENT PHASE: ACTION\n"
-                    f"Allowed tools: {', '.join(allowed_tool_names)}.\n"
-                    f"Charged retrieval budget: {session.budget_state.budget_limit} cache-miss actions.\n"
-                    "Use conclude only when the review item list is ready.\n"
-                    "The final step must call the conclude tool with the completed review payload.\n"
+                thought_phase_instruction=build_reviewer_thought_prompt(),
+                action_phase_instruction=build_reviewer_action_prompt(
+                    tool_names=allowed_tool_names,
+                    retrieval_budget=session.budget_state.budget_limit,
+                    conclude_contract=conclude_call_contract,
                 ),
                 search_tool_names=[name for name in allowed_tool_names if name != "conclude"],
                 analysis_tool_names=["conclude"],
@@ -4795,6 +4857,7 @@ class ReactReviewedReviewerAgent:
                     submission=submission,
                     proposer_trajectory=proposer_trajectory,
                     cycle_number=cycle_number,
+                    conclude_call_contract=conclude_call_contract,
                 ),
                 system_prompt_override=system_prompt,
                 max_steps_override=self.max_steps,
@@ -5045,218 +5108,30 @@ class ReactReviewedReviewerAgent:
                 return []
         return items
 
-    def _run_deterministic(
+    def _build_review_prompt_contract(
         self,
         *,
-        workspace: ReactReviewedWorkspace,
         submission: AnswerSubmission,
         proposer_trajectory: ReActTrajectory,
-        cycle_number: int,
-        session: ReviewerSession,
-    ) -> Tuple[List[ReviewItem], ReActTrajectory]:
-        trajectory = ReActTrajectory(query=f"{self.reviewer_role} review: {submission.submission_id}")
-        inspect_payload = workspace.inspect_submission_anchor()
-        inspect_call_id = f"tc_{uuid.uuid4().hex[:8]}"
-        trajectory.add_step(
-            ReActStep(
-                step_number=1,
-                thought=f"Inspect the current submission from the {self.reviewer_role} angle.",
-                action="inspect_submission_anchor",
-                action_input={},
-                observation=_json_preview(inspect_payload),
-                tool_calls=[
-                    ToolCallRecord(
-                        tool_name="inspect_submission_anchor",
-                        tool_call_id=inspect_call_id,
-                        tool_args={},
-                        observation=_json_preview(inspect_payload),
-                        observation_data=inspect_payload,
-                    )
-                ],
-                tool_call_id=inspect_call_id,
-                observation_data=inspect_payload,
-            )
+    ) -> Dict[str, Any]:
+        return build_review_prompt_contract(
+            reviewer_role=self.reviewer_role,
+            target_section_id=submission.sections[0].section_id if submission.sections else None,
+            target_trajectory_id=proposer_trajectory.trajectory_id,
         )
-        items = self._deterministic_review_items(
-            workspace=workspace,
-            submission=submission,
-            proposer_trajectory=proposer_trajectory,
-            session=session,
-        )[: self.max_items]
-        conclude_call_id = f"tc_{uuid.uuid4().hex[:8]}"
-        trajectory.add_step(
-            ReActStep(
-                step_number=2,
-                thought="Return structured review items only.",
-                action="conclude",
-                action_input={"reviewer_role": self.reviewer_role},
-                observation=_json_preview([item.model_dump(exclude_none=True) for item in items]),
-                tool_calls=[
-                    ToolCallRecord(
-                        tool_name="conclude",
-                        tool_call_id=conclude_call_id,
-                        tool_args={"reviewer_role": self.reviewer_role},
-                        observation=_json_preview([item.model_dump(exclude_none=True) for item in items]),
-                        observation_data=[item.model_dump(exclude_none=True) for item in items],
-                    )
-                ],
-                tool_call_id=conclude_call_id,
-                observation_data=[item.model_dump(exclude_none=True) for item in items],
-            )
-        )
-        trajectory.finalize(json.dumps({"review_item_count": len(items)}, ensure_ascii=False))
-        return items, trajectory
 
-    def _deterministic_review_items(
-        self,
-        *,
-        workspace: ReactReviewedWorkspace,
-        submission: AnswerSubmission,
-        proposer_trajectory: ReActTrajectory,
-        session: ReviewerSession,
-    ) -> List[ReviewItem]:
-        section_lookup = {section.section_id: section for section in submission.sections}
-        items: List[ReviewItem] = []
-        if self.reviewer_role == "search_coverage":
-            for answer_section in workspace.task_spec.answer_sections:
-                if answer_section.required and answer_section.section_id not in section_lookup:
-                    items.append(
-                        ReviewItem(
-                            review_id=f"{self.reviewer_role}_{answer_section.section_id}",
-                            reviewer_role=self.reviewer_role,
-                            anchor_kind="missing_section",
-                            severity="blocking",
-                            flaw_type="missing_required_section",
-                            critique=f"Required TaskSpec section '{answer_section.section_id}' is missing.",
-                            required_action="Add the missing required section before acceptance.",
-                            target_section_id=answer_section.section_id,
-                        )
-                    )
-            for section in submission.sections:
-                if not section.citation_ids:
-                    items.append(
-                        ReviewItem(
-                            review_id=f"{self.reviewer_role}_{section.section_id}",
-                            reviewer_role=self.reviewer_role,
-                            anchor_kind="section_only",
-                            severity="warning",
-                            flaw_type="thin_search_coverage",
-                            critique="This section has no attached citations from the retrieval pass.",
-                            required_action="Either attach evidence-backed citations or narrow the section claim.",
-                            target_section_id=section.section_id,
-                        )
-                    )
-        elif self.reviewer_role == "evidence_trace":
-            citation_ids = {citation.citation_id for citation in submission.citations}
-            for section in submission.sections:
-                if any(citation_id not in citation_ids for citation_id in section.citation_ids):
-                    items.append(
-                        ReviewItem(
-                            review_id=f"{self.reviewer_role}_{section.section_id}",
-                            reviewer_role=self.reviewer_role,
-                            anchor_kind="section_only",
-                            severity="blocking",
-                            flaw_type="dangling_citation_ref",
-                            critique="Section references a citation id that is not present in the submission catalog.",
-                            required_action="Fix citation ids so each section maps to a real catalog entry.",
-                            target_section_id=section.section_id,
-                        )
-                    )
-                if not section.step_refs:
-                    items.append(
-                        ReviewItem(
-                            review_id=f"{self.reviewer_role}_{section.section_id}_step",
-                            reviewer_role=self.reviewer_role,
-                            anchor_kind="section_only",
-                            severity="blocking",
-                            flaw_type="missing_step_ref",
-                            critique="Section content is not linked back to a proposer trajectory step.",
-                            required_action="Add at least one step reference for this section.",
-                            target_section_id=section.section_id,
-                        )
-                    )
-        elif self.reviewer_role == "reasoning_consistency":
-            for section in submission.sections:
-                if not _compact_text(section.content):
-                    items.append(
-                        ReviewItem(
-                            review_id=f"{self.reviewer_role}_{section.section_id}",
-                            reviewer_role=self.reviewer_role,
-                            anchor_kind="section_only",
-                            severity="blocking",
-                            flaw_type="empty_section",
-                            critique="Section content is empty after submission assembly.",
-                            required_action="Replace the empty section with a conservative evidence-backed statement.",
-                            target_section_id=section.section_id,
-                        )
-                    )
-                elif section.citation_ids and "insufficient" in section.content.lower():
-                    items.append(
-                        ReviewItem(
-                            review_id=f"{self.reviewer_role}_{section.section_id}_scope",
-                            reviewer_role=self.reviewer_role,
-                            anchor_kind="section_only",
-                            severity="note",
-                            flaw_type="scope_tension",
-                            critique="Section cites evidence but still uses strongly under-specified insufficiency language.",
-                            required_action="Clarify whether the section is evidence-backed or explicitly unresolved.",
-                            target_section_id=section.section_id,
-                        )
-                    )
-        elif self.reviewer_role == "counterevidence":
-            with workspace._state_lock:
-                query_plan_items = list(workspace.query_plans.items())
-            contrarian_plan = next(
-                (
-                    query_plan_id
-                    for query_plan_id, query_plan in query_plan_items
-                    if query_plan.lane == "contrarian"
-                ),
-                None,
-            )
-            if contrarian_plan:
-                try:
-                    result = workspace.search_papers(
-                        query_plan_id=contrarian_plan,
-                        reason="counterevidence reviewer",
-                        artifact_store=session.artifact_store,
-                        session=session,
-                        charge_budget=True,
-                        requested_via="search_papers",
-                        write_snapshot=False,
-                    )
-                except ReviewerBudgetBlocked:
-                    result = []
-                if result and len(submission.citations) <= 1:
-                    items.append(
-                        ReviewItem(
-                            review_id=f"{self.reviewer_role}_global",
-                            reviewer_role=self.reviewer_role,
-                            anchor_kind="global",
-                            severity="warning",
-                            flaw_type="counterevidence_not_checked",
-                            critique="A contrarian search returned additional papers, but the submission still cites only a narrow support set.",
-                            required_action="Check whether contrary or boundary-condition evidence should be reflected in limitations.",
-                            evidence_refs=[str(result[0].get("paper_id") or "")],
-                        )
-                    )
-        return items
-
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self, *, conclude_call_contract: Dict[str, Any]) -> str:
         role_notes = {
             "search_coverage": "Check for missing search directions, controls, and missing sections.",
             "evidence_trace": "Check whether citations, evidence refs, and step refs are traceable and real.",
             "reasoning_consistency": "Check for reasoning jumps, scope drift, and inconsistent section claims.",
             "counterevidence": "Use limited new retrieval only to search for counterevidence or boundary conditions.",
         }
-        return (
-            f"You are ReviewerAgent[{self.reviewer_role}] in a chemistry QA workflow.\n"
-            f"{role_notes[self.reviewer_role]}\n"
-            "Review only the proposer submission and proposer trajectory.\n"
-            "Do not challenge RouterAgent or EntityResolverAgent outputs.\n"
-            f"You have at most {self.max_retrieval_actions} charged retrieval cache-miss actions.\n"
-            "Return ReviewItem objects only by calling conclude.\n"
-            "The final tool call must call conclude with the completed review payload.\n"
+        return build_reviewer_system_prompt(
+            reviewer_role=self.reviewer_role,
+            role_note=role_notes[self.reviewer_role],
+            max_retrieval_actions=self.max_retrieval_actions,
+            conclude_contract=conclude_call_contract,
         )
 
     def _build_user_prompt(
@@ -5265,15 +5140,19 @@ class ReactReviewedReviewerAgent:
         submission: AnswerSubmission,
         proposer_trajectory: ReActTrajectory,
         cycle_number: int,
+        conclude_call_contract: Optional[Dict[str, Any]] = None,
     ) -> str:
-        return _json_preview(
-            {
-                "cycle_number": cycle_number,
-                "reviewer_role": self.reviewer_role,
-                "submission": submission.model_dump(exclude_none=True),
-                "proposer_trajectory": proposer_trajectory.to_dict(),
-            },
-            limit=12000,
+        if conclude_call_contract is None:
+            conclude_call_contract = self._build_review_prompt_contract(
+                submission=submission,
+                proposer_trajectory=proposer_trajectory,
+            )
+        return build_reviewer_user_prompt(
+            cycle_number=cycle_number,
+            reviewer_role=self.reviewer_role,
+            submission=submission.model_dump(exclude_none=True),
+            proposer_trajectory=proposer_trajectory.to_dict(),
+            conclude_call_contract=conclude_call_contract,
         )
 
 
@@ -5993,6 +5872,8 @@ class ReactReviewedWorkflow:
                     break
                 if stop_on_no_blocking_items and not acceptance_decision.blocking_review_ids:
                     break
+        except QueryPlannerExecutionError:
+            raise
         except Exception as exc:
             workflow_error = exc
             review_completion_status = "incomplete"

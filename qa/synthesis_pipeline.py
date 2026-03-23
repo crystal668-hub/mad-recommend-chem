@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 from qa.artifacts import QAArtifactStore
-from qa.nodes.answer_validator import AnswerValidator
+from qa.nodes.answer_validator import AnswerValidationError, AnswerValidator
 from qa.nodes.synthesis_pack_builder import SynthesisPackBuilder
-from qa.nodes.synthesizer import SynthesizerNode
+from qa.nodes.synthesizer import SynthesizerExecutionError, SynthesizerNode
 from qa.retrieval_state import EvidenceLedger, PaperRecord, RetrievalDiagnosticRecord, RetrievalState, ReviewSummary
 from qa.state import TaskSpec
 from qa.synthesis_state import QAResult
@@ -66,14 +66,33 @@ class VerifiedSynthesisPipeline:
             len(input_pack.execution_warnings),
         )
 
-        fallback_result = self.synthesizer.build_deterministic_result(input_pack)
-        draft_result = self.synthesizer.run(input_pack)
+        try:
+            draft_result = self.synthesizer.run(input_pack)
+        except SynthesizerExecutionError as exc:
+            self._write_failure_artifacts(
+                store=store,
+                node_name="synthesizer",
+                input_payload=input_pack.model_dump(exclude_none=True),
+                error=exc,
+            )
+            raise
         logger.info("qa_synthesis_draft_complete sections=%s", len(draft_result.sections))
-        validated_result = self.answer_validator.run(
-            input_pack=input_pack,
-            draft_result=draft_result,
-            fallback_result=fallback_result,
-        )
+        try:
+            validated_result = self.answer_validator.run(
+                input_pack=input_pack,
+                draft_result=draft_result,
+            )
+        except AnswerValidationError as exc:
+            self._write_failure_artifacts(
+                store=store,
+                node_name="answer_validator",
+                input_payload={
+                    "input_pack": input_pack.model_dump(exclude_none=True),
+                    "draft_result": draft_result.model_dump(exclude_none=True),
+                },
+                error=exc,
+            )
+            raise
 
         final_answer_path = store.write_text("final_answer.md", validated_result.final_answer)
         qa_result_path = str(store.path("qa_result.json"))
@@ -127,3 +146,28 @@ class VerifiedSynthesisPipeline:
         )
 
     __call__ = run
+
+    def _write_failure_artifacts(
+        self,
+        *,
+        store: QAArtifactStore,
+        node_name: str,
+        input_payload: Dict[str, Any],
+        error: Any,
+    ) -> None:
+        debug_payload = dict(getattr(error, "debug_payload", {}) or {})
+        payload = error.to_payload() if hasattr(error, "to_payload") else {
+            "error": f"{node_name}_execution_failed",
+            "stage": "unknown",
+            "reason": str(error),
+        }
+        store.write_json(f"{node_name}/failure.json", payload)
+        store.write_json(
+            f"{node_name}/agent_run.json",
+            {
+                "agent": node_name,
+                "input": input_payload,
+                "error": payload,
+                "debug": debug_payload,
+            },
+        )

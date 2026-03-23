@@ -5,6 +5,7 @@ from typing import Any, List, Optional, Sequence, Set
 
 from prompts.qa_prompts import CITATION_REVIEWER_SYSTEM_PROMPT, build_reviewer_user_prompt
 from qa.llm_utils import invoke_llm, parse_json_object
+from qa.peer_review_errors import PeerReviewExecutionError
 from qa.review_utils import build_evidence_lookup, top_evidence_refs, traceable_evidence_items, valid_evidence_items
 from qa.retrieval_state import ClaimRecord, EvidenceLedger, ReviewFlag
 
@@ -145,8 +146,16 @@ class CitationReviewer:
         focus_flag_types: Optional[Sequence[str]],
         use_llm: bool,
     ) -> List[ReviewFlag]:
-        if self.llm is None or not use_llm:
+        if not use_llm:
             return []
+        if self.llm is None:
+            raise PeerReviewExecutionError(
+                stage="citation_reviewer_startup",
+                message="Citation reviewer LLM is unavailable.",
+                reviewer_type=self.reviewer_type,
+                claim_id=claim.claim_id,
+                review_round=review_round,
+            )
         evidence_payload = [
             {
                 "evidence_id": item.evidence_id,
@@ -172,11 +181,26 @@ class CitationReviewer:
             },
         ]
         try:
-            parsed = parse_json_object(invoke_llm(self.llm, messages))
-        except Exception:
-            return []
+            response_content = invoke_llm(self.llm, messages)
+        except Exception as exc:
+            raise PeerReviewExecutionError(
+                stage="citation_reviewer_invoke",
+                message="Citation reviewer LLM call failed.",
+                details={"error_type": type(exc).__name__, "error": str(exc)},
+                reviewer_type=self.reviewer_type,
+                claim_id=claim.claim_id,
+                review_round=review_round,
+            ) from exc
+        parsed = parse_json_object(response_content)
         if not isinstance(parsed, dict):
-            return []
+            raise PeerReviewExecutionError(
+                stage="citation_reviewer_invalid_response",
+                message="Citation reviewer returned a non-object payload.",
+                reviewer_type=self.reviewer_type,
+                claim_id=claim.claim_id,
+                review_round=review_round,
+                response_content=response_content,
+            )
         valid_evidence_refs = {item["evidence_id"] for item in evidence_payload}
         repaired: List[ReviewFlag] = []
         for raw_flag in parsed.get("flags") or []:

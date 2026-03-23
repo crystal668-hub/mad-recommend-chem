@@ -3,9 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import shutil
-import subprocess
-import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,9 +53,7 @@ MAX_UNKNOWN_SNIPPETS = 3
 class PDFExtractionConfig:
     enabled: bool = True
     primary_backend: str = "pymupdf"
-    secondary_backend: str = "docling"
-    ocr_backend: str = "ocrmypdf"
-    enable_ocr_fallback: bool = True
+    secondary_backend: str = "none"
     min_total_chars: int = 800
     min_chars_per_text_page: int = 80
     min_text_page_ratio: float = 0.5
@@ -66,9 +61,6 @@ class PDFExtractionConfig:
     snippet_target_chars: int = 1000
     snippet_overlap_chars: int = 120
     preserve_page_blocks: bool = True
-    max_ocr_pages: int = 40
-    ocr_timeout_seconds: int = 300
-    skip_ocr_when_text_already_usable: bool = True
 
     @classmethod
     def from_dict(cls, payload: Optional[dict[str, Any]]) -> "PDFExtractionConfig":
@@ -76,9 +68,7 @@ class PDFExtractionConfig:
         config = cls(
             enabled=bool(raw.get("enabled", True)),
             primary_backend=str(raw.get("primary_backend") or "pymupdf").strip().lower(),
-            secondary_backend=str(raw.get("secondary_backend") or "docling").strip().lower(),
-            ocr_backend=str(raw.get("ocr_backend") or "ocrmypdf").strip().lower(),
-            enable_ocr_fallback=bool(raw.get("enable_ocr_fallback", True)),
+            secondary_backend=str(raw.get("secondary_backend") or "none").strip().lower(),
             min_total_chars=max(0, int(raw.get("min_total_chars", 800) or 800)),
             min_chars_per_text_page=max(1, int(raw.get("min_chars_per_text_page", 80) or 80)),
             min_text_page_ratio=float(raw.get("min_text_page_ratio", 0.5) or 0.5),
@@ -86,9 +76,6 @@ class PDFExtractionConfig:
             snippet_target_chars=max(200, int(raw.get("snippet_target_chars", 1000) or 1000)),
             snippet_overlap_chars=max(0, int(raw.get("snippet_overlap_chars", 120) or 120)),
             preserve_page_blocks=bool(raw.get("preserve_page_blocks", True)),
-            max_ocr_pages=max(1, int(raw.get("max_ocr_pages", 40) or 40)),
-            ocr_timeout_seconds=max(1, int(raw.get("ocr_timeout_seconds", 300) or 300)),
-            skip_ocr_when_text_already_usable=bool(raw.get("skip_ocr_when_text_already_usable", True)),
         )
         if config.snippet_overlap_chars >= config.snippet_target_chars:
             config.snippet_overlap_chars = max(0, config.snippet_target_chars // 4)
@@ -238,34 +225,6 @@ class PDFExtractionPipeline:
                     attempts=attempts,
                     warnings=warnings,
                 )
-
-        if self.config.enable_ocr_fallback:
-            page_count = max((attempt.page_count for attempt in attempts if attempt.page_count), default=0)
-            if page_count and page_count > self.config.max_ocr_pages:
-                warnings.append(
-                    f"{paper_id}: OCR fallback skipped because the PDF has {page_count} pages, "
-                    f"exceeding qa.pdf_extraction.max_ocr_pages={self.config.max_ocr_pages}."
-                )
-            else:
-                logger.info("ocr_fallback_triggered paper_id=%s", paper_id)
-                ocr_attempt = self._extract_with_ocr(pdf_path=Path(source_artifact_path))
-                attempts.append(ocr_attempt)
-                if ocr_attempt.failure_reason == "ocr_unavailable":
-                    warnings.append(
-                        f"{paper_id}: OCR fallback was requested but ocrmypdf/tesseract is not available in the environment."
-                    )
-                    logger.warning("ocr_unavailable paper_id=%s", paper_id)
-                elif ocr_attempt.failure_reason:
-                    warnings.append(f"{paper_id}: OCR fallback failed: {ocr_attempt.failure_reason}")
-                if ocr_attempt.usable:
-                    return self._finalize_success(
-                        paper_id=paper_id,
-                        artifact_store=artifact_store,
-                        source_artifact_path=source_artifact_path,
-                        attempt=ocr_attempt,
-                        attempts=attempts,
-                        warnings=warnings,
-                    )
 
         if primary_attempt.failure_reason:
             warnings.append(f"{paper_id}: PyMuPDF extraction failed: {primary_attempt.failure_reason}")
@@ -498,69 +457,6 @@ class PDFExtractionPipeline:
             metrics=metrics,
             usable=usable,
         )
-
-    def _extract_with_ocr(self, *, pdf_path: Path) -> ExtractionAttempt:
-        ocrmypdf_path = shutil.which("ocrmypdf")
-        tesseract_path = shutil.which("tesseract")
-        if not ocrmypdf_path or not tesseract_path:
-            return ExtractionAttempt(
-                extractor="ocrmypdf",
-                succeeded=False,
-                failure_reason="ocr_unavailable",
-            )
-
-        tmp_root = Path("tmp") / "pdfs"
-        tmp_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=tmp_root) as tmpdir:
-            output_path = Path(tmpdir) / "searchable.pdf"
-            try:
-                self._run_ocr_command(
-                    ocrmypdf_path=ocrmypdf_path,
-                    input_path=pdf_path,
-                    output_path=output_path,
-                    timeout_seconds=self.config.ocr_timeout_seconds,
-                )
-                ocr_bytes = output_path.read_bytes()
-            except subprocess.TimeoutExpired:
-                return ExtractionAttempt(
-                    extractor="ocrmypdf",
-                    succeeded=False,
-                    failure_reason=f"timed out after {self.config.ocr_timeout_seconds}s",
-                )
-            except Exception as exc:
-                return ExtractionAttempt(
-                    extractor="ocrmypdf",
-                    succeeded=False,
-                    failure_reason=str(exc),
-                )
-        attempt = self._extract_with_pymupdf(pdf_bytes=ocr_bytes, ocr_applied=True)
-        attempt.extractor = "pymupdf"
-        return attempt
-
-    def _run_ocr_command(
-        self,
-        *,
-        ocrmypdf_path: str,
-        input_path: Path,
-        output_path: Path,
-        timeout_seconds: int,
-    ) -> None:
-        completed = subprocess.run(
-            [
-                ocrmypdf_path,
-                "--skip-text",
-                "--quiet",
-                str(input_path),
-                str(output_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-        if completed.returncode != 0:
-            stderr = normalize_text(completed.stderr) or normalize_text(completed.stdout) or "unknown OCR failure"
-            raise RuntimeError(stderr)
 
     def _evaluate_quality(self, *, fulltext: str, page_texts: list[str]) -> dict[str, Any]:
         normalized_fulltext = self._normalize_extracted_text(fulltext)

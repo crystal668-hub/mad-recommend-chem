@@ -62,15 +62,13 @@ DEFAULT_QA_PEER_REVIEW_CONFIG: Dict[str, Any] = {
     "max_claims_for_llm_review": 40,
     "max_second_round_claims": 15,
     "disable_llm_review_when_abstract_only": True,
-    "fallback_mode": "deterministic_only",
+    "fallback_mode": "fail_fast_only",
 }
 
 DEFAULT_QA_PDF_EXTRACTION_CONFIG: Dict[str, Any] = {
     "enabled": True,
     "primary_backend": "pymupdf",
-    "secondary_backend": "docling",
-    "ocr_backend": "ocrmypdf",
-    "enable_ocr_fallback": True,
+    "secondary_backend": "none",
     "min_total_chars": 800,
     "min_chars_per_text_page": 80,
     "min_text_page_ratio": 0.5,
@@ -78,9 +76,6 @@ DEFAULT_QA_PDF_EXTRACTION_CONFIG: Dict[str, Any] = {
     "snippet_target_chars": 1000,
     "snippet_overlap_chars": 120,
     "preserve_page_blocks": True,
-    "max_ocr_pages": 40,
-    "ocr_timeout_seconds": 300,
-    "skip_ocr_when_text_already_usable": True,
 }
 
 DEFAULT_QA_ENTITY_RESOLUTION_CONFIG: Dict[str, Any] = {
@@ -227,7 +222,7 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "fallback_mode": _coerce_allowed_text(
             peer_review_config.get("fallback_mode"),
-            allowed={"deterministic_only"},
+            allowed={"fail_fast_only"},
             fallback=DEFAULT_QA_PEER_REVIEW_CONFIG["fallback_mode"],
         ),
     }
@@ -363,19 +358,8 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "secondary_backend": _coerce_allowed_text(
             pdf_extraction_config.get("secondary_backend"),
-            allowed={"docling"},
+            allowed={"none", "docling"},
             fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["secondary_backend"],
-        ),
-        "ocr_backend": _coerce_allowed_text(
-            pdf_extraction_config.get("ocr_backend"),
-            allowed={"ocrmypdf"},
-            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["ocr_backend"],
-        ),
-        "enable_ocr_fallback": bool(
-            pdf_extraction_config.get(
-                "enable_ocr_fallback",
-                DEFAULT_QA_PDF_EXTRACTION_CONFIG["enable_ocr_fallback"],
-            )
         ),
         "min_total_chars": _coerce_non_negative_int(
             pdf_extraction_config.get("min_total_chars"),
@@ -405,20 +389,6 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
             pdf_extraction_config.get(
                 "preserve_page_blocks",
                 DEFAULT_QA_PDF_EXTRACTION_CONFIG["preserve_page_blocks"],
-            )
-        ),
-        "max_ocr_pages": _coerce_positive_int(
-            pdf_extraction_config.get("max_ocr_pages"),
-            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["max_ocr_pages"],
-        ),
-        "ocr_timeout_seconds": _coerce_positive_int(
-            pdf_extraction_config.get("ocr_timeout_seconds"),
-            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["ocr_timeout_seconds"],
-        ),
-        "skip_ocr_when_text_already_usable": bool(
-            pdf_extraction_config.get(
-                "skip_ocr_when_text_already_usable",
-                DEFAULT_QA_PDF_EXTRACTION_CONFIG["skip_ocr_when_text_already_usable"],
             )
         ),
     }
@@ -475,9 +445,41 @@ def build_qa_runtime(
     progress_log_every_claims = qa_config["progress_log_every_claims"]
     peer_review_config = dict(qa_config.get("peer_review", {}) or {})
 
+    def _fallback_mode(node_name: str) -> str:
+        if node_name in {
+            "router",
+            "entity_resolver",
+            "query_planner",
+            "synthesizer",
+            "react_proposer",
+            "react_reviewer_search_coverage",
+            "react_reviewer_evidence_trace",
+            "react_reviewer_reasoning_consistency",
+            "react_reviewer_counterevidence",
+            "methodology_reviewer",
+            "citation_reviewer",
+            "contradiction_reviewer",
+            "claim_revision",
+            "review_merge",
+        }:
+            return "fail_fast"
+        return "deterministic"
+
     def _fallback_label(node_name: str) -> str:
+        if node_name == "router":
+            return "router will hard-fail during grounding"
         if node_name == "entity_resolver":
             return "entity mention extraction will hard-fail when grounding runs"
+        if node_name == "query_planner":
+            return "query planner will hard-fail during retrieval"
+        if node_name == "synthesizer":
+            return "synthesizer will hard-fail during synthesis"
+        if node_name == "react_proposer":
+            return "react proposer will hard-fail during proposal"
+        if node_name.startswith("react_reviewer_"):
+            return "react reviewer will hard-fail during review"
+        if node_name in {"methodology_reviewer", "citation_reviewer", "contradiction_reviewer", "claim_revision", "review_merge"}:
+            return "peer review node will hard-fail during peer review"
         return "node will use deterministic fallback"
 
     def get_node_llm(node_name: str) -> Any:
@@ -487,7 +489,7 @@ def build_qa_runtime(
             "enabled": False,
             "provider": None,
             "model": None,
-            "fallback": "deterministic",
+            "fallback": _fallback_mode(node_name),
             "timeout_seconds": None,
         }
         llm_manifest[node_name] = entry
@@ -561,7 +563,7 @@ def build_qa_runtime(
                 "enabled": False,
                 "provider": None,
                 "model": None,
-                "fallback": "deterministic",
+                "fallback": _fallback_mode(node_name),
                 "timeout_seconds": None,
             }
             llm_manifest[node_name] = entry

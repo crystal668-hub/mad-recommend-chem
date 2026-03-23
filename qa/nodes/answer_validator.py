@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Sequence, Set
 
 from qa.synthesis_state import AnswerSectionOutput, QAResult, SynthesisInputPack
 
@@ -15,22 +15,93 @@ LOW_CONFIDENCE_STRONG_LANGUAGE = (
 )
 
 
+class AnswerValidationError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        stage: str,
+        reason: str,
+        input_pack: SynthesisInputPack,
+        debug_payload: Dict[str, Any],
+    ) -> None:
+        super().__init__(reason)
+        self.stage = str(stage or "").strip() or "unknown"
+        self.reason = str(reason or "").strip() or "answer validation failed"
+        self.question = str(input_pack.question or "")
+        self.question_type = str(input_pack.task_spec.question_type or "")
+        self.debug_payload = dict(debug_payload or {})
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "error": "answer_validation_failed",
+            "stage": self.stage,
+            "reason": self.reason,
+            "question": self.question,
+            "question_type": self.question_type,
+        }
+
+
 class AnswerValidator:
+    def __init__(self) -> None:
+        self.last_run_debug: Dict[str, Any] = {}
+
     def run(
         self,
         *,
         input_pack: SynthesisInputPack,
         draft_result: QAResult,
-        fallback_result: Optional[QAResult] = None,
     ) -> QAResult:
+        self.last_run_debug = {
+            "input_pack": input_pack.model_dump(exclude_none=True),
+            "draft_result": draft_result.model_dump(exclude_none=True),
+        }
         sanitized = self._sanitize_result(input_pack=input_pack, draft_result=draft_result)
-        if self._has_structural_issue(input_pack=input_pack, result=sanitized):
-            return fallback_result or sanitized
-        if self._has_confidence_language_mismatch(input_pack=input_pack, result=sanitized):
-            return fallback_result or sanitized
+        self.last_run_debug["sanitized_result"] = sanitized.model_dump(exclude_none=True)
+        structural_issues = self._collect_structural_issues(input_pack=input_pack, result=sanitized)
+        if structural_issues:
+            self._raise_failure(
+                stage="validation",
+                reason=" ; ".join(structural_issues),
+                input_pack=input_pack,
+                failure_type="structural_issue",
+                details=structural_issues,
+            )
+        confidence_issues = self._collect_confidence_language_issues(input_pack=input_pack, result=sanitized)
+        if confidence_issues:
+            self._raise_failure(
+                stage="validation",
+                reason=" ; ".join(confidence_issues),
+                input_pack=input_pack,
+                failure_type="confidence_language_mismatch",
+                details=confidence_issues,
+            )
         return sanitized
 
     __call__ = run
+
+    def _raise_failure(
+        self,
+        *,
+        stage: str,
+        reason: str,
+        input_pack: SynthesisInputPack,
+        failure_type: str,
+        details: Sequence[str],
+    ) -> None:
+        failure_payload = {
+            "error": "answer_validation_failed",
+            "stage": str(stage or "").strip() or "unknown",
+            "reason": str(reason or "").strip() or "answer validation failed",
+            "failure_type": str(failure_type or "").strip() or "unknown",
+            "details": [str(item).strip() for item in details if str(item).strip()],
+        }
+        self.last_run_debug["failure"] = failure_payload
+        raise AnswerValidationError(
+            stage=failure_payload["stage"],
+            reason=failure_payload["reason"],
+            input_pack=input_pack,
+            debug_payload=self.last_run_debug,
+        )
 
     def _sanitize_result(self, *, input_pack: SynthesisInputPack, draft_result: QAResult) -> QAResult:
         citation_lookup = {citation.citation_id: citation for citation in input_pack.citation_catalog}
@@ -112,12 +183,13 @@ class AnswerValidator:
             time_elapsed=draft_result.time_elapsed,
         )
 
-    def _has_structural_issue(self, *, input_pack: SynthesisInputPack, result: QAResult) -> bool:
+    def _collect_structural_issues(self, *, input_pack: SynthesisInputPack, result: QAResult) -> List[str]:
+        issues: List[str] = []
         if not result.sections:
-            return True
+            issues.append("Validated answer did not contain any sections.")
         primary_section_id = next((pack.section_id for pack in input_pack.section_claims), None)
         if primary_section_id is not None and primary_section_id not in {section.section_id for section in result.sections}:
-            return True
+            issues.append(f"Validated answer is missing required primary section '{primary_section_id}'.")
 
         limitations_required = bool(
             input_pack.contested_claims
@@ -126,7 +198,7 @@ class AnswerValidator:
             or input_pack.retrieval_diagnostics_summary
         )
         if limitations_required and not any(section.title == "Limitations / Controversies" for section in result.sections):
-            return True
+            issues.append("Validated answer is missing the required Limitations / Controversies section.")
 
         allowed_citations_by_section = {
             pack.section_id: set(pack.core_citation_ids)
@@ -144,16 +216,19 @@ class AnswerValidator:
         for section in result.sections:
             allowed = allowed_citations_by_section.get(section.section_id, set())
             if allowed and not section.citation_ids and section.section_id != primary_section_id:
-                return True
+                issues.append(f"Section '{section.section_id}' lost all allowed citations during validation.")
             if any(citation_id not in allowed for citation_id in section.citation_ids):
-                return True
-        return False
+                issues.append(f"Section '{section.section_id}' cites IDs outside its allowed citation set.")
+        return issues
 
-    def _has_confidence_language_mismatch(self, *, input_pack: SynthesisInputPack, result: QAResult) -> bool:
+    def _collect_confidence_language_issues(self, *, input_pack: SynthesisInputPack, result: QAResult) -> List[str]:
+        issues: List[str] = []
         texts = [result.final_answer]
         if input_pack.overall_confidence.level == "low":
             texts.extend(section.content for section in result.sections)
-            return any(pattern.search(text) for text in texts for pattern in LOW_CONFIDENCE_STRONG_LANGUAGE)
+            if any(pattern.search(text) for text in texts for pattern in LOW_CONFIDENCE_STRONG_LANGUAGE):
+                issues.append("Low-confidence answer uses overly strong language in final_answer or section text.")
+            return issues
 
         low_sections = {
             item.section_id
@@ -164,8 +239,8 @@ class AnswerValidator:
             if section.section_id not in low_sections:
                 continue
             if any(pattern.search(section.content) for pattern in LOW_CONFIDENCE_STRONG_LANGUAGE):
-                return True
-        return False
+                issues.append(f"Low-confidence section '{section.section_id}' uses overly strong language.")
+        return issues
 
     def _assemble_final_answer(self, sections: Sequence[AnswerSectionOutput]) -> str:
         return "\n\n".join(f"## {section.title}\n{section.content}" for section in sections).strip()

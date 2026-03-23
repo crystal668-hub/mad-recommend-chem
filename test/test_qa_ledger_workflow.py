@@ -6,14 +6,64 @@ import uuid
 from pathlib import Path
 
 from qa.facade import QASystem
+from qa.nodes.query_planner import QueryPlannerExecutionError
+from qa.nodes.router import RouterExecutionError
+from qa.peer_review_errors import PeerReviewExecutionError
+from qa.retrieval_pipeline import HeterogeneousRetrievalPipeline
+from qa.review_pipeline import StructuredPeerReviewPipeline
 
 from test.qa_test_utils import (
+    StaticClaimMiner,
+    StaticDocumentAcquirer,
+    StaticEvidenceExtractor,
+    StaticRetriever,
     NullLedgerRetrievalPipeline,
     StaticGroundingPipeline,
     build_ledger_system,
     make_base_config,
     read_json,
 )
+from qa.evidence import EvidenceLedgerBuilder
+
+
+class FailingGroundingPipeline:
+    def run_detailed(self, question: str, context: str | None = None):
+        raise RouterExecutionError(
+            stage="semantic",
+            reason="semantic stage returned unusable output",
+            question=question,
+            normalized_question=question.lower(),
+            context=context,
+            debug_payload={
+                "input": {"question": question, "context": context},
+                "normalized_question": question.lower(),
+                "failure": {
+                    "error": "router_execution_failed",
+                    "stage": "semantic",
+                    "reason": "semantic stage returned unusable output",
+                },
+            },
+        )
+
+
+class FailingQueryPlanner:
+    def run(self, *, task_spec, entity_pack):
+        raise QueryPlannerExecutionError(
+            stage="planning",
+            reason="query planner returned unusable output",
+            task_spec=task_spec,
+            debug_payload={
+                "input": {
+                    "task_spec": task_spec.model_dump(exclude_none=True),
+                    "entity_pack": entity_pack.model_dump(exclude_none=True),
+                },
+                "failure": {
+                    "error": "query_planner_execution_failed",
+                    "stage": "planning",
+                    "reason": "query planner returned unusable output",
+                },
+            },
+        )
 
 
 class LedgerWorkflowSystemTests(unittest.TestCase):
@@ -128,6 +178,83 @@ class LedgerWorkflowSystemTests(unittest.TestCase):
             )
 
         self.assertFalse((artifact_dir / "qa_result.json").exists())
+
+    def test_ledger_writes_router_failure_artifacts_and_stops_before_qa_result(self):
+        config = make_base_config(self.temp_dir, workflow_mode="ledger", save_output=False)
+        system = QASystem(
+            config=config,
+            grounding_pipeline=FailingGroundingPipeline(),
+            retrieval_pipeline=NullLedgerRetrievalPipeline(),
+        )
+        artifact_dir = self.temp_dir / "artifacts"
+
+        with self.assertRaises(RouterExecutionError):
+            system.run_qa(
+                question="How does Pt/C affect HER activity in 1 M KOH?",
+                artifact_dir=str(artifact_dir),
+            )
+
+        self.assertTrue((artifact_dir / "runtime_manifest.json").exists())
+        self.assertTrue((artifact_dir / "router" / "failure.json").exists())
+        self.assertTrue((artifact_dir / "router" / "agent_run.json").exists())
+        self.assertFalse((artifact_dir / "router" / "task_spec.json").exists())
+        self.assertFalse((artifact_dir / "qa_result.json").exists())
+        failure_payload = read_json(artifact_dir / "router" / "failure.json")
+        self.assertEqual("router_execution_failed", failure_payload["error"])
+        self.assertEqual("semantic", failure_payload["stage"])
+
+    def test_ledger_writes_query_planner_failure_artifacts_and_stops_before_qa_result(self):
+        system = build_ledger_system(self.temp_dir, save_output=False)
+        system.retrieval_pipeline = HeterogeneousRetrievalPipeline(
+            query_planner=FailingQueryPlanner(),
+            retriever=StaticRetriever(),
+            document_acquirer=StaticDocumentAcquirer(),
+            evidence_extractor=StaticEvidenceExtractor(),
+            claim_miner=StaticClaimMiner(),
+            ledger_builder=EvidenceLedgerBuilder(),
+            peer_review_pipeline=None,
+        )
+        artifact_dir = self.temp_dir / "artifacts"
+
+        with self.assertRaises(QueryPlannerExecutionError):
+            system.run_qa(
+                question="How does Pt/C affect HER activity in 1 M KOH?",
+                artifact_dir=str(artifact_dir),
+            )
+
+        self.assertTrue((artifact_dir / "runtime_manifest.json").exists())
+        self.assertTrue((artifact_dir / "query_planner" / "failure.json").exists())
+        self.assertTrue((artifact_dir / "query_planner" / "agent_run.json").exists())
+        self.assertFalse((artifact_dir / "query_plans.json").exists())
+        self.assertFalse((artifact_dir / "qa_result.json").exists())
+        failure_payload = read_json(artifact_dir / "query_planner" / "failure.json")
+        self.assertEqual("query_planner_execution_failed", failure_payload["error"])
+        self.assertEqual("planning", failure_payload["stage"])
+
+    def test_ledger_writes_peer_review_failure_artifacts_and_stops_before_qa_result(self):
+        system = build_ledger_system(self.temp_dir, save_output=False)
+        system.peer_review_pipeline = StructuredPeerReviewPipeline()
+        artifact_dir = self.temp_dir / "artifacts"
+
+        with self.assertRaises(PeerReviewExecutionError) as ctx:
+            system.run_qa(
+                question="How does Pt/C affect HER activity in 1 M KOH?",
+                artifact_dir=str(artifact_dir),
+            )
+
+        self.assertEqual("peer_review_startup", ctx.exception.stage)
+        self.assertTrue((artifact_dir / "runtime_manifest.json").exists())
+        self.assertTrue((artifact_dir / "peer_review" / "failure.json").exists())
+        self.assertTrue((artifact_dir / "peer_review" / "agent_run.json").exists())
+        self.assertFalse((artifact_dir / "evidence_ledger_reviewed.json").exists())
+        self.assertFalse((artifact_dir / "review_summaries.json").exists())
+        self.assertFalse((artifact_dir / "qa_result.json").exists())
+        failure_payload = read_json(artifact_dir / "peer_review" / "failure.json")
+        self.assertEqual("peer_review_execution_failed", failure_payload["error"])
+        self.assertEqual("peer_review_startup", failure_payload["stage"])
+        agent_run_payload = read_json(artifact_dir / "peer_review" / "agent_run.json")
+        self.assertEqual("StructuredPeerReviewPipeline", agent_run_payload["agent"])
+        self.assertEqual(1, agent_run_payload["input"]["claim_count"])
 
     def test_qa_result_file_matches_returned_model_dump(self):
         system = build_ledger_system(self.temp_dir, save_output=False)

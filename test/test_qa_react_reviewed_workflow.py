@@ -13,19 +13,24 @@ from unittest.mock import patch
 from agents.react_agent import AgentResponse
 from agents.react_reasoning import ReActTrajectory
 from pydantic import ValidationError
+from prompts.react_reviewed import build_reviewer_action_prompt
 from qa.artifacts import QAArtifactStore
 from qa.facade import QASystem
 from qa.handoff import EvidenceExtractorHandoff
+from qa.nodes.query_planner import QueryPlannerExecutionError
+from qa.nodes.router import RouterExecutionError
 from qa.nodes.retriever import RetrieverNode
 from qa.react_reviewed_state import AnswerSubmission, ReviewItem, ReviewerRunStatus, SubmissionCitation, SubmissionConfidenceRating, SubmissionSection, SubmissionStepRef
 from qa.react_reviewed_workflow import (
     PROPOSER_TOOL_NAMES,
     ReactReviewedProposerExecutionError,
     ReactReviewedProposerAgent,
+    ReactReviewedReviewerExecutionError,
     ReactReviewedReviewerAgent,
     ReactReviewedStructuredOutputError,
     ReactReviewedWorkflow,
     ReactReviewedWorkspace,
+    RouterAgentWrapper,
     ReviewerBudgetBlocked,
     ReviewerBudgetState,
     ReviewerSession,
@@ -231,6 +236,26 @@ class _StaticRouterNode:
         return _task_spec(question)
 
 
+class _FailingRouterNode:
+    def run(self, *, question: str, context=None):
+        raise RouterExecutionError(
+            stage="semantic",
+            reason="semantic stage returned unusable output",
+            question=question,
+            normalized_question=question.lower(),
+            context=context,
+            debug_payload={
+                "input": {"question": question, "context": context},
+                "normalized_question": question.lower(),
+                "failure": {
+                    "error": "router_execution_failed",
+                    "stage": "semantic",
+                    "reason": "semantic stage returned unusable output",
+                },
+            },
+        )
+
+
 class _StaticEntityResolverNode:
     def run(self, *, question: str, task_spec: TaskSpec):
         return _entity_pack()
@@ -239,6 +264,26 @@ class _StaticEntityResolverNode:
 class _NoopQueryPlanner:
     def run(self, *, task_spec: TaskSpec, entity_pack: EntityPack):
         return []
+
+
+class _FailingQueryPlanner:
+    def run(self, *, task_spec: TaskSpec, entity_pack: EntityPack):
+        raise QueryPlannerExecutionError(
+            stage="planning",
+            reason="query planner returned unusable output",
+            task_spec=task_spec,
+            debug_payload={
+                "input": {
+                    "task_spec": task_spec.model_dump(exclude_none=True),
+                    "entity_pack": entity_pack.model_dump(exclude_none=True),
+                },
+                "failure": {
+                    "error": "query_planner_execution_failed",
+                    "stage": "planning",
+                    "reason": "query planner returned unusable output",
+                },
+            },
+        )
 
 
 class _CountingRetriever:
@@ -362,6 +407,12 @@ class _FakeProposer:
     def run(self, *, workspace: ReactReviewedWorkspace, cycle_number: int, open_review_items):
         trajectory = _trajectory(f"proposer cycle {cycle_number}")
         return _submission(workspace.question, cycle_number=cycle_number, trajectory_id=trajectory.trajectory_id), trajectory
+
+
+class _PlanningProposer:
+    def run(self, *, workspace: ReactReviewedWorkspace, cycle_number: int, open_review_items):
+        workspace.plan_queries(focus="revision" if cycle_number > 1 else "initial")
+        raise AssertionError("query planner failure should have interrupted the workflow")
 
 
 class _FailingProposer:
@@ -668,6 +719,75 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         workflow.proposer = _FakeProposer()
         return workflow
 
+    def test_router_wrapper_writes_failure_artifacts_and_raises(self):
+        wrapper = RouterAgentWrapper(router=_FailingRouterNode())
+        store = QAArtifactStore(base_dir=self.temp_dir / "router_failure")
+
+        with self.assertRaises(RouterExecutionError):
+            wrapper.run(
+                question="How does Pt/C affect HER activity?",
+                context=None,
+                artifact_store=store,
+            )
+
+        failure_payload = _read_json(str(self.temp_dir / "router_failure" / "router" / "failure.json"))
+        agent_run_payload = _read_json(str(self.temp_dir / "router_failure" / "router" / "agent_run.json"))
+        self.assertEqual("router_execution_failed", failure_payload["error"])
+        self.assertEqual("semantic", failure_payload["stage"])
+        self.assertEqual("router_execution_failed", agent_run_payload["error"]["error"])
+        self.assertFalse((self.temp_dir / "router_failure" / "router" / "task_spec.json").exists())
+
+    def test_workspace_plan_queries_writes_failure_artifacts_and_raises(self):
+        workspace = ReactReviewedWorkspace(
+            question="How does Pt/C affect HER activity?",
+            context=None,
+            task_spec=_task_spec(),
+            entity_pack=_entity_pack(),
+            entity_resolution_snapshot={},
+            artifact_store=QAArtifactStore(base_dir=self.temp_dir / "planner_failure"),
+            query_planner=_FailingQueryPlanner(),
+            retriever=_CountingRetriever(),
+            document_acquirer=_CountingDocumentAcquirer(),
+            handoff=EvidenceExtractorHandoff(),
+            evidence_extractor=_CountingEvidenceExtractor(),
+        )
+
+        with self.assertRaises(QueryPlannerExecutionError):
+            workspace.plan_queries()
+
+        failure_payload = _read_json(str(self.temp_dir / "planner_failure" / "query_planner" / "failure.json"))
+        agent_run_payload = _read_json(str(self.temp_dir / "planner_failure" / "query_planner" / "agent_run.json"))
+        self.assertEqual("query_planner_execution_failed", failure_payload["error"])
+        self.assertEqual("planning", failure_payload["stage"])
+        self.assertEqual("query_planner_execution_failed", agent_run_payload["error"]["error"])
+        self.assertFalse((self.temp_dir / "planner_failure" / "query_plans.json").exists())
+
+    def test_workflow_reraises_query_planner_failure_and_skips_qa_result(self):
+        workflow = ReactReviewedWorkflow(
+            qa_config={"react_reviewed": {"reviewer_max_concurrency": 4}},
+            router=_StaticRouterNode(),
+            entity_resolver=_StaticEntityResolverNode(),
+            query_planner=_FailingQueryPlanner(),
+            retriever=_CountingRetriever(),
+            document_acquirer=_CountingDocumentAcquirer(),
+            handoff=EvidenceExtractorHandoff(),
+            evidence_extractor=_CountingEvidenceExtractor(),
+        )
+        workflow.proposer = _PlanningProposer()
+        artifact_dir = self.temp_dir / "workflow_planner_failure"
+
+        with self.assertRaises(QueryPlannerExecutionError):
+            workflow.run(
+                question="How does Pt/C affect HER activity?",
+                context=None,
+                artifact_dir=str(artifact_dir),
+            )
+
+        self.assertTrue((artifact_dir / "query_planner" / "failure.json").exists())
+        self.assertTrue((artifact_dir / "query_planner" / "agent_run.json").exists())
+        self.assertFalse((artifact_dir / "qa_result.json").exists())
+        self.assertFalse((artifact_dir / "workflow_error.txt").exists())
+
     def test_proposer_prefers_structured_output_over_response_content(self):
         proposer = ReactReviewedProposerAgent(
             model_config={},
@@ -762,7 +882,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
 
     def test_screen_candidate_papers_prefers_relevant_fulltext_friendly_candidates(self):
         proposer = ReactReviewedProposerAgent(
-            model_config={},
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
             max_steps_initial=6,
             max_steps_revision=6,
             llm_timeout_seconds=45.0,
@@ -819,20 +939,34 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             ),
         }
 
-        screened = proposer._screen_candidate_papers(
-            workspace=workspace,
-            cycle_number=1,
-            open_review_items=[],
-            paper_ids=["paper-generic", "paper-full"],
-            max_candidates=2,
-        )
+        with patch.object(
+            proposer,
+            "_llm_screen_candidate_papers",
+            return_value={
+                "locked_paper_ids": ["paper-full"],
+                "dropped_paper_ids": ["paper-generic"],
+                "ranked_candidates": [
+                    {"paper_id": "paper-full", "decision": "lock", "reason": "high relevance"},
+                    {"paper_id": "paper-generic", "decision": "drop", "reason": "off topic"},
+                ],
+                "llm_screening_used": True,
+            },
+        ):
+            screened = proposer._screen_candidate_papers(
+                workspace=workspace,
+                cycle_number=1,
+                open_review_items=[],
+                paper_ids=["paper-generic", "paper-full"],
+                max_candidates=2,
+            )
 
         self.assertEqual("paper-full", screened["locked_paper_ids"][0])
         self.assertIn("paper-generic", screened["dropped_paper_ids"])
+        self.assertTrue(screened["llm_screening_used"])
 
     def test_screen_candidate_papers_drops_comparator_only_primary_entity_reference(self):
         proposer = ReactReviewedProposerAgent(
-            model_config={},
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
             max_steps_initial=6,
             max_steps_revision=6,
             llm_timeout_seconds=45.0,
@@ -891,16 +1025,113 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             ),
         }
 
-        screened = proposer._screen_candidate_papers(
-            workspace=workspace,
-            cycle_number=1,
-            open_review_items=[],
-            paper_ids=["paper-comparator", "paper-target"],
-            max_candidates=2,
-        )
+        with patch.object(
+            proposer,
+            "_llm_screen_candidate_papers",
+            return_value={
+                "locked_paper_ids": ["paper-target"],
+                "dropped_paper_ids": ["paper-comparator"],
+                "ranked_candidates": [
+                    {"paper_id": "paper-target", "decision": "lock", "reason": "directly studies Pt/C"},
+                    {
+                        "paper_id": "paper-comparator",
+                        "decision": "drop",
+                        "reason": "mentions Pt/C only as comparator",
+                    },
+                ],
+                "llm_screening_used": True,
+            },
+        ):
+            screened = proposer._screen_candidate_papers(
+                workspace=workspace,
+                cycle_number=1,
+                open_review_items=[],
+                paper_ids=["paper-comparator", "paper-target"],
+                max_candidates=2,
+            )
 
         self.assertEqual(["paper-target"], screened["locked_paper_ids"])
         self.assertIn("paper-comparator", screened["dropped_paper_ids"])
+        self.assertTrue(screened["llm_screening_used"])
+
+    def test_screen_candidate_papers_fail_fast_without_llm_config(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace()
+        workspace.paper_candidates = {
+            "paper-1": PaperCandidate(
+                paper_id="paper-1",
+                title="Pt/C improves HER activity in 1 M KOH",
+                abstract="Pt/C improves HER activity in alkaline electrolyte.",
+                provider_hits=["openalex"],
+                lane_sources=["data"],
+                retrieval_score=8.5,
+                oa_url="https://example.org/fulltext",
+            )
+        }
+
+        with self.assertRaises(ReactReviewedProposerExecutionError) as ctx:
+            proposer._screen_candidate_papers(
+                workspace=workspace,
+                cycle_number=1,
+                open_review_items=[],
+                paper_ids=["paper-1"],
+                max_candidates=1,
+            )
+
+        self.assertEqual("proposer_screening", ctx.exception.stage)
+        screening_path = self.temp_dir / "workspace" / "proposer_cycle_1_candidate_screening.json"
+        failure_path = self.temp_dir / "workspace" / "diagnostics" / "proposer_cycle_1_failure.json"
+        screening_payload = _read_json(str(screening_path))
+        failure_payload = _read_json(str(failure_path))
+        self.assertEqual("proposer_screening", screening_payload["stage"])
+        self.assertFalse(screening_payload["llm_screening_used"])
+        self.assertEqual("missing_model_config", failure_payload["details"]["reason"])
+        self.assertEqual("proposer_screening", failure_payload["stage"])
+
+    def test_screen_candidate_papers_persists_raw_llm_response_when_payload_invalid(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace()
+        workspace.paper_candidates = {
+            "paper-1": PaperCandidate(
+                paper_id="paper-1",
+                title="Pt/C improves HER activity in 1 M KOH",
+                abstract="Pt/C improves HER activity in alkaline electrolyte.",
+                provider_hits=["openalex", "semantic_scholar"],
+                lane_sources=["data"],
+                retrieval_score=8.5,
+                doi="10.1000/full",
+            )
+        }
+        raw_response = json.dumps({"unexpected": "schema"})
+
+        with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
+            "qa.react_reviewed_workflow.invoke_llm",
+            return_value=raw_response,
+        ):
+            with self.assertRaises(ReactReviewedProposerExecutionError) as ctx:
+                proposer._screen_candidate_papers(
+                    workspace=workspace,
+                    cycle_number=1,
+                    open_review_items=[],
+                    paper_ids=["paper-1"],
+                    max_candidates=1,
+                )
+
+        self.assertEqual("proposer_screening", ctx.exception.stage)
+        failure_path = self.temp_dir / "workspace" / "diagnostics" / "proposer_cycle_1_failure.json"
+        failure_payload = _read_json(str(failure_path))
+        self.assertEqual("invalid_screening_payload", failure_payload["details"]["reason"])
+        self.assertEqual(raw_response, failure_payload["response_content"])
 
     def test_normalize_submission_citations_does_not_backfill_irrelevant_abstract(self):
         proposer = ReactReviewedProposerAgent(
@@ -1736,6 +1967,60 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(["direct_answer"], payload["conclude_call_contract"]["required_section_ids"])
         self.assertIn("submission", payload["conclude_call_contract"]["tool_call_example"])
 
+    def test_reviewer_build_user_prompt_includes_conclude_contract(self):
+        reviewer = ReactReviewedReviewerAgent(
+            reviewer_role="search_coverage",
+            model_config={},
+            max_steps=3,
+            max_items=3,
+            max_retrieval_actions=1,
+            llm_timeout_seconds=45.0,
+        )
+        submission = _submission("What is the molecular formula of ethanol?")
+        proposer_trajectory = _trajectory("review contract prompt")
+
+        prompt = reviewer._build_user_prompt(
+            submission=submission,
+            proposer_trajectory=proposer_trajectory,
+            cycle_number=1,
+        )
+        payload = json.loads(prompt)
+
+        self.assertIn("conclude_call_contract", payload)
+        self.assertEqual(
+            "Call conclude with exactly {\"review\": {\"review_items\": [...]}}. Do not send a bare array, do not pass {\"review_items\": [...]} directly, and do not rename the wrapper key.",
+            payload["conclude_call_contract"]["tool_call_rule"],
+        )
+        self.assertIn("review", payload["conclude_call_contract"]["tool_call_example"])
+
+    def test_reviewer_prompt_contract_requires_review_wrapper(self):
+        reviewer = ReactReviewedReviewerAgent(
+            reviewer_role="search_coverage",
+            model_config={},
+            max_steps=3,
+            max_items=3,
+            max_retrieval_actions=1,
+            llm_timeout_seconds=45.0,
+        )
+        submission = _submission("What is the molecular formula of ethanol?")
+        proposer_trajectory = _trajectory("review contract details")
+        conclude_call_contract = reviewer._build_review_prompt_contract(
+            submission=submission,
+            proposer_trajectory=proposer_trajectory,
+        )
+
+        system_prompt = reviewer._build_system_prompt(conclude_call_contract=conclude_call_contract)
+        action_prompt = build_reviewer_action_prompt(
+            tool_names=("inspect_submission_anchor", "conclude"),
+            retrieval_budget=1,
+            conclude_contract=conclude_call_contract,
+        )
+
+        self.assertIn('{"review": {"review_items": [...]}}', system_prompt)
+        self.assertIn("Do not output a bare array", system_prompt)
+        self.assertIn('{"review": {"review_items": [...]}}', action_prompt)
+        self.assertIn("Common invalid outputs", action_prompt)
+
     def test_try_validate_salvaged_submission_payload_normalizes_invalid_citations_with_run_state(self):
         proposer = ReactReviewedProposerAgent(
             model_config={},
@@ -1801,11 +2086,20 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             max_steps_revision=6,
             llm_timeout_seconds=45.0,
         )
+        workspace = self._make_workspace()
+        conclude_call_contract = proposer._build_submission_prompt_contract(
+            workspace=workspace,
+            cycle_number=1,
+            open_review_items=[],
+        )
 
-        instruction = proposer._action_instruction(PROPOSER_TOOL_NAMES)
+        instruction = proposer._action_instruction(
+            PROPOSER_TOOL_NAMES,
+            conclude_call_contract=conclude_call_contract,
+        )
 
-        self.assertIn('For conclude, the tool args object must be exactly {"submission": {...}}.', instruction)
-        self.assertIn("Do not pass a bare submission object", instruction)
+        self.assertIn('Call conclude with exactly {"submission": {...}}.', instruction)
+        self.assertIn("Common invalid outputs", instruction)
 
     def test_proposer_repair_parses_valid_json_response(self):
         proposer = ReactReviewedProposerAgent(
@@ -2680,6 +2974,42 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(invalid_trajectory.trajectory_id, trajectory.trajectory_id)
         self.assertEqual({}, workspace.paper_records)
 
+    def test_reviewer_fail_fast_without_llm_config_persists_failure_artifact(self):
+        reviewer = ReactReviewedReviewerAgent(
+            reviewer_role="search_coverage",
+            model_config={},
+            max_steps=3,
+            max_items=3,
+            max_retrieval_actions=1,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace()
+        session = self._make_session("search_coverage", 1)
+        submission = _submission(workspace.question)
+        proposer_trajectory = _trajectory("proposer reviewer error")
+
+        with self.assertRaises(ReactReviewedReviewerExecutionError) as ctx:
+            reviewer.run(
+                workspace=workspace,
+                submission=submission,
+                proposer_trajectory=proposer_trajectory,
+                cycle_number=1,
+                session=session,
+            )
+
+        self.assertEqual("reviewer_startup", ctx.exception.stage)
+        failure_path = (
+            self.temp_dir
+            / "sessions"
+            / "search_coverage"
+            / "diagnostics"
+            / "search_coverage_cycle_1_failure.json"
+        )
+        failure_payload = _read_json(str(failure_path))
+        self.assertEqual("search_coverage", failure_payload["reviewer_role"])
+        self.assertEqual("reviewer_startup", failure_payload["stage"])
+        self.assertFalse(failure_payload["details"]["has_api_key"])
+
     def test_workflow_marks_incomplete_when_reviewer_returns_invalid_json(self):
         workflow = self._make_workflow()
         failing_reviewer = workflow.reviewers["search_coverage"]
@@ -2711,6 +3041,34 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual("incomplete", result.review_completion_status)
         self.assertEqual("rejected", result.acceptance_status)
         self.assertEqual("invalid_json", review_statuses[0]["status"])
+        self.assertNotIn("final_submission", result.artifact_paths)
+        self.assertIn("acceptance_decision", result.artifact_paths)
+
+    def test_workflow_marks_incomplete_when_reviewer_errors_without_llm(self):
+        workflow = self._make_workflow()
+        workflow.reviewers = {
+            "search_coverage": ReactReviewedReviewerAgent(
+                reviewer_role="search_coverage",
+                model_config={},
+                max_steps=3,
+                max_items=3,
+                max_retrieval_actions=1,
+                llm_timeout_seconds=45.0,
+            ),
+            "evidence_trace": _ParallelReviewer("evidence_trace", threading.Barrier(1), 0.0, []),
+            "reasoning_consistency": _ParallelReviewer("reasoning_consistency", threading.Barrier(1), 0.0, []),
+            "counterevidence": _ParallelReviewer("counterevidence", threading.Barrier(1), 0.0, []),
+        }
+
+        result = workflow.run(
+            question="How does Pt/C affect HER activity?",
+            artifact_dir=str(self.temp_dir / "artifacts_reviewer_error"),
+        )
+
+        review_statuses = _read_json(result.artifact_paths["review_statuses"])
+        self.assertEqual("incomplete", result.review_completion_status)
+        self.assertEqual("rejected", result.acceptance_status)
+        self.assertIn("error", [item["status"] for item in review_statuses])
         self.assertNotIn("final_submission", result.artifact_paths)
         self.assertIn("acceptance_decision", result.artifact_paths)
 

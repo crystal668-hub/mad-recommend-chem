@@ -7,7 +7,7 @@ from qa.artifacts import QAArtifactStore
 from qa.evidence import ClaimMiner, EvidenceExtractor, EvidenceLedgerBuilder
 from qa.handoff import EvidenceExtractorHandoff
 from qa.nodes.document_acquirer import DocumentAcquirerNode
-from qa.nodes.query_planner import QueryPlannerNode
+from qa.nodes.query_planner import QueryPlannerExecutionError, QueryPlannerNode
 from qa.nodes.retriever import RetrieverNode
 from qa.review_pipeline import StructuredPeerReviewPipeline
 from qa.retrieval_state import RetrievalDiagnosticRecord, RetrievalState
@@ -52,7 +52,16 @@ class HeterogeneousRetrievalPipeline:
     ) -> RetrievalState:
         store = QAArtifactStore(base_dir=artifact_dir)
         logger.info("qa_retrieval_start question=%s", question)
-        query_plans = self.query_planner.run(task_spec=task_spec, entity_pack=entity_pack)
+        try:
+            query_plans = self.query_planner.run(task_spec=task_spec, entity_pack=entity_pack)
+        except QueryPlannerExecutionError as exc:
+            self._write_query_planner_failure_artifacts(
+                store=store,
+                task_spec=task_spec,
+                entity_pack=entity_pack,
+                error=exc,
+            )
+            raise
         logger.info("qa_query_planning_complete query_plans=%s", len(query_plans))
         paper_candidates = self.retriever.run(
             task_spec=task_spec,
@@ -142,3 +151,29 @@ class HeterogeneousRetrievalPipeline:
         )
 
     __call__ = run
+
+    def _write_query_planner_failure_artifacts(
+        self,
+        *,
+        store: QAArtifactStore,
+        task_spec: TaskSpec,
+        entity_pack: EntityPack,
+        error: QueryPlannerExecutionError,
+    ) -> None:
+        debug_payload = dict(error.debug_payload or {})
+        store.write_json(
+            "query_planner/failure.json",
+            error.to_payload(),
+        )
+        store.write_json(
+            "query_planner/agent_run.json",
+            {
+                "agent": "QueryPlannerNode",
+                "input": {
+                    "task_spec": task_spec.model_dump(exclude_none=True),
+                    "entity_pack": entity_pack.model_dump(exclude_none=True),
+                },
+                "error": error.to_payload(),
+                "debug": debug_payload,
+            },
+        )

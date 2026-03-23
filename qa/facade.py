@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from qa.artifacts import QAArtifactStore
+from qa.nodes.router import RouterExecutionError
+from qa.peer_review_errors import PeerReviewExecutionError
 from qa.retrieval_state import RetrievalState
 from qa.runtime import QARuntime, build_qa_runtime, resolve_qa_runtime_config
 from qa.synthesis_state import QAResult
@@ -96,11 +98,20 @@ class QASystem:
             return finalized_result
 
         run_detailed = getattr(self.grounding_pipeline, "run_detailed", None)
-        if callable(run_detailed):
-            grounding_state, resolution_result = run_detailed(question=question, context=context)
-        else:
-            grounding_state = self.grounding_pipeline.run(question=question, context=context)
-            resolution_result = None
+        try:
+            if callable(run_detailed):
+                grounding_state, resolution_result = run_detailed(question=question, context=context)
+            else:
+                grounding_state = self.grounding_pipeline.run(question=question, context=context)
+                resolution_result = None
+        except RouterExecutionError as exc:
+            self._write_router_failure_artifacts(
+                artifact_dir=resolved_artifact_dir,
+                question=question,
+                context=context,
+                error=exc,
+            )
+            raise
         entity_artifacts = self._write_entity_resolution_artifacts(
             artifact_dir=resolved_artifact_dir,
             resolution_result=resolution_result,
@@ -118,10 +129,19 @@ class QASystem:
         execution_warnings: list[str] = []
         if self.peer_review_pipeline is not None:
             logger.info("qa_peer_review_dispatch claims=%s", len(retrieval_state.evidence_ledger.claims))
-            reviewed_ledger = self.peer_review_pipeline.run(
-                retrieval_state.evidence_ledger,
-                task_spec=grounding_state.task_spec,
-            )
+            try:
+                reviewed_ledger = self.peer_review_pipeline.run(
+                    retrieval_state.evidence_ledger,
+                    task_spec=grounding_state.task_spec,
+                )
+            except PeerReviewExecutionError as exc:
+                self._write_peer_review_failure_artifacts(
+                    artifact_dir=resolved_artifact_dir,
+                    evidence_ledger=retrieval_state.evidence_ledger,
+                    task_spec=grounding_state.task_spec,
+                    error=exc,
+                )
+                raise
             retrieval_state = retrieval_state.model_copy(update={"evidence_ledger": reviewed_ledger})
             review_artifacts = self._write_review_artifacts(retrieval_state)
             execution_warnings = self._merge_execution_warnings(
@@ -245,6 +265,81 @@ class QASystem:
         artifact_paths: Dict[str, str] = {}
         for relative_path, payload in dict(resolution_result.artifact_payloads()).items():
             artifact_paths[Path(relative_path).stem] = store.write_json(relative_path, payload)
+        return artifact_paths
+
+    def _write_router_failure_artifacts(
+        self,
+        *,
+        artifact_dir: str,
+        question: str,
+        context: Optional[str],
+        error: RouterExecutionError,
+    ) -> Dict[str, str]:
+        store = QAArtifactStore(base_dir=artifact_dir)
+        debug_payload = dict(error.debug_payload or {})
+        artifact_paths: Dict[str, str] = {}
+        if isinstance(debug_payload.get("semantic_stage"), dict):
+            artifact_paths["router_semantic_stage"] = store.write_json(
+                "router/semantic_stage.json",
+                debug_payload["semantic_stage"],
+            )
+        if isinstance(debug_payload.get("localization_stage"), dict):
+            artifact_paths["router_localization_stage"] = store.write_json(
+                "router/localization_stage.json",
+                debug_payload["localization_stage"],
+            )
+        artifact_paths["router_failure"] = store.write_json(
+            "router/failure.json",
+            error.to_payload(),
+        )
+        artifact_paths["router_agent_run"] = store.write_json(
+            "router/agent_run.json",
+            {
+                "agent": "RouterAgent",
+                "input": {"question": question, "context": context},
+                "error": error.to_payload(),
+                "debug": debug_payload,
+            },
+        )
+        return artifact_paths
+
+    def _write_peer_review_failure_artifacts(
+        self,
+        *,
+        artifact_dir: str,
+        evidence_ledger: Any,
+        task_spec: Any,
+        error: PeerReviewExecutionError,
+    ) -> Dict[str, str]:
+        store = QAArtifactStore(base_dir=artifact_dir)
+        ledger_payload = (
+            evidence_ledger.model_dump(exclude_none=True)
+            if hasattr(evidence_ledger, "model_dump")
+            else dict(evidence_ledger or {})
+        )
+        task_spec_payload = (
+            task_spec.model_dump(exclude_none=True)
+            if task_spec is not None and hasattr(task_spec, "model_dump")
+            else None
+        )
+        artifact_paths: Dict[str, str] = {}
+        artifact_paths["peer_review_failure"] = store.write_json(
+            "peer_review/failure.json",
+            error.to_payload(),
+        )
+        artifact_paths["peer_review_agent_run"] = store.write_json(
+            "peer_review/agent_run.json",
+            {
+                "agent": "StructuredPeerReviewPipeline",
+                "input": {
+                    "task_spec": task_spec_payload,
+                    "claim_count": len(list(getattr(evidence_ledger, "claims", []) or [])),
+                    "evidence_count": len(list(getattr(evidence_ledger, "evidence_items", []) or [])),
+                    "evidence_ledger": ledger_payload,
+                },
+                "error": error.to_payload(),
+            },
+        )
         return artifact_paths
 
     def _public_result_path(self) -> Path:
