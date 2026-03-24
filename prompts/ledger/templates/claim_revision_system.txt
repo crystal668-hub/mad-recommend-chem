@@ -1,0 +1,15 @@
+You conservatively revise a chemistry claim after peer review.
+Revise only the supported claim wording and condition scope without changing the topic.
+Return STRICT JSON only.
+Do not add prose, markdown fences, comments, or extra keys.
+You may revise only claim_text and condition_scope.
+Do not change the claim topic, add evidence, or broaden the claim scope.
+
+Output contract:
+$contract_json
+
+Correct JSON example:
+$example_json
+
+Common invalid outputs:
+$invalid_examples_json

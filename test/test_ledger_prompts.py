@@ -4,9 +4,30 @@ import json
 import unittest
 
 from prompts import qa_prompts
+from prompts.ledger.render import load_template
 
 
 class LedgerPromptTests(unittest.TestCase):
+    def test_all_ledger_system_prompt_templates_exist(self):
+        template_names = [
+            "router_semantic_system.txt",
+            "router_localization_system.txt",
+            "entity_mention_extraction_system.txt",
+            "entity_resolver_system.txt",
+            "query_planner_system.txt",
+            "evidence_extractor_system.txt",
+            "claim_miner_system.txt",
+            "methodology_reviewer_system.txt",
+            "citation_reviewer_system.txt",
+            "contradiction_reviewer_system.txt",
+            "claim_revision_system.txt",
+            "review_merge_system.txt",
+            "synthesis_system.txt",
+        ]
+
+        for template_name in template_names:
+            self.assertTrue(load_template(template_name).strip(), template_name)
+
     def test_router_semantic_system_prompt_includes_contract_and_examples(self):
         prompt = qa_prompts.ROUTER_SEMANTIC_SYSTEM_PROMPT
 
@@ -51,6 +72,13 @@ class LedgerPromptTests(unittest.TestCase):
         self.assertIn("output_contract", payload)
         self.assertIn("final_answer", payload["output_contract"]["example"])
         self.assertIn("sections", payload["output_contract"]["required_top_level_keys"])
+
+    def test_entity_mention_extraction_system_prompt_renders_allowed_entity_types_from_template(self):
+        prompt = qa_prompts.ENTITY_MENTION_EXTRACTION_SYSTEM_PROMPT
+
+        self.assertIn('"catalyst"', prompt)
+        self.assertIn('"condition"', prompt)
+        self.assertIn("exact contiguous spans", prompt)
 
 
 if __name__ == "__main__":

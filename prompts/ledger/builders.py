@@ -17,165 +17,107 @@ from prompts.ledger.contracts import (
     synthesis_contract,
 )
 from prompts.ledger.render import json_block
+from prompts.ledger.render import render_template
 
 
-def _build_strict_json_system_prompt(*, role: str, mission: str, extra_rules: Sequence[str], contract: Dict[str, Any]) -> str:
-    lines = [
-        role,
-        mission,
-        "Return STRICT JSON only.",
-        "Do not add prose, markdown fences, comments, or extra keys.",
-        "",
-        "Output contract:",
-        json_block(contract),
-        "",
-        "Correct JSON example:",
-        json_block(contract.get("example") or {}),
-        "",
-        "Common invalid outputs:",
-        json_block(contract.get("invalid_examples") or []),
-    ]
-    if extra_rules:
-        lines.extend(["", "Additional rules:"])
-        lines.extend(f"- {rule}" for rule in extra_rules)
-    return "\n".join(lines).strip()
+def _build_contract_system_prompt(template_name: str, *, contract: Dict[str, Any], **values: str) -> str:
+    return render_template(
+        template_name,
+        contract_json=json_block(contract),
+        example_json=json_block(contract.get("example") or {}),
+        invalid_examples_json=json_block(contract.get("invalid_examples") or []),
+        **values,
+    )
 
 
 def build_router_semantic_system_prompt() -> str:
-    return _build_strict_json_system_prompt(
-        role="You are RouterNode semantic interpretation stage for a chemistry QA grounding pipeline.",
-        mission="Reason from the question text first and expose ambiguity explicitly instead of forcing false certainty.",
-        extra_rules=["Choose only from the allowed question types and enums."],
-        contract=router_semantic_contract(),
-    )
+    return _build_contract_system_prompt("router_semantic_system.txt", contract=router_semantic_contract())
 
 
 def build_router_localization_system_prompt() -> str:
-    return _build_strict_json_system_prompt(
-        role="You are RouterNode task localization stage for a chemistry QA grounding pipeline.",
-        mission="Use the semantic parse as the primary interpretation of user intent and keep the final TaskSpec conservative when ambiguity remains.",
-        extra_rules=["Use optional signals only as supporting observations, not as preferred defaults."],
-        contract=router_localization_contract(),
-    )
+    return _build_contract_system_prompt("router_localization_system.txt", contract=router_localization_contract())
 
 
 def build_entity_mention_extraction_system_prompt(*, allowed_entity_types: Sequence[str]) -> str:
-    return _build_strict_json_system_prompt(
-        role="You are EntityResolverNode for a chemistry QA pipeline.",
-        mission="Extract only chemistry-relevant entity mentions that appear as exact contiguous spans in the question.",
-        extra_rules=[
-            "You may only use the supplied ontology entity types.",
-            "Do not invent new spans, aliases, canonical names, or chemical identifiers.",
-        ],
-        contract=entity_mention_extraction_contract(allowed_entity_types=allowed_entity_types),
+    contract = entity_mention_extraction_contract(allowed_entity_types=allowed_entity_types)
+    return _build_contract_system_prompt(
+        "entity_mention_extraction_system.txt",
+        contract=contract,
+        allowed_entity_types_json=json_block(list(allowed_entity_types)),
     )
 
 
 def build_entity_resolver_system_prompt() -> str:
-    return _build_strict_json_system_prompt(
-        role="You are EntityResolverNode for a chemistry QA pipeline.",
-        mission="Resolve an entity mention only by choosing from the supplied candidate entity types and candidate indices.",
-        extra_rules=["Do not invent new entities, aliases, canonical names, or chemical identifiers."],
-        contract=entity_resolver_contract(),
-    )
+    return _build_contract_system_prompt("entity_resolver_system.txt", contract=entity_resolver_contract())
 
 
 def build_query_planner_system_prompt() -> str:
-    return _build_strict_json_system_prompt(
-        role="You are QueryPlannerNode for a chemistry QA retrieval pipeline.",
-        mission="Produce exactly four search plans aligned to the supplied task and entity grounding.",
-        extra_rules=[
-            "You must produce exactly four plans whose lanes are review, frontier, data, and contrarian.",
-            "Preserve the supplied baseline structure unless a narrower query is clearly better.",
-        ],
-        contract=query_planner_contract(),
+    contract = query_planner_contract()
+    return _build_contract_system_prompt(
+        "query_planner_system.txt",
+        contract=contract,
+        allowed_lanes_json=json_block(contract.get("allowed_lanes") or []),
     )
 
 
 def build_evidence_extractor_system_prompt() -> str:
-    return _build_strict_json_system_prompt(
-        role="You classify scientific evidence snippets for a chemistry QA pipeline.",
-        mission="Label the snippet conservatively using only information present in the snippet.",
-        extra_rules=[
-            "roles may only contain observation, limitation, or mechanism.",
-            "claim_polarity must be support, oppose, or neutral.",
-            "Do not invent entities or metrics that are not supported by the snippet.",
-        ],
-        contract=evidence_extractor_contract(),
+    contract = evidence_extractor_contract()
+    return _build_contract_system_prompt(
+        "evidence_extractor_system.txt",
+        contract=contract,
+        allowed_roles_json=json_block(contract.get("allowed_roles") or []),
+        allowed_claim_polarity_json=json_block(contract.get("allowed_claim_polarity") or []),
     )
 
 
 def build_claim_miner_system_prompt() -> str:
-    return _build_strict_json_system_prompt(
-        role="You name evidence clusters as single English condition-bound claims.",
-        mission="Summarize the supported claim conservatively without adding new evidence or topics.",
-        extra_rules=["Output only the claim_text field."],
-        contract=claim_miner_contract(),
-    )
+    return _build_contract_system_prompt("claim_miner_system.txt", contract=claim_miner_contract())
 
 
 def build_methodology_reviewer_system_prompt() -> str:
-    return _build_strict_json_system_prompt(
-        role="You are MethodologyReviewer for a chemistry QA pipeline.",
-        mission="Flag only methodology issues that are directly supported by the supplied claim, task axes, and snippets.",
-        extra_rules=["Use only the allowed flag_type values."],
-        contract=reviewer_contract(
-            allowed_flag_types=["Missing_Condition", "Incomplete_Condition", "Overgeneralized", "Mechanism_Speculative", "Metric_Mismatch"]
-        ),
+    contract = reviewer_contract(
+        allowed_flag_types=["Missing_Condition", "Incomplete_Condition", "Overgeneralized", "Mechanism_Speculative", "Metric_Mismatch"]
+    )
+    return _build_contract_system_prompt(
+        "methodology_reviewer_system.txt",
+        contract=contract,
+        allowed_flag_types_json=json_block(contract.get("allowed_flag_types") or []),
     )
 
 
 def build_citation_reviewer_system_prompt() -> str:
-    return _build_strict_json_system_prompt(
-        role="You are CitationReviewer for a chemistry QA pipeline.",
-        mission="Flag unsupported or weakly supported claims using only the supplied evidence references.",
-        extra_rules=["Do not emit Fabricated_Citation; that is checked deterministically elsewhere."],
-        contract=reviewer_contract(allowed_flag_types=["Unsupported", "Weak_Evidence"]),
+    contract = reviewer_contract(allowed_flag_types=["Unsupported", "Weak_Evidence"])
+    return _build_contract_system_prompt(
+        "citation_reviewer_system.txt",
+        contract=contract,
+        allowed_flag_types_json=json_block(contract.get("allowed_flag_types") or []),
     )
 
 
 def build_contradiction_reviewer_system_prompt() -> str:
-    return _build_strict_json_system_prompt(
-        role="You adjudicate whether a prefiltered pair of chemistry claims is a true_conflict or condition_divergence.",
-        mission="Assess only the supplied pair and do not generalize beyond it.",
-        extra_rules=["Choose only from true_conflict, condition_divergence, or no_conflict."],
-        contract=contradiction_reviewer_contract(),
+    contract = contradiction_reviewer_contract()
+    return _build_contract_system_prompt(
+        "contradiction_reviewer_system.txt",
+        contract=contract,
+        allowed_conflict_types_json=json_block(contract.get("allowed_conflict_types") or []),
     )
 
 
 def build_claim_revision_system_prompt() -> str:
-    return _build_strict_json_system_prompt(
-        role="You conservatively revise a chemistry claim after peer review.",
-        mission="Revise only the supported claim wording and condition scope without changing the topic.",
-        extra_rules=[
-            "You may revise only claim_text and condition_scope.",
-            "Do not change the claim topic, add evidence, or broaden the claim scope.",
-        ],
-        contract=claim_revision_contract(),
-    )
+    return _build_contract_system_prompt("claim_revision_system.txt", contract=claim_revision_contract())
 
 
 def build_review_merge_system_prompt() -> str:
-    return _build_strict_json_system_prompt(
-        role="You are ReviewMergeNode for a chemistry QA structured peer review module.",
-        mission="Merge review outcomes conservatively and do not override critical review findings.",
-        extra_rules=["You may choose only accepted, contested, or rejected."],
-        contract=review_merge_contract(),
+    contract = review_merge_contract()
+    return _build_contract_system_prompt(
+        "review_merge_system.txt",
+        contract=contract,
+        allowed_statuses_json=json_block(contract.get("allowed_statuses") or []),
     )
 
 
 def build_synthesis_system_prompt() -> str:
-    return _build_strict_json_system_prompt(
-        role="You are SynthesizerNode of a chemistry QA pipeline.",
-        mission="Write the final answer using only the supplied SynthesisInputPack.",
-        extra_rules=[
-            "Do not add new facts, new citations, or any rejected claim.",
-            "Accepted claims may appear in main sections.",
-            "Contested claims may appear only in the Limitations / Controversies section.",
-            "Match the wording to the supplied confidence labels.",
-        ],
-        contract=synthesis_contract(),
-    )
+    return _build_contract_system_prompt("synthesis_system.txt", contract=synthesis_contract())
 
 
 def build_router_semantic_user_prompt(
@@ -387,4 +329,3 @@ def build_review_merge_user_prompt(
 def build_synthesizer_user_prompt(input_pack: Dict[str, Any]) -> str:
     payload = {"input_pack": input_pack, "output_contract": synthesis_contract()}
     return json_block(payload)
-
