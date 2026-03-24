@@ -63,6 +63,19 @@ Ledger-focused partial-run diagnosis is also available:
 python -m qa.ledger_live_runner --run-suite
 ```
 
+ChemBench reasoning smoke tests are available as a separate runner:
+
+```bash
+python -m qa.chembench_smoke
+```
+
+Optional flags:
+
+- `--cases-file ./evals/chembench_smoke_cases.yaml`
+- `--case molecular_structure`
+- `--artifact-root ./outputs/chembench_smoke/manual_run`
+- `--shadow-config <path>`
+
 ## Configuration
 
 Runtime configuration lives in `config/config.yaml`.

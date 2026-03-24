@@ -1,0 +1,42 @@
+cases:
+  - subset: analytical_chemistry
+    name: analytical_chemistry_3
+    uuid: c84c6a28-acde-4f2c-a75f-3f144ead8cfd
+    question: >-
+      What analytical method would be suitable for a river water sample collected near a mining area,
+      where the concentrations of multiple toxic metals such as lead, cadmium, and arsenic must be
+      quantified simultaneously at trace levels?
+    gold: Inductively coupled plasma optical emission spectroscopy
+    type: choice_text
+    keywords:
+      - ICP-OES
+      - Inductively coupled plasma optical emission spectroscopy
+    source_url: https://huggingface.co/datasets/jablonkagroup/ChemBench/viewer/analytical_chemistry/train
+
+  - subset: analytical_chemistry
+    name: molecular_structure
+    uuid: 72b8c8f0-a0c6-49d2-b417-df8cb43598da
+    question: >-
+      How many normal modes of vibration does C60 have, assuming Ih point group symmetry and using
+      the 3N-6 vibrational degrees of freedom rule?
+    gold: "174"
+    type: integer
+    keywords:
+      - C60
+      - vibrational modes
+      - 3N-6
+    source_url: https://huggingface.co/datasets/jablonkagroup/ChemBench/viewer/analytical_chemistry/train
+
+  - subset: analytical_chemistry
+    name: number_1h_nmr_shifts
+    uuid: f50b5e40-20e2-4583-9659-3011d40f9492
+    question: >-
+      How many peaks would you expect in the 1H NMR spectrum of the compound with SMILES
+      `C[C@H]1[C@H](C)S(=O)(=O)N(C1)C(=O)N1CCOCC1`?
+    gold: "5"
+    type: integer
+    keywords:
+      - 1H NMR
+      - peak count
+      - SMILES
+    source_url: https://huggingface.co/datasets/jablonkagroup/ChemBench/viewer/analytical_chemistry/train
