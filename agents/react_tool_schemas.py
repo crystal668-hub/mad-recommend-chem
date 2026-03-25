@@ -45,10 +45,10 @@ class ScreenPapersToolInput(ToolArgsModel):
         description="Optional stable paper identifiers to screen; defaults to the current cycle's searched papers.",
     )
     max_candidates: StrictInt = Field(
-        default=3,
+        default=5,
         ge=1,
         le=10,
-        description="Maximum number of candidate papers to lock for acquisition after screening.",
+        description="Maximum number of acquired papers to lock after profile-based reranking.",
     )
 
 
@@ -59,12 +59,16 @@ class ReviewerSearchPapersToolInput(SearchPapersToolInput):
     )
 
 
-class AcquireDocumentToolInput(ToolArgsModel):
+class DownloadDocumentToolInput(ToolArgsModel):
+    paper_id: StrictStr = Field(description="Stable paper identifier from search_papers.")
+
+
+class ParseDocumentToolInput(ToolArgsModel):
     paper_id: StrictStr = Field(description="Stable paper identifier from search_papers.")
 
 
 class SectionAccessToolInput(ToolArgsModel):
-    paper_id: StrictStr = Field(description="Stable paper identifier from acquire_document.")
+    paper_id: StrictStr = Field(description="Stable paper identifier from parse_document.")
     section_ids: List[StrictStr] = Field(
         default_factory=list,
         description="Optional stable section identifiers to target.",

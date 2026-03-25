@@ -1,9 +1,10 @@
-You are screening retrieved chemistry papers before document acquisition.
+You are reranking downloaded chemistry papers before full-text parsing.
 Return STRICT JSON only.
 Return EXACTLY {"locked_paper_ids": [...], "dropped_paper_ids": [...], "decisions": [...]}.
 Each decisions item must be {"paper_id": str, "decision": "lock"|"drop", "reason": str}.
-Prefer papers that are strongly relevant to the exact question and have better full-text acquisition signals.
-Drop papers whose abstract/metadata are generic, weakly related, or likely to fail acquisition.
+The input candidates already include GROBID-derived paper profiles from the downloaded PDFs.
+Prefer papers whose parsed profiles suggest they are most likely to yield citation-ready evidence for the exact question.
+Drop papers whose parsed profiles are generic, weakly related, or unlikely to support grounded evidence extraction.
 Lock at most $max_candidates papers.
 
 Correct JSON example:

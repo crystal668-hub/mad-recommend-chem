@@ -20,6 +20,7 @@ from qa.nodes.review_merge import ReviewMergeNode
 from qa.nodes.router import RouterNode
 from qa.nodes.synthesizer import SynthesizerNode
 from qa.pipeline import QueryGroundingPipeline
+from qa.paper_profiles import GrobidPaperProfileBuilder
 from qa.pdf_extraction import PDFExtractionPipeline
 from qa.providers import (
     CrossrefClient,
@@ -107,6 +108,9 @@ DEFAULT_QA_CONFIG: Dict[str, Any] = {
         "proposer_fallback_mode": "fail_fast_only",
         "proposer_repair_attempts": 1,
         "proposer_evidence_policy": "prefer_fulltext",
+        "proposer_candidate_target": 18,
+        "proposer_rerank_top_k": 5,
+        "grobid_url": "http://localhost:8070",
         "stage_watchdog_seconds": 120.0,
         "max_review_cycles": 3,
         "reviewer_max_steps": 3,
@@ -268,6 +272,17 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
             )
         ),
     }
+    proposer_candidate_target = _coerce_positive_int(
+        react_reviewed_config.get("proposer_candidate_target"),
+        fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_candidate_target"],
+    )
+    proposer_rerank_top_k = min(
+        proposer_candidate_target,
+        _coerce_positive_int(
+            react_reviewed_config.get("proposer_rerank_top_k"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_rerank_top_k"],
+        ),
+    )
     qa_config["react_reviewed"] = {
         "max_propose_steps_initial": _coerce_positive_int(
             react_reviewed_config.get("max_propose_steps_initial"),
@@ -291,6 +306,10 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
             allowed={"prefer_fulltext"},
             fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_evidence_policy"],
         ),
+        "proposer_candidate_target": proposer_candidate_target,
+        "proposer_rerank_top_k": proposer_rerank_top_k,
+        "grobid_url": _resolve_provider_text(react_reviewed_config.get("grobid_url"))
+        or str(DEFAULT_QA_CONFIG["react_reviewed"]["grobid_url"]),
         "stage_watchdog_seconds": _coerce_positive_float(
             react_reviewed_config.get("stage_watchdog_seconds"),
             fallback=DEFAULT_QA_CONFIG["react_reviewed"]["stage_watchdog_seconds"],
@@ -787,6 +806,7 @@ def build_qa_runtime(
         )
 
     if react_reviewed_workflow is None and qa_config["workflow_mode"] == "react_reviewed":
+        react_reviewed_config = dict(qa_config.get("react_reviewed", {}) or {})
         react_reviewed_workflow = ReactReviewedWorkflow(
             qa_config=qa_config,
             router=grounding_pipeline.router,
@@ -796,6 +816,9 @@ def build_qa_runtime(
             document_acquirer=retrieval_pipeline.document_acquirer,
             handoff=retrieval_pipeline.handoff,
             evidence_extractor=retrieval_pipeline.evidence_extractor,
+            paper_profile_builder=GrobidPaperProfileBuilder(
+                grobid_url=react_reviewed_config.get("grobid_url"),
+            ),
             proposer_model_config=get_node_model_config("react_proposer"),
             reviewer_model_configs={
                 "search_coverage": get_node_model_config("react_reviewer_search_coverage") or {},
@@ -803,6 +826,8 @@ def build_qa_runtime(
                 "reasoning_consistency": get_node_model_config("react_reviewer_reasoning_consistency") or {},
                 "counterevidence": get_node_model_config("react_reviewer_counterevidence") or {},
             },
+            proposer_candidate_target=react_reviewed_config.get("proposer_candidate_target", 18),
+            proposer_rerank_top_k=react_reviewed_config.get("proposer_rerank_top_k", 5),
         )
 
     return QARuntime(

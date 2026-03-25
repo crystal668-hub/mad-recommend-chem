@@ -80,6 +80,9 @@ qa:
     proposer_fallback_mode: "fail_fast_only"
     proposer_repair_attempts: 1
     proposer_evidence_policy: "prefer_fulltext"
+    grobid_url: "http://localhost:8070"
+    proposer_candidate_target: 15
+    proposer_rerank_top_k: 5
     stage_watchdog_seconds: 120.0
     max_review_cycles: 3
     reviewer_max_steps: 3

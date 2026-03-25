@@ -251,7 +251,7 @@ class _DeadlineFollowupRetrievalBackend:
                     },
                     {
                         "id": "call_acquire_1",
-                        "name": "acquire_document",
+                        "name": "download_document",
                         "args": {"paper_id": "paper-1"},
                     },
                     {
@@ -293,7 +293,7 @@ class _DeadlineLastChanceExtractBackend:
                 tool_calls=[
                     {
                         "id": "call_acquire_1",
-                        "name": "acquire_document",
+                        "name": "download_document",
                         "args": {"paper_id": "paper-1"},
                     }
                 ],
@@ -610,9 +610,16 @@ class DeadlineModeTests(unittest.TestCase):
             executed.append("search_papers")
             return ToolResult(observation="[]", data=[])
 
-        def _acquire(_payload):
-            executed.append("acquire_document")
+        def _download(_payload):
+            executed.append("download_document")
             return ToolResult(observation='{"paper_id":"paper-1"}', data={"paper_id": "paper-1"})
+
+        def _parse(_payload):
+            executed.append("parse_document")
+            return ToolResult(
+                observation='{"paper_id":"paper-1","fulltext_status":"fulltext_indexed"}',
+                data={"paper_id": "paper-1", "fulltext_status": "fulltext_indexed"},
+            )
 
         def _extract(_payload):
             executed.append("extract_evidence")
@@ -625,7 +632,8 @@ class DeadlineModeTests(unittest.TestCase):
             )
 
         search_tool = _InvokeTool(_search)
-        acquire_tool = _InvokeTool(_acquire)
+        download_tool = _InvokeTool(_download)
+        parse_tool = _InvokeTool(_parse)
         extract_tool = _InvokeTool(_extract)
         conclude_tool = _InvokeTool(_conclude)
 
@@ -642,8 +650,8 @@ class DeadlineModeTests(unittest.TestCase):
                 system_prompt="",
                 max_react_steps=10,
                 verbose=False,
-                tools=[search_tool, acquire_tool, extract_tool, conclude_tool],
-                search_tool_names=["search_papers", "acquire_document", "extract_evidence"],
+                tools=[search_tool, download_tool, parse_tool, extract_tool, conclude_tool],
+                search_tool_names=["search_papers", "download_document", "parse_document", "extract_evidence"],
                 analysis_tool_names=["conclude"],
                 conclude_argument_name="submission",
                 conclude_output_kind="submission",
@@ -653,10 +661,11 @@ class DeadlineModeTests(unittest.TestCase):
                 agent,
                 "_build_tools",
                 return_value=(
-                    [search_tool, acquire_tool, extract_tool, conclude_tool],
+                    [search_tool, download_tool, parse_tool, extract_tool, conclude_tool],
                     {
                         "search_papers": search_tool,
-                        "acquire_document": acquire_tool,
+                        "download_document": download_tool,
+                        "parse_document": parse_tool,
                         "extract_evidence": extract_tool,
                         "conclude": conclude_tool,
                     },
@@ -667,7 +676,7 @@ class DeadlineModeTests(unittest.TestCase):
                     max_steps_override=2,
                 )
 
-        self.assertEqual(["acquire_document", "extract_evidence"], executed)
+        self.assertEqual(["download_document", "extract_evidence"], executed)
         self.assertEqual({"kind": "submission", "payload": {"submission_id": "submission_cycle_1"}}, response.structured_output)
         self.assertEqual("conclude", trajectory.steps[-1].action)
 
@@ -678,9 +687,16 @@ class DeadlineModeTests(unittest.TestCase):
         llm = _ReactiveLLM(backend)
         executed: list[str] = []
 
-        def _acquire(_payload):
-            executed.append("acquire_document")
+        def _download(_payload):
+            executed.append("download_document")
             return ToolResult(observation='{"paper_id":"paper-1"}', data={"paper_id": "paper-1"})
+
+        def _parse(_payload):
+            executed.append("parse_document")
+            return ToolResult(
+                observation='{"paper_id":"paper-1","fulltext_status":"fulltext_indexed"}',
+                data={"paper_id": "paper-1", "fulltext_status": "fulltext_indexed"},
+            )
 
         def _extract(_payload):
             executed.append("extract_evidence")
@@ -692,7 +708,8 @@ class DeadlineModeTests(unittest.TestCase):
                 data={"__conclude_valid__": True, "submission": {"submission_id": "submission_cycle_1"}},
             )
 
-        acquire_tool = _InvokeTool(_acquire)
+        download_tool = _InvokeTool(_download)
+        parse_tool = _InvokeTool(_parse)
         extract_tool = _InvokeTool(_extract)
         conclude_tool = _InvokeTool(_conclude)
 
@@ -709,8 +726,8 @@ class DeadlineModeTests(unittest.TestCase):
                 system_prompt="",
                 max_react_steps=10,
                 verbose=False,
-                tools=[acquire_tool, extract_tool, conclude_tool],
-                search_tool_names=["acquire_document", "extract_evidence"],
+                tools=[download_tool, parse_tool, extract_tool, conclude_tool],
+                search_tool_names=["download_document", "parse_document", "extract_evidence"],
                 analysis_tool_names=["conclude"],
                 conclude_argument_name="submission",
                 conclude_output_kind="submission",
@@ -720,9 +737,10 @@ class DeadlineModeTests(unittest.TestCase):
                 agent,
                 "_build_tools",
                 return_value=(
-                    [acquire_tool, extract_tool, conclude_tool],
+                    [download_tool, parse_tool, extract_tool, conclude_tool],
                     {
-                        "acquire_document": acquire_tool,
+                        "download_document": download_tool,
+                        "parse_document": parse_tool,
                         "extract_evidence": extract_tool,
                         "conclude": conclude_tool,
                     },
@@ -733,7 +751,7 @@ class DeadlineModeTests(unittest.TestCase):
                     max_steps_override=2,
                 )
 
-        self.assertEqual(["acquire_document", "extract_evidence"], executed)
+        self.assertEqual(["download_document", "parse_document", "extract_evidence"], executed)
         self.assertEqual({"kind": "submission", "payload": {"submission_id": "submission_cycle_1"}}, response.structured_output)
         self.assertEqual("conclude", trajectory.steps[-1].action)
         synthetic_message = next(
@@ -752,7 +770,7 @@ class DeadlineModeTests(unittest.TestCase):
         self.assertEqual(
             [
                 {
-                    "id": "deadline_extract_1",
+                    "id": "deadline_extract_2",
                     "name": "extract_evidence",
                     "args": {"paper_id": "paper-1", "preferred_sections": True},
                     "type": "tool_call",

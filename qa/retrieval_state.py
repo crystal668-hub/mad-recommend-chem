@@ -24,6 +24,7 @@ SectionType = Literal[
     "unknown",
 ]
 FulltextStatus = Literal["abstract_only", "fulltext_indexed", "binary_only", "fulltext_unusable", "missing", "error"]
+PaperProfileStatus = Literal["ready", "error"]
 EvidenceRole = Literal["observation", "condition", "limitation", "mechanism"]
 SourceLayer = Literal["abstract", "fulltext"]
 ClaimPolarity = Literal["support", "oppose", "neutral"]
@@ -88,6 +89,12 @@ class PaperCandidate(StrictModel):
     ranking_features: Dict[str, Any] = Field(default_factory=dict)
     provider_artifacts: Dict[str, str] = Field(default_factory=dict)
     oa_url: Optional[str] = None
+    openalex_id: Optional[str] = None
+    best_oa_pdf_url: Optional[str] = None
+    best_oa_landing_page_url: Optional[str] = None
+    oa_eligible: bool = False
+    oa_source: Optional[str] = None
+    oa_signal_reason: Optional[str] = None
 
     @field_validator("authors", "provider_hits", "lane_sources", mode="before")
     @classmethod
@@ -126,6 +133,46 @@ class PaperRecord(StrictModel):
     @field_validator("authors", "provider_sources", "extraction_warnings", mode="before")
     @classmethod
     def coerce_list(cls, value):
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        return [value]
+
+
+class PaperProfile(StrictModel):
+    paper_id: str
+    title: str
+    doi: Optional[str] = None
+    year: Optional[int] = Field(default=None, ge=1900, le=2100)
+    venue: Optional[str] = None
+    oa_source_url: Optional[str] = None
+    source_artifact_path: Optional[str] = None
+    parser_name: Optional[str] = None
+    profile_status: PaperProfileStatus = "ready"
+    abstract_or_summary: Optional[str] = None
+    section_headings: List[str] = Field(default_factory=list)
+    problem_or_task: Optional[str] = None
+    materials_or_entities: List[str] = Field(default_factory=list)
+    methods_or_experimental_setup: Optional[str] = None
+    reported_metrics: List[str] = Field(default_factory=list)
+    evidence_rich_sections: List[str] = Field(default_factory=list)
+    citation_readiness_summary: str
+    limitations: List[str] = Field(default_factory=list)
+    parser_artifact_path: Optional[str] = None
+    raw_artifact_path: Optional[str] = None
+    error_message: Optional[str] = None
+
+    @field_validator(
+        "section_headings",
+        "materials_or_entities",
+        "reported_metrics",
+        "evidence_rich_sections",
+        "limitations",
+        mode="before",
+    )
+    @classmethod
+    def coerce_text_list(cls, value):
         if value is None:
             return []
         if isinstance(value, list):

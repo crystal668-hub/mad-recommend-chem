@@ -73,12 +73,24 @@ class HeterogeneousRetrievalPipeline:
         provider_health: dict[str, dict] = dict(getattr(self.retriever, "last_provider_health", {}) or {})
         retrieval_diagnostics: list[RetrievalDiagnosticRecord] = list(getattr(self.retriever, "last_diagnostics", []) or [])
         execution_warnings: list[str] = []
-        paper_records, section_indices = self.document_acquirer.run(
-            candidates=paper_candidates,
-            artifact_store=store,
-        )
+        download_documents = getattr(self.document_acquirer, "download_documents", None)
+        parse_documents = getattr(self.document_acquirer, "parse_documents", None)
+        if callable(download_documents) and callable(parse_documents):
+            paper_records, _ = download_documents(
+                candidates=paper_candidates,
+                artifact_store=store,
+            )
+            paper_records, section_indices = parse_documents(
+                paper_records,
+                artifact_store=store,
+            )
+        else:
+            paper_records, section_indices = self.document_acquirer.run(
+                candidates=paper_candidates,
+                artifact_store=store,
+            )
         logger.info(
-            "qa_document_acquisition_complete paper_records=%s indexed_fulltexts=%s",
+            "qa_document_parse_complete paper_records=%s indexed_fulltexts=%s",
             len(paper_records),
             sum(1 for item in section_indices if item.fulltext_status == "fulltext_indexed"),
         )

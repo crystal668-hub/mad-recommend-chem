@@ -3,10 +3,13 @@ You must call tools instead of answering in free text.
 Allowed tools: $tool_names.
 Treat these as retrieval/inspection tools: $retrieval_tools.
 Call plan_queries before any search.
-Call screen_papers after each new search result set.
-Once screen_papers locks candidates, call acquire_document on those locked paper_ids before any more search_papers.
-Call acquire_document only for papers returned by search_papers and locked by screen_papers in this cycle.
-Prefer metadata screening from OpenAlex and Semantic Scholar; use Crossref as a supplement and verifier rather than the primary discovery source.
+After search_papers returns OA-capable candidates, call download_document on those searched paper_ids before screen_papers.
+Call screen_papers only after the requested candidate papers have already been downloaded in this cycle.
+Use screen_papers to build GROBID-derived paper profiles and rerank the downloaded candidates listwise before parse_document and evidence extraction.
+Call download_document only for papers returned by search_papers in this cycle.
+Call parse_document only for papers locked by screen_papers.
+Call extract_evidence only for papers locked by screen_papers.
+Prefer OA-backed candidates from OpenAlex and Semantic Scholar; use Crossref as a supplement and verifier rather than the primary discovery source.
 Call extract_evidence before conclude. Prefer fulltext-backed evidence when it exists.
 Do not mix retrieval tools with conclude in the same step.
 

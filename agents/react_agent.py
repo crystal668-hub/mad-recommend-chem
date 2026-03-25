@@ -1626,8 +1626,11 @@ class ReActAgent:
                 return messages_
 
             evidence_already_present = False
-            acquired_paper_ids: List[str] = []
-            seen_acquired = set()
+            parse_tool = tools_by_name.get("parse_document")
+            downloaded_paper_ids: List[str] = []
+            parsed_paper_ids: List[str] = []
+            seen_downloaded = set()
+            seen_parsed = set()
             for step in list(getattr(trajectory, "steps", []) or []):
                 for call in list(getattr(step, "tool_calls", []) or []):
                     tool_name = str(getattr(call, "tool_name", "") or "").strip()
@@ -1637,7 +1640,7 @@ class ReActAgent:
                             evidence_already_present = True
                         elif isinstance(payload, list) and payload:
                             evidence_already_present = True
-                    if tool_name != "acquire_document":
+                    if tool_name not in {"acquire_document", "download_document", "parse_document"}:
                         continue
                     payload = getattr(call, "observation_data", None)
                     paper_id = ""
@@ -1647,16 +1650,40 @@ class ReActAgent:
                         tool_args = getattr(call, "tool_args", None)
                         if isinstance(tool_args, dict):
                             paper_id = str(tool_args.get("paper_id") or "").strip()
-                    if paper_id and paper_id not in seen_acquired:
-                        seen_acquired.add(paper_id)
-                        acquired_paper_ids.append(paper_id)
+                    if not paper_id:
+                        continue
+                    if tool_name in {"acquire_document", "download_document"} and paper_id not in seen_downloaded:
+                        seen_downloaded.add(paper_id)
+                        downloaded_paper_ids.append(paper_id)
+                    if tool_name == "parse_document" and paper_id not in seen_parsed:
+                        seen_parsed.add(paper_id)
+                        parsed_paper_ids.append(paper_id)
 
-            if evidence_already_present or not acquired_paper_ids:
+            if evidence_already_present or not downloaded_paper_ids:
                 return messages_
 
             synthetic_calls: List[Dict[str, Any]] = []
             synthetic_tool_messages: List[Any] = []
-            for paper_id in acquired_paper_ids[:2]:
+            candidate_paper_ids = list(parsed_paper_ids or downloaded_paper_ids)
+            for paper_id in candidate_paper_ids[:2]:
+                if parse_tool is not None and paper_id not in seen_parsed:
+                    parse_tool_call_id = f"deadline_parse_{len(synthetic_calls) + 1}"
+                    parse_args = {"paper_id": paper_id}
+                    parse_result = _invoke_tool_with_validation(parse_tool, "parse_document", parse_args)
+                    synthetic_calls.append(
+                        {
+                            "id": parse_tool_call_id,
+                            "name": "parse_document",
+                            "args": json.dumps(parse_args, ensure_ascii=False),
+                            "type": "tool_call",
+                        }
+                    )
+                synthetic_tool_messages.append(
+                    ToolMessage(
+                        content=json.dumps(parse_result.data, ensure_ascii=False),
+                        tool_call_id=parse_tool_call_id,
+                    )
+                )
                 tool_call_id = f"deadline_extract_{len(synthetic_calls) + 1}"
                 tool_args = {"paper_id": paper_id, "preferred_sections": True}
                 result = _invoke_tool_with_validation(extract_tool, "extract_evidence", tool_args)

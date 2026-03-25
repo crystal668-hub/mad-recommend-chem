@@ -8,6 +8,7 @@ import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import patch
 
 from agents.react_agent import AgentResponse
@@ -36,8 +37,8 @@ from qa.react_reviewed_workflow import (
     ReviewerSession,
     _ProposerRunState,
 )
-from qa.retrieval_state import EvidenceItem, PaperCandidate, PaperRecord, QueryPlan, Section, SectionIndex
-from qa.runtime import resolve_qa_runtime_config
+from qa.retrieval_state import EvidenceItem, PaperCandidate, PaperProfile, PaperRecord, QueryPlan, Section, SectionIndex
+from qa.runtime import build_qa_runtime, resolve_qa_runtime_config
 from qa.state import AnswerSection, EntityPack, SourceSpan, TaskSpec
 from qa.synthesis_state import QAResult
 
@@ -287,29 +288,20 @@ class _FailingQueryPlanner:
 
 
 class _CountingRetriever:
-    def __init__(self, *, delay: float = 0.0) -> None:
+    def __init__(self, *, delay: float = 0.0, candidates: Optional[list[PaperCandidate]] = None) -> None:
         self.delay = delay
         self.calls = 0
         self.lock = threading.Lock()
         self.last_diagnostics = []
         self.last_provider_health = {}
+        self.candidates = list(candidates) if candidates is not None else [_paper_candidate("paper-1", score=0.9)]
 
     def run(self, *, task_spec: TaskSpec, entity_pack: EntityPack, query_plans, artifact_store=None):
         with self.lock:
             self.calls += 1
         if self.delay:
             time.sleep(self.delay)
-        return [
-            PaperCandidate(
-                paper_id="paper-1",
-                title="Pt/C HER in alkaline media",
-                abstract="Pt/C improves HER activity in alkaline media.",
-                year=2024,
-                provider_hits=["openalex"],
-                lane_sources=["contrarian"],
-                retrieval_score=0.9,
-            )
-        ]
+        return list(self.candidates)
 
 
 class _CountingDocumentAcquirer:
@@ -320,14 +312,45 @@ class _CountingDocumentAcquirer:
         self.last_diagnostics = []
         self.last_provider_health = {}
         self.last_execution_warnings = []
+        self.pdf_extractor = _FakePDFExtractor()
 
-    def run(self, *, candidates, artifact_store=None):
+    def run(self, *, candidates, artifact_store=None, parse_fulltext: bool = True):
         with self.lock:
             self.calls += 1
         if self.delay:
             time.sleep(self.delay)
         candidate = candidates[0]
         store = artifact_store or QAArtifactStore()
+        source_pdf_path = store.write_bytes(f"fulltext/{candidate.paper_id}.pdf", b"%PDF-1.4 fake pdf")
+        if not parse_fulltext:
+            return (
+                [
+                    PaperRecord(
+                        paper_id=candidate.paper_id,
+                        doi=candidate.doi,
+                        title=candidate.title,
+                        abstract=candidate.abstract,
+                        authors=list(candidate.authors),
+                        year=candidate.year,
+                        venue=candidate.venue,
+                        provider_sources=list(candidate.provider_hits),
+                        provider_artifacts=dict(candidate.provider_artifacts),
+                        oa_url=candidate.oa_url,
+                        fulltext_available=True,
+                        fulltext_status="binary_only",
+                        fulltext_format="application/pdf",
+                        fulltext_artifact_path=source_pdf_path,
+                        source_artifact_path=source_pdf_path,
+                    )
+                ],
+                [
+                    SectionIndex(
+                        paper_id=candidate.paper_id,
+                        fulltext_status="binary_only",
+                        sections=[],
+                    )
+                ],
+            )
         fulltext = "Pt/C improves HER activity in alkaline media."
         fulltext_path = store.write_text(f"fulltext/{candidate.paper_id}.txt", fulltext)
         return (
@@ -346,6 +369,7 @@ class _CountingDocumentAcquirer:
                     fulltext_available=True,
                     fulltext_status="fulltext_indexed",
                     fulltext_artifact_path=fulltext_path,
+                    source_artifact_path=source_pdf_path,
                 )
             ],
             [
@@ -364,6 +388,91 @@ class _CountingDocumentAcquirer:
                 )
             ],
         )
+
+
+class _FakePaperProfileBuilder:
+    def __init__(self, *, failures: Optional[set[str]] = None) -> None:
+        self.failures = set(failures or set())
+        self.calls: list[str] = []
+
+    def build(self, *, paper_record: PaperRecord, artifact_store=None):
+        self.calls.append(paper_record.paper_id)
+        if paper_record.paper_id in self.failures:
+            raise RuntimeError(f"profile extraction failed for {paper_record.paper_id}")
+        return PaperProfile.model_validate(
+            {
+                "paper_id": paper_record.paper_id,
+                "title": paper_record.title,
+                "doi": paper_record.doi,
+                "year": paper_record.year,
+                "venue": paper_record.venue,
+                "oa_source_url": paper_record.oa_url,
+                "source_artifact_path": paper_record.source_artifact_path,
+                "parser_name": "fake_grobid",
+                "profile_status": "ready",
+                "abstract_or_summary": paper_record.abstract or "profile summary",
+                "section_headings": ["Abstract", "Results"],
+                "problem_or_task": "Assess alkaline HER evidence for Pt/C.",
+                "materials_or_entities": ["Pt/C", "HER", "KOH"],
+                "methods_or_experimental_setup": "Electrochemical benchmark testing in alkaline media.",
+                "reported_metrics": ["overpotential", "current density"],
+                "evidence_rich_sections": ["Results"],
+                "citation_readiness_summary": "Profile indicates evidence-rich results content.",
+                "limitations": [],
+                "parser_artifact_path": "proposer_profiles/fake.profile.json",
+                "raw_artifact_path": "proposer_profiles/fake.grobid_raw.json",
+            }
+        )
+
+
+class _FakePDFExtractor:
+    def process(self, *, paper_id: str, pdf_bytes: bytes, artifact_store=None):
+        store = artifact_store or QAArtifactStore()
+        source_pdf_path = store.write_bytes(f"fulltext/{paper_id}.pdf", pdf_bytes)
+        fulltext = "Pt/C improves HER activity in alkaline media."
+        fulltext_path = store.write_text(f"fulltext/{paper_id}.txt", fulltext)
+        report_path = store.write_json(
+            f"fulltext/{paper_id}.extraction_report.json",
+            {"paper_id": paper_id, "status": "fulltext_indexed", "selected_extractor": "fake_pdf"},
+        )
+        return SimpleNamespace(
+            fulltext_status="fulltext_indexed",
+            source_artifact_path=source_pdf_path,
+            fulltext_artifact_path=fulltext_path,
+            sections_artifact_path=None,
+            snippets_artifact_path=None,
+            extraction_report_path=report_path,
+            sections=[
+                {
+                    "section_id": "sec_results",
+                    "section_type": "results",
+                    "heading": "Results",
+                    "page_start": None,
+                    "page_end": None,
+                    "fulltext_char_start": 0,
+                    "fulltext_char_end": len(fulltext),
+                }
+            ],
+            warnings=[],
+            extractor="fake_pdf",
+            ocr_applied=False,
+        )
+
+
+def _paper_candidate(paper_id: str, *, score: float = 0.9) -> PaperCandidate:
+    return PaperCandidate(
+        paper_id=paper_id,
+        title=f"{paper_id} Pt/C HER in alkaline media",
+        abstract="Pt/C improves HER activity in alkaline media.",
+        year=2024,
+        provider_hits=["openalex"],
+        lane_sources=["contrarian"],
+        retrieval_score=score,
+        oa_url=f"https://example.org/{paper_id}.pdf",
+        best_oa_pdf_url=f"https://example.org/{paper_id}.pdf",
+        oa_eligible=True,
+        oa_source="openalex",
+    )
 
 
 class _CountingEvidenceExtractor:
@@ -495,6 +604,9 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
         self.assertEqual("fail_fast_only", resolved["react_reviewed"]["proposer_fallback_mode"])
         self.assertEqual(1, resolved["react_reviewed"]["proposer_repair_attempts"])
         self.assertEqual("prefer_fulltext", resolved["react_reviewed"]["proposer_evidence_policy"])
+        self.assertEqual(18, resolved["react_reviewed"]["proposer_candidate_target"])
+        self.assertEqual(5, resolved["react_reviewed"]["proposer_rerank_top_k"])
+        self.assertEqual("http://localhost:8070", resolved["react_reviewed"]["grobid_url"])
         self.assertEqual(3, resolved["react_reviewed"]["max_review_cycles"])
         self.assertEqual(4, resolved["react_reviewed"]["reviewer_max_concurrency"])
         self.assertEqual(
@@ -507,6 +619,56 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
             resolved["react_reviewed"]["reviewer_retrieval_budget_by_role"],
         )
         self.assertTrue(resolved["react_reviewed"]["review_failure_blocks_acceptance"])
+
+    def test_resolve_runtime_config_accepts_optional_proposer_screening_overrides(self):
+        resolved = resolve_qa_runtime_config(
+            {
+                "qa": {
+                    "react_reviewed": {
+                        "proposer_candidate_target": "12",
+                        "proposer_rerank_top_k": "20",
+                        "grobid_url": "http://grobid.internal:8070",
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(12, resolved["react_reviewed"]["proposer_candidate_target"])
+        self.assertEqual(12, resolved["react_reviewed"]["proposer_rerank_top_k"])
+        self.assertEqual("http://grobid.internal:8070", resolved["react_reviewed"]["grobid_url"])
+
+    @patch("qa.runtime.build_chat_model_from_config")
+    def test_build_runtime_wires_proposer_screening_config_into_workflow(self, mock_build_model):
+        mock_build_model.return_value = object()
+
+        runtime = build_qa_runtime(
+            config={
+                "llm": {
+                    "agent1": {
+                        "provider": "openai",
+                        "model": "openai/gpt-5.2",
+                        "api_key": "test-key",
+                    }
+                },
+                "qa": {
+                    "workflow_mode": "react_reviewed",
+                    "react_reviewed": {
+                        "proposer_candidate_target": 9,
+                        "proposer_rerank_top_k": 4,
+                        "grobid_url": "http://grobid.internal:8070",
+                    },
+                },
+            }
+        )
+
+        workflow = runtime.react_reviewed_workflow
+        self.assertIsNotNone(workflow)
+        assert workflow is not None
+        self.assertEqual(9, workflow.proposer_candidate_target)
+        self.assertEqual(4, workflow.proposer_rerank_top_k)
+        self.assertEqual(9, workflow.proposer.proposer_candidate_target)
+        self.assertEqual(4, workflow.proposer.proposer_rerank_top_k)
+        self.assertEqual("http://grobid.internal:8070", workflow.paper_profile_builder.grobid_url)
 
     def test_qa_result_accepts_submission_trace_fields(self):
         result = QAResult.model_validate(
@@ -673,8 +835,11 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         retriever: _CountingRetriever | None = None,
         document_acquirer: _CountingDocumentAcquirer | None = None,
         evidence_extractor: _CountingEvidenceExtractor | None = None,
+        paper_profile_builder: _FakePaperProfileBuilder | None = None,
         entity_resolution_snapshot: dict | None = None,
         stage_watchdog_seconds: float = 120.0,
+        proposer_candidate_target: int = 18,
+        proposer_rerank_top_k: int = 5,
     ) -> ReactReviewedWorkspace:
         artifact_store = QAArtifactStore(base_dir=self.temp_dir / "workspace")
         return ReactReviewedWorkspace(
@@ -689,7 +854,10 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             document_acquirer=document_acquirer or _CountingDocumentAcquirer(),
             handoff=EvidenceExtractorHandoff(),
             evidence_extractor=evidence_extractor or _CountingEvidenceExtractor(),
+            paper_profile_builder=paper_profile_builder or _FakePaperProfileBuilder(),
             stage_watchdog_seconds=stage_watchdog_seconds,
+            proposer_candidate_target=proposer_candidate_target,
+            proposer_rerank_top_k=proposer_rerank_top_k,
         )
 
     def _make_session(self, role: str, budget_limit: int) -> ReviewerSession:
@@ -715,6 +883,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             document_acquirer=_CountingDocumentAcquirer(),
             handoff=EvidenceExtractorHandoff(),
             evidence_extractor=_CountingEvidenceExtractor(),
+            paper_profile_builder=_FakePaperProfileBuilder(),
         )
         workflow.proposer = _FakeProposer()
         return workflow
@@ -938,6 +1107,21 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 retrieval_score=7.9,
             ),
         }
+        workspace.paper_records = {
+            paper_id: PaperRecord(
+                paper_id=paper_id,
+                title=candidate.title,
+                abstract=candidate.abstract,
+                doi=candidate.doi,
+                year=candidate.year,
+                venue=candidate.venue,
+                oa_url=candidate.oa_url,
+                fulltext_available=True,
+                fulltext_status="fulltext_indexed",
+                source_artifact_path=str(self.temp_dir / f"{paper_id}.pdf"),
+            )
+            for paper_id, candidate in workspace.paper_candidates.items()
+        }
 
         with patch.object(
             proposer,
@@ -1024,6 +1208,21 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 oa_url="https://example.org/comparator",
             ),
         }
+        workspace.paper_records = {
+            paper_id: PaperRecord(
+                paper_id=paper_id,
+                title=candidate.title,
+                abstract=candidate.abstract,
+                doi=candidate.doi,
+                year=candidate.year,
+                venue=candidate.venue,
+                oa_url=candidate.oa_url,
+                fulltext_available=True,
+                fulltext_status="fulltext_indexed",
+                source_artifact_path=str(self.temp_dir / f"{paper_id}.pdf"),
+            )
+            for paper_id, candidate in workspace.paper_candidates.items()
+        }
 
         with patch.object(
             proposer,
@@ -1073,6 +1272,17 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 oa_url="https://example.org/fulltext",
             )
         }
+        workspace.paper_records = {
+            "paper-1": PaperRecord(
+                paper_id="paper-1",
+                title="Pt/C improves HER activity in 1 M KOH",
+                abstract="Pt/C improves HER activity in alkaline electrolyte.",
+                fulltext_available=True,
+                fulltext_status="fulltext_indexed",
+                oa_url="https://example.org/fulltext",
+                source_artifact_path=str(self.temp_dir / "paper-1.pdf"),
+            )
+        }
 
         with self.assertRaises(ReactReviewedProposerExecutionError) as ctx:
             proposer._screen_candidate_papers(
@@ -1112,6 +1322,17 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 doi="10.1000/full",
             )
         }
+        workspace.paper_records = {
+            "paper-1": PaperRecord(
+                paper_id="paper-1",
+                title="Pt/C improves HER activity in 1 M KOH",
+                abstract="Pt/C improves HER activity in alkaline electrolyte.",
+                doi="10.1000/full",
+                fulltext_available=True,
+                fulltext_status="fulltext_indexed",
+                source_artifact_path=str(self.temp_dir / "paper-1.pdf"),
+            )
+        }
         raw_response = json.dumps({"unexpected": "schema"})
 
         with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
@@ -1132,6 +1353,111 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         failure_payload = _read_json(str(failure_path))
         self.assertEqual("invalid_screening_payload", failure_payload["details"]["reason"])
         self.assertEqual(raw_response, failure_payload["response_content"])
+
+    def test_screen_candidate_papers_drops_profile_generation_failures(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace(paper_profile_builder=_FakePaperProfileBuilder(failures={"paper-bad"}))
+        workspace.paper_candidates = {
+            "paper-good": PaperCandidate(
+                paper_id="paper-good",
+                title="Pt/C improves HER activity in 1 M KOH",
+                abstract="Pt/C improves HER activity in alkaline electrolyte.",
+                provider_hits=["openalex"],
+                lane_sources=["data"],
+                retrieval_score=8.5,
+                oa_url="https://example.org/good.pdf",
+            ),
+            "paper-bad": PaperCandidate(
+                paper_id="paper-bad",
+                title="Generic catalyst summary",
+                abstract="Generic catalyst summary.",
+                provider_hits=["openalex"],
+                lane_sources=["data"],
+                retrieval_score=7.2,
+                oa_url="https://example.org/bad.pdf",
+            ),
+        }
+        workspace.paper_records = {
+            paper_id: PaperRecord(
+                paper_id=paper_id,
+                title=candidate.title,
+                abstract=candidate.abstract,
+                oa_url=candidate.oa_url,
+                fulltext_available=True,
+                fulltext_status="fulltext_indexed",
+                source_artifact_path=str(self.temp_dir / f"{paper_id}.pdf"),
+            )
+            for paper_id, candidate in workspace.paper_candidates.items()
+        }
+
+        with patch.object(
+            proposer,
+            "_llm_screen_candidate_papers",
+            return_value={
+                "locked_paper_ids": ["paper-good"],
+                "dropped_paper_ids": [],
+                "ranked_candidates": [
+                    {"paper_id": "paper-good", "decision": "lock", "reason": "best profile alignment"},
+                ],
+                "llm_screening_used": True,
+            },
+        ):
+            screened = proposer._screen_candidate_papers(
+                workspace=workspace,
+                cycle_number=1,
+                open_review_items=[],
+                paper_ids=["paper-good", "paper-bad"],
+                max_candidates=1,
+            )
+
+        self.assertEqual(["paper-good"], screened["locked_paper_ids"])
+        self.assertIn("paper-bad", screened["dropped_paper_ids"])
+        self.assertTrue(any(item["paper_id"] == "paper-bad" for item in screened["ranked_candidates"]))
+
+    def test_workspace_search_papers_filters_non_oa_candidates(self):
+        class _MixedRetriever:
+            def __init__(self) -> None:
+                self.last_diagnostics = []
+                self.last_provider_health = {}
+
+            def run(self, *, task_spec: TaskSpec, entity_pack: EntityPack, query_plans, artifact_store=None):
+                return [
+                    PaperCandidate(
+                        paper_id="paper-oa",
+                        title="Pt/C alkaline HER benchmark",
+                        abstract="OA candidate",
+                        provider_hits=["openalex"],
+                        lane_sources=["data"],
+                        retrieval_score=0.9,
+                        oa_url="https://example.org/paper-oa.pdf",
+                        best_oa_pdf_url="https://example.org/paper-oa.pdf",
+                        oa_eligible=True,
+                    ),
+                    PaperCandidate(
+                        paper_id="paper-no-oa",
+                        title="Non-OA benchmark",
+                        abstract="non OA candidate",
+                        provider_hits=["crossref"],
+                        lane_sources=["data"],
+                        retrieval_score=0.8,
+                    ),
+                ]
+
+        workspace = self._make_workspace(retriever=_MixedRetriever())
+
+        result = workspace.search_papers(
+            query_text="Pt/C HER alkaline",
+            lane="data",
+            reason="oa filter",
+            write_snapshot=False,
+        )
+
+        self.assertEqual(["paper-oa"], [item["paper_id"] for item in result])
 
     def test_normalize_submission_citations_does_not_backfill_irrelevant_abstract(self):
         proposer = ReactReviewedProposerAgent(
@@ -2752,6 +3078,82 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(first[0]["query_plan_id"], second[0]["query_plan_id"])
         self.assertEqual(1, len(workspace.query_plans))
 
+    def test_search_papers_respects_configured_candidate_target(self):
+        workspace = self._make_workspace(
+            retriever=_CountingRetriever(
+                candidates=[_paper_candidate(f"paper-{index}", score=1.0 - (index * 0.01)) for index in range(6)]
+            ),
+            stage_watchdog_seconds=120.0,
+            proposer_candidate_target=3,
+        )
+
+        payload = workspace.search_papers(
+            query_text="Pt/C HER alkaline",
+            lane="review",
+            reason="candidate target test",
+            write_snapshot=False,
+        )
+
+        self.assertEqual(3, len(payload))
+        self.assertEqual(["paper-0", "paper-1", "paper-2"], [item["paper_id"] for item in payload])
+        self.assertEqual(6, len(workspace.paper_candidates))
+
+    def test_proposer_uses_configured_screen_top_k_in_tool_schema_default(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+            proposer_candidate_target=8,
+            proposer_rerank_top_k=3,
+        )
+        workspace = self._make_workspace()
+        captured_tools = {}
+
+        class _StubStructuredTool:
+            @staticmethod
+            def from_function(func, name=None, args_schema=None):
+                tool_name = name or getattr(func, "__name__", "tool")
+                captured_tools[tool_name] = args_schema
+
+                class _Tool:
+                    def __init__(self, func, name, args_schema):
+                        self.func = func
+                        self.name = name or getattr(func, "__name__", "tool")
+                        self.args_schema = args_schema
+
+                    def invoke(self, payload):
+                        if isinstance(payload, dict):
+                            return self.func(**payload)
+                        return self.func(payload)
+
+                return _Tool(func, name, args_schema)
+
+        class _RaisingReActAgent:
+            def __init__(self, *args, **kwargs):
+                self.current_trajectory = _trajectory("schema capture")
+
+            def generate_response_with_react(self, *args, **kwargs):
+                raise RuntimeError("stop after tool registration")
+
+        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed_workflow.ReActAgent",
+            _RaisingReActAgent,
+        ):
+            with self.assertRaises(ReactReviewedProposerExecutionError):
+                proposer.run(
+                    workspace=workspace,
+                    cycle_number=1,
+                    open_review_items=[],
+                )
+
+        screen_schema = captured_tools["screen_papers"]
+        self.assertEqual(3, screen_schema.model_fields["max_candidates"].default)
+        validated = screen_schema.model_validate({"paper_ids": ["paper-1"], "max_candidates": 8})
+        self.assertEqual(8, validated.max_candidates)
+        with self.assertRaises(ValidationError):
+            screen_schema.model_validate({"paper_ids": ["paper-1"], "max_candidates": 9})
+
     def test_plan_queries_reuses_existing_lane_plans_across_repeated_calls(self):
         class _FixedPlanner:
             def run(self, *, task_spec: TaskSpec, entity_pack: EntityPack):
@@ -3297,7 +3699,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(1, retriever.calls)
         self.assertEqual([0, 1], sorted(session.budget_state.actions_used for session in sessions))
 
-    def test_acquire_document_cache_dedupes(self):
+    def test_download_document_cache_dedupes(self):
         document_acquirer = _CountingDocumentAcquirer(delay=0.2)
         workspace = self._make_workspace(document_acquirer=document_acquirer)
         workspace.paper_candidates["paper-1"] = PaperCandidate(
@@ -3315,12 +3717,12 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         def _worker(session: ReviewerSession) -> None:
             try:
                 barrier.wait(timeout=3)
-                workspace.acquire_document(
+                workspace.download_document(
                     paper_id="paper-1",
                     artifact_store=session.artifact_store,
                     session=session,
                     charge_budget=True,
-                    requested_via="acquire_document",
+                    requested_via="download_document",
                     write_snapshot=False,
                 )
             except BaseException as exc:  # pragma: no cover - test plumbing
@@ -3379,7 +3781,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(1, evidence_extractor.calls)
         self.assertEqual([0, 1], sorted(session.budget_state.actions_used for session in sessions))
 
-    def test_workspace_stage_watchdog_records_timeout_for_acquire_document(self):
+    def test_workspace_stage_watchdog_records_timeout_for_download_document(self):
         document_acquirer = _CountingDocumentAcquirer(delay=0.2)
         workspace = self._make_workspace(document_acquirer=document_acquirer, stage_watchdog_seconds=0.05)
         workspace.paper_candidates["paper-1"] = PaperCandidate(
@@ -3393,7 +3795,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
 
         started_at = time.perf_counter()
         with self.assertRaises(TimeoutError):
-            workspace.acquire_document(
+            workspace.download_document(
                 paper_id="paper-1",
                 artifact_store=workspace.store,
                 write_snapshot=False,
@@ -3401,9 +3803,74 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         elapsed = time.perf_counter() - started_at
 
         stage_status = _read_json(str(self.temp_dir / "workspace" / "diagnostics" / "runtime_stage_status.json"))
-        self.assertEqual("acquire_document", stage_status["stage"])
+        self.assertEqual("download_document", stage_status["stage"])
         self.assertEqual("timeout", stage_status["status"])
         self.assertLess(elapsed, 0.15)
+
+    def test_download_document_downloads_pdf_without_immediate_pdf_indexing(self):
+        workspace = self._make_workspace(document_acquirer=_CountingDocumentAcquirer())
+        workspace.paper_candidates["paper-1"] = _paper_candidate("paper-1")
+
+        payload = workspace.download_document(
+            paper_id="paper-1",
+            artifact_store=workspace.store,
+            write_snapshot=False,
+        )
+
+        self.assertEqual("binary_only", payload["fulltext_status"])
+        self.assertEqual(0, payload["section_count"])
+        self.assertTrue(str(payload["artifact_path"]).endswith(".pdf"))
+
+    def test_screen_candidate_papers_locks_top_k_but_defers_parsing(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace(document_acquirer=_CountingDocumentAcquirer())
+        workspace.paper_candidates = {
+            "paper-good": _paper_candidate("paper-good", score=0.95),
+            "paper-drop": _paper_candidate("paper-drop", score=0.75),
+        }
+        workspace.download_document(paper_id="paper-good", write_snapshot=False)
+        workspace.download_document(paper_id="paper-drop", write_snapshot=False)
+
+        with patch.object(
+            proposer,
+            "_llm_screen_candidate_papers",
+            return_value=(
+                {
+                    "locked_paper_ids": ["paper-good"],
+                    "dropped_paper_ids": ["paper-drop"],
+                    "ranked_candidates": [
+                        {"paper_id": "paper-good", "decision": "lock", "reason": "best profile alignment"},
+                        {"paper_id": "paper-drop", "decision": "drop", "reason": "weak profile alignment"},
+                    ],
+                    "paper_profiles": [],
+                    "llm_screening_used": True,
+                },
+                {"raw": "ok"},
+            ),
+        ):
+            payload = proposer._screen_candidate_papers(
+                workspace=workspace,
+                cycle_number=1,
+                open_review_items=[],
+                paper_ids=["paper-good", "paper-drop"],
+                max_candidates=1,
+            )
+
+        self.assertEqual(["paper-good"], payload["locked_paper_ids"])
+        self.assertNotIn("indexed_papers", payload)
+        self.assertEqual("binary_only", workspace.paper_records["paper-good"].fulltext_status)
+        self.assertEqual("binary_only", workspace.paper_records["paper-drop"].fulltext_status)
+
+        parsed = workspace.parse_document(paper_id="paper-good", write_snapshot=False)
+
+        self.assertEqual("paper-good", parsed["paper_id"])
+        self.assertEqual("fulltext_indexed", workspace.paper_records["paper-good"].fulltext_status)
+        self.assertEqual("binary_only", workspace.paper_records["paper-drop"].fulltext_status)
 
     def test_budget_block_prevents_state_mutation(self):
         retriever = _CountingRetriever()
@@ -3439,12 +3906,12 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             write_snapshot=False,
         )
         with self.assertRaises(ReviewerBudgetBlocked):
-            search_workspace.acquire_document(
+            search_workspace.download_document(
                 paper_id="paper-1",
                 artifact_store=search_session.artifact_store,
                 session=search_session,
                 charge_budget=True,
-                requested_via="acquire_document",
+                requested_via="download_document",
                 write_snapshot=False,
             )
         self.assertEqual(1, search_session.budget_state.actions_used)

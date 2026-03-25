@@ -72,6 +72,7 @@ class DocumentAcquirerNode:
         self,
         candidates: Sequence[PaperCandidate],
         artifact_store: Optional[QAArtifactStore] = None,
+        parse_fulltext: bool = True,
     ) -> Tuple[List[PaperRecord], List[SectionIndex]]:
         store = artifact_store or QAArtifactStore()
         paper_records: List[PaperRecord] = []
@@ -97,7 +98,11 @@ class DocumentAcquirerNode:
                 )
 
         for candidate in candidates:
-            paper_record, section_index = self._acquire_one(candidate=candidate, store=store)
+            paper_record, section_index = self._acquire_one(
+                candidate=candidate,
+                store=store,
+                parse_fulltext=parse_fulltext,
+            )
             paper_records.append(paper_record)
             section_indices.append(section_index)
 
@@ -105,9 +110,127 @@ class DocumentAcquirerNode:
         self.last_provider_health = self._collect_provider_health()
         return paper_records, section_indices
 
+    def download_documents(
+        self,
+        candidates: Sequence[PaperCandidate],
+        artifact_store: Optional[QAArtifactStore] = None,
+    ) -> Tuple[List[PaperRecord], List[SectionIndex]]:
+        return self.run(
+            candidates=candidates,
+            artifact_store=artifact_store,
+            parse_fulltext=False,
+        )
+
+    def parse_documents(
+        self,
+        paper_records: Sequence[PaperRecord],
+        artifact_store: Optional[QAArtifactStore] = None,
+    ) -> Tuple[List[PaperRecord], List[SectionIndex]]:
+        store = artifact_store or QAArtifactStore()
+        parsed_records: List[PaperRecord] = []
+        section_indices: List[SectionIndex] = []
+        for paper_record in paper_records:
+            parsed_record, section_index = self._parse_one(
+                paper_record=paper_record,
+                store=store,
+            )
+            parsed_records.append(parsed_record)
+            section_indices.append(section_index)
+        return parsed_records, section_indices
+
     __call__ = run
 
-    def _acquire_one(self, candidate: PaperCandidate, store: QAArtifactStore) -> Tuple[PaperRecord, SectionIndex]:
+    def _parse_one(
+        self,
+        *,
+        paper_record: PaperRecord,
+        store: QAArtifactStore,
+    ) -> Tuple[PaperRecord, SectionIndex]:
+        source_artifact_path = str(paper_record.source_artifact_path or "").strip()
+        fulltext_artifact_path = str(paper_record.fulltext_artifact_path or "").strip()
+        fulltext_status = str(paper_record.fulltext_status or "missing").strip() or "missing"
+
+        if fulltext_status == "fulltext_indexed" and fulltext_artifact_path:
+            section_index = self._build_section_index(
+                paper_id=paper_record.paper_id,
+                fulltext_status=fulltext_status,
+                fulltext_artifact_path=fulltext_artifact_path,
+            )
+            index_artifact_path = store.write_json(
+                f"indices/{paper_record.paper_id}.json",
+                section_index.model_dump(exclude_none=True),
+            )
+            return paper_record.model_copy(update={"index_artifact_path": index_artifact_path}), section_index
+
+        if source_artifact_path.lower().endswith(".pdf") and Path(source_artifact_path).exists():
+            pdf_result = self.pdf_extractor.process(
+                paper_id=paper_record.paper_id,
+                pdf_bytes=Path(source_artifact_path).read_bytes(),
+                artifact_store=store,
+            )
+            indexed_sections = [
+                Section.model_validate(
+                    {
+                        "section_id": section_payload.get("section_id"),
+                        "section_type": section_payload.get("section_type"),
+                        "heading": section_payload.get("heading"),
+                        "page_start": section_payload.get("page_start"),
+                        "page_end": section_payload.get("page_end"),
+                        "fulltext_char_start": section_payload.get("fulltext_char_start"),
+                        "fulltext_char_end": section_payload.get("fulltext_char_end"),
+                    }
+                )
+                for section_payload in list(pdf_result.sections or [])
+            ]
+            section_index = self._build_section_index(
+                paper_id=paper_record.paper_id,
+                fulltext_status=pdf_result.fulltext_status,
+                fulltext_artifact_path=pdf_result.fulltext_artifact_path,
+                sections=indexed_sections,
+            )
+            index_artifact_path = store.write_json(
+                f"indices/{paper_record.paper_id}.json",
+                section_index.model_dump(exclude_none=True),
+            )
+            self.last_execution_warnings.extend(list(pdf_result.warnings or []))
+            return (
+                paper_record.model_copy(
+                    update={
+                        "fulltext_available": True,
+                        "fulltext_status": pdf_result.fulltext_status,
+                        "fulltext_format": paper_record.fulltext_format or "application/pdf",
+                        "fulltext_artifact_path": pdf_result.fulltext_artifact_path,
+                        "source_artifact_path": pdf_result.source_artifact_path,
+                        "index_artifact_path": index_artifact_path,
+                        "extraction_report_path": pdf_result.extraction_report_path,
+                        "sections_artifact_path": pdf_result.sections_artifact_path,
+                        "snippets_artifact_path": pdf_result.snippets_artifact_path,
+                        "extraction_warnings": list(pdf_result.warnings or []),
+                        "fulltext_extractor": pdf_result.extractor,
+                        "ocr_applied": bool(pdf_result.ocr_applied),
+                    }
+                ),
+                section_index,
+            )
+
+        section_index = self._build_section_index(
+            paper_id=paper_record.paper_id,
+            fulltext_status=fulltext_status,
+            fulltext_artifact_path=paper_record.fulltext_artifact_path,
+        )
+        index_artifact_path = store.write_json(
+            f"indices/{paper_record.paper_id}.json",
+            section_index.model_dump(exclude_none=True),
+        )
+        return paper_record.model_copy(update={"index_artifact_path": index_artifact_path}), section_index
+
+    def _acquire_one(
+        self,
+        candidate: PaperCandidate,
+        store: QAArtifactStore,
+        *,
+        parse_fulltext: bool = True,
+    ) -> Tuple[PaperRecord, SectionIndex]:
         provider_artifacts = dict(candidate.provider_artifacts)
         provider_sources = list(candidate.provider_hits)
         oa_url = candidate.oa_url
@@ -128,7 +251,7 @@ class DocumentAcquirerNode:
 
         self._write_runtime_status(
             store=store,
-            stage="acquire_document",
+            stage="download_document",
             status="start",
             paper_id=candidate.paper_id,
             provider="document_acquirer",
@@ -139,7 +262,7 @@ class DocumentAcquirerNode:
                 "document_fetch_total_timeout_seconds": self.document_fetch_total_timeout_seconds,
             },
         )
-        logger.info("document_acquirer_stage_start paper_id=%s stage=%s", candidate.paper_id, "acquire_document")
+        logger.info("document_acquirer_stage_start paper_id=%s stage=%s", candidate.paper_id, "download_document")
 
         try:
             if self.unpaywall_client and candidate.doi:
@@ -303,70 +426,78 @@ class DocumentAcquirerNode:
                     self._record_diagnostic(provider="oa_fetch", stage="fetch", outcome="hit")
                     fulltext_format = fetched.content_type
                     if fetched.content_type == "application/pdf" and fetched.binary is not None:
-                        self._check_total_timeout(
-                            started_at=acquire_started_at,
-                            paper_id=candidate.paper_id,
-                            stage="pdf_extraction",
-                            store=store,
-                            provider="pdf_extraction",
-                            url=getattr(fetched, "final_url", None) or fetched.url,
-                        )
-                        self._write_runtime_status(
-                            store=store,
-                            stage="pdf_extraction",
-                            status="start",
-                            paper_id=candidate.paper_id,
-                            provider="pdf_extraction",
-                            url=getattr(fetched, "final_url", None) or fetched.url,
-                            metadata={"content_type": fetched.content_type},
-                            started_at=acquire_started_at,
-                        )
-                        logger.info("document_acquirer_stage_start paper_id=%s stage=%s", candidate.paper_id, "pdf_extraction")
-                        pdf_result = self._run_with_timeout(
-                            lambda: self.pdf_extractor.process(
+                        if not parse_fulltext:
+                            source_artifact_path = store.write_bytes(f"fulltext/{candidate.paper_id}.pdf", fetched.binary)
+                            fulltext_artifact_path = source_artifact_path
+                            fulltext_available = True
+                            fulltext_status = "binary_only"
+                            fulltext_format = fetched.content_type
+                            indexed_sections = []
+                        else:
+                            self._check_total_timeout(
+                                started_at=acquire_started_at,
                                 paper_id=candidate.paper_id,
-                                pdf_bytes=fetched.binary,
-                                artifact_store=store,
-                            ),
-                            timeout_seconds=self.document_fetch_total_timeout_seconds,
-                        )
-                        self._write_runtime_status(
-                            store=store,
-                            stage="pdf_extraction",
-                            status="success",
-                            paper_id=candidate.paper_id,
-                            provider="pdf_extraction",
-                            url=getattr(fetched, "final_url", None) or fetched.url,
-                            metadata={"fulltext_status": pdf_result.fulltext_status, "extractor": pdf_result.extractor},
-                            started_at=acquire_started_at,
-                        )
-                        logger.info("document_acquirer_stage_success paper_id=%s stage=%s", candidate.paper_id, "pdf_extraction")
-                        source_artifact_path = pdf_result.source_artifact_path
-                        fulltext_artifact_path = pdf_result.fulltext_artifact_path
-                        extraction_report_path = pdf_result.extraction_report_path
-                        sections_artifact_path = pdf_result.sections_artifact_path
-                        snippets_artifact_path = pdf_result.snippets_artifact_path
-                        extraction_warnings = list(pdf_result.warnings)
-                        fulltext_extractor = pdf_result.extractor
-                        ocr_applied = bool(pdf_result.ocr_applied)
-                        fulltext_available = True
-                        fulltext_status = pdf_result.fulltext_status
-                        if pdf_result.sections:
-                            indexed_sections = [
-                                Section.model_validate(
-                                    {
-                                        "section_id": section_payload.get("section_id"),
-                                        "section_type": section_payload.get("section_type"),
-                                        "heading": section_payload.get("heading"),
-                                        "page_start": section_payload.get("page_start"),
-                                        "page_end": section_payload.get("page_end"),
-                                        "fulltext_char_start": section_payload.get("fulltext_char_start"),
-                                        "fulltext_char_end": section_payload.get("fulltext_char_end"),
-                                    }
-                                )
-                                for section_payload in pdf_result.sections
-                            ]
-                        self.last_execution_warnings.extend(extraction_warnings)
+                                stage="pdf_extraction",
+                                store=store,
+                                provider="pdf_extraction",
+                                url=getattr(fetched, "final_url", None) or fetched.url,
+                            )
+                            self._write_runtime_status(
+                                store=store,
+                                stage="pdf_extraction",
+                                status="start",
+                                paper_id=candidate.paper_id,
+                                provider="pdf_extraction",
+                                url=getattr(fetched, "final_url", None) or fetched.url,
+                                metadata={"content_type": fetched.content_type},
+                                started_at=acquire_started_at,
+                            )
+                            logger.info("document_acquirer_stage_start paper_id=%s stage=%s", candidate.paper_id, "pdf_extraction")
+                            pdf_result = self._run_with_timeout(
+                                lambda: self.pdf_extractor.process(
+                                    paper_id=candidate.paper_id,
+                                    pdf_bytes=fetched.binary,
+                                    artifact_store=store,
+                                ),
+                                timeout_seconds=self.document_fetch_total_timeout_seconds,
+                            )
+                            self._write_runtime_status(
+                                store=store,
+                                stage="pdf_extraction",
+                                status="success",
+                                paper_id=candidate.paper_id,
+                                provider="pdf_extraction",
+                                url=getattr(fetched, "final_url", None) or fetched.url,
+                                metadata={"fulltext_status": pdf_result.fulltext_status, "extractor": pdf_result.extractor},
+                                started_at=acquire_started_at,
+                            )
+                            logger.info("document_acquirer_stage_success paper_id=%s stage=%s", candidate.paper_id, "pdf_extraction")
+                            source_artifact_path = pdf_result.source_artifact_path
+                            fulltext_artifact_path = pdf_result.fulltext_artifact_path
+                            extraction_report_path = pdf_result.extraction_report_path
+                            sections_artifact_path = pdf_result.sections_artifact_path
+                            snippets_artifact_path = pdf_result.snippets_artifact_path
+                            extraction_warnings = list(pdf_result.warnings)
+                            fulltext_extractor = pdf_result.extractor
+                            ocr_applied = bool(pdf_result.ocr_applied)
+                            fulltext_available = True
+                            fulltext_status = pdf_result.fulltext_status
+                            if pdf_result.sections:
+                                indexed_sections = [
+                                    Section.model_validate(
+                                        {
+                                            "section_id": section_payload.get("section_id"),
+                                            "section_type": section_payload.get("section_type"),
+                                            "heading": section_payload.get("heading"),
+                                            "page_start": section_payload.get("page_start"),
+                                            "page_end": section_payload.get("page_end"),
+                                            "fulltext_char_start": section_payload.get("fulltext_char_start"),
+                                            "fulltext_char_end": section_payload.get("fulltext_char_end"),
+                                        }
+                                    )
+                                    for section_payload in pdf_result.sections
+                                ]
+                            self.last_execution_warnings.extend(extraction_warnings)
                     elif fetched.binary is not None:
                         fulltext_artifact_path = store.write_bytes(
                             f"fulltext/{candidate.paper_id}.{guess_binary_extension(fetched.content_type)}",
@@ -399,7 +530,7 @@ class DocumentAcquirerNode:
             )
             self._write_runtime_status(
                 store=store,
-                stage="acquire_document",
+                stage="download_document",
                 status="timeout",
                 paper_id=candidate.paper_id,
                 provider="document_acquirer",
@@ -410,7 +541,7 @@ class DocumentAcquirerNode:
         except Exception as exc:
             self._write_runtime_status(
                 store=store,
-                stage="acquire_document",
+                stage="download_document",
                 status="failure",
                 paper_id=candidate.paper_id,
                 provider="document_acquirer",
@@ -478,7 +609,7 @@ class DocumentAcquirerNode:
         if not timed_out:
             self._write_runtime_status(
                 store=store,
-                stage="acquire_document",
+                stage="download_document",
                 status="success",
                 paper_id=candidate.paper_id,
                 provider="document_acquirer",
@@ -490,7 +621,7 @@ class DocumentAcquirerNode:
                 },
                 started_at=acquire_started_at,
             )
-            logger.info("document_acquirer_stage_success paper_id=%s stage=%s", candidate.paper_id, "acquire_document")
+            logger.info("document_acquirer_stage_success paper_id=%s stage=%s", candidate.paper_id, "download_document")
         return paper_record, section_index
 
     def _normalize_fulltext(self, raw_text: str, content_type: Optional[str]) -> str:

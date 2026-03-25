@@ -201,7 +201,20 @@ class RetrieverNode:
             or ((raw_item.get("host_venue") or {}).get("display_name"))
         ) or None
         best_oa_location = raw_item.get("best_oa_location") or {}
-        oa_url = best_oa_location.get("pdf_url") or best_oa_location.get("landing_page_url")
+        best_oa_pdf_url = best_oa_location.get("pdf_url")
+        best_oa_landing_page_url = best_oa_location.get("landing_page_url")
+        oa_url = best_oa_pdf_url or best_oa_landing_page_url
+        open_access = raw_item.get("open_access") or {}
+        oa_eligible = bool(oa_url) or bool(open_access.get("is_oa")) or bool(best_oa_location)
+        oa_signal_reason = (
+            "openalex_best_oa_pdf"
+            if best_oa_pdf_url
+            else "openalex_best_oa_landing_page"
+            if best_oa_landing_page_url
+            else "openalex_open_access_flag"
+            if oa_eligible
+            else None
+        )
 
         artifact_path = store.write_json(f"provider_raw/openalex/{paper_id}.json", raw_item)
         return PaperCandidate(
@@ -217,6 +230,12 @@ class RetrieverNode:
             ranking_features={},
             provider_artifacts={"openalex": artifact_path},
             oa_url=oa_url,
+            openalex_id=normalize_text(raw_item.get("id")) or None,
+            best_oa_pdf_url=best_oa_pdf_url,
+            best_oa_landing_page_url=best_oa_landing_page_url,
+            oa_eligible=oa_eligible,
+            oa_source="openalex" if oa_eligible else None,
+            oa_signal_reason=oa_signal_reason,
         )
 
     def _candidate_from_semantic_scholar(
@@ -233,7 +252,8 @@ class RetrieverNode:
         abstract = normalize_text(raw_item.get("abstract")) or None
         authors = flatten_author_names(raw_item.get("authors"))
         venue = normalize_text(raw_item.get("venue")) or None
-        oa_url = ((raw_item.get("openAccessPdf") or {}).get("url")) or raw_item.get("url")
+        best_oa_pdf_url = ((raw_item.get("openAccessPdf") or {}).get("url")) or None
+        oa_url = best_oa_pdf_url or raw_item.get("url")
         paper_id = stable_paper_id(doi=doi, title=title, year=year)
         artifact_path = store.write_json(f"provider_raw/semantic_scholar/{paper_id}.json", raw_item)
         candidate = PaperCandidate(
@@ -249,6 +269,10 @@ class RetrieverNode:
             ranking_features={},
             provider_artifacts={"semantic_scholar": artifact_path},
             oa_url=oa_url,
+            best_oa_pdf_url=best_oa_pdf_url,
+            oa_eligible=bool(best_oa_pdf_url),
+            oa_source="semantic_scholar" if best_oa_pdf_url else None,
+            oa_signal_reason="semantic_scholar_open_access_pdf" if best_oa_pdf_url else None,
         )
         citation_count = raw_item.get("citationCount")
         if citation_count is not None:
@@ -341,6 +365,18 @@ class RetrieverNode:
             target.venue = incoming.venue
         if not target.oa_url and incoming.oa_url:
             target.oa_url = incoming.oa_url
+        if not target.openalex_id and incoming.openalex_id:
+            target.openalex_id = incoming.openalex_id
+        if not target.best_oa_pdf_url and incoming.best_oa_pdf_url:
+            target.best_oa_pdf_url = incoming.best_oa_pdf_url
+        if not target.best_oa_landing_page_url and incoming.best_oa_landing_page_url:
+            target.best_oa_landing_page_url = incoming.best_oa_landing_page_url
+        if not target.oa_eligible and incoming.oa_eligible:
+            target.oa_eligible = True
+        if not target.oa_source and incoming.oa_source:
+            target.oa_source = incoming.oa_source
+        if not target.oa_signal_reason and incoming.oa_signal_reason:
+            target.oa_signal_reason = incoming.oa_signal_reason
         target.provider_hits = list(dict.fromkeys([*target.provider_hits, *incoming.provider_hits]))
         target.lane_sources = list(dict.fromkeys([*target.lane_sources, *incoming.lane_sources]))
         merged_artifacts = dict(target.provider_artifacts)

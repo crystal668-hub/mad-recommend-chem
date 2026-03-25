@@ -212,9 +212,28 @@ class StaticDocumentAcquirer:
         }
         self.last_execution_warnings = list(warnings or [])
 
-    def run(self, *, candidates, artifact_store=None):
+    def run(self, *, candidates, artifact_store=None, parse_fulltext: bool = True):
         store = artifact_store or QAArtifactStore()
         paper = candidates[0]
+        if not parse_fulltext:
+            source_pdf_path = store.write_bytes(f"fulltext/{paper.paper_id}.pdf", b"%PDF-1.4 static pdf")
+            return (
+                [
+                    PaperRecord(
+                        paper_id=paper.paper_id,
+                        title=paper.title,
+                        abstract=paper.abstract,
+                        year=paper.year,
+                        provider_sources=list(paper.provider_hits),
+                        fulltext_available=True,
+                        fulltext_status="binary_only",
+                        fulltext_format="application/pdf",
+                        fulltext_artifact_path=str(source_pdf_path),
+                        source_artifact_path=str(source_pdf_path),
+                    )
+                ],
+                [SectionIndex(paper_id=paper.paper_id, fulltext_status="binary_only", sections=[])],
+            )
         fulltext = "Pt/C improves HER activity in 1 M KOH by lowering overpotential."
         fulltext_path = store.write_text(f"fulltext/{paper.paper_id}.txt", fulltext)
         return (
@@ -246,6 +265,42 @@ class StaticDocumentAcquirer:
                 )
             ],
         )
+
+    def download_documents(self, candidates, artifact_store=None):
+        return self.run(candidates=candidates, artifact_store=artifact_store, parse_fulltext=False)
+
+    def parse_documents(self, paper_records, artifact_store=None):
+        store = artifact_store or QAArtifactStore()
+        parsed_records = []
+        section_indices = []
+        for paper in list(paper_records or []):
+            fulltext = "Pt/C improves HER activity in 1 M KOH by lowering overpotential."
+            fulltext_path = store.write_text(f"fulltext/{paper.paper_id}.txt", fulltext)
+            parsed_records.append(
+                paper.model_copy(
+                    update={
+                        "fulltext_available": True,
+                        "fulltext_status": "fulltext_indexed",
+                        "fulltext_artifact_path": fulltext_path,
+                    }
+                )
+            )
+            section_indices.append(
+                SectionIndex(
+                    paper_id=paper.paper_id,
+                    fulltext_status="fulltext_indexed",
+                    sections=[
+                        Section(
+                            section_id="sec-results",
+                            section_type="results",
+                            heading="Results",
+                            fulltext_char_start=0,
+                            fulltext_char_end=len(fulltext),
+                        )
+                    ],
+                )
+            )
+        return parsed_records, section_indices
 
 
 class StaticEvidenceExtractor:
