@@ -1678,12 +1678,12 @@ class ReActAgent:
                             "type": "tool_call",
                         }
                     )
-                synthetic_tool_messages.append(
-                    ToolMessage(
-                        content=json.dumps(parse_result.data, ensure_ascii=False),
-                        tool_call_id=parse_tool_call_id,
+                    synthetic_tool_messages.append(
+                        ToolMessage(
+                            content=json.dumps(parse_result.data, ensure_ascii=False),
+                            tool_call_id=parse_tool_call_id,
+                        )
                     )
-                )
                 tool_call_id = f"deadline_extract_{len(synthetic_calls) + 1}"
                 tool_args = {"paper_id": paper_id, "preferred_sections": True}
                 result = _invoke_tool_with_validation(extract_tool, "extract_evidence", tool_args)

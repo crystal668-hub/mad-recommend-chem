@@ -21,6 +21,7 @@ from qa.handoff import EvidenceExtractorHandoff
 from qa.nodes.query_planner import QueryPlannerExecutionError
 from qa.nodes.router import RouterExecutionError
 from qa.nodes.retriever import RetrieverNode
+from qa.paper_profiles import GrobidPaperProfileBuilder
 from qa.react_reviewed_state import AnswerSubmission, ReviewItem, ReviewerRunStatus, SubmissionCitation, SubmissionConfidenceRating, SubmissionSection, SubmissionStepRef
 from qa.react_reviewed_workflow import (
     PROPOSER_TOOL_NAMES,
@@ -1458,6 +1459,303 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         )
 
         self.assertEqual(["paper-oa"], [item["paper_id"] for item in result])
+
+    def test_retriever_filters_off_topic_candidates_before_enrichment(self):
+        class _OpenAlexClient:
+            def search(self, query_plan, limit=8):
+                return [
+                    {
+                        "display_name": "ICP-MS determination of Pb, Cd, and As in river water at trace levels",
+                        "doi": "10.1000/on-topic",
+                        "publication_year": 2024,
+                        "abstract": "River water ICP-MS method quantifies lead, cadmium, and arsenic simultaneously at trace levels.",
+                        "authorships": [],
+                        "best_oa_location": {"pdf_url": "https://example.org/on-topic.pdf"},
+                    },
+                    {
+                        "display_name": "Dietary Change in Populations of the North American Subarctic",
+                        "doi": "10.1000/off-topic",
+                        "publication_year": 2016,
+                        "abstract": "A review of dietary acculturation and chronic disease risk in subarctic populations.",
+                        "authorships": [],
+                        "best_oa_location": {"pdf_url": "https://example.org/off-topic.pdf"},
+                    },
+                    {
+                        "display_name": "Current Status of Trace Metal Pollution in Soils Affected by Industrial Activities",
+                        "doi": "10.1000/off-topic-methodless",
+                        "publication_year": 2012,
+                        "abstract": "Trace metal pollution in industrial soils includes lead, cadmium, and arsenic contamination but does not study an analytical measurement method.",
+                        "authorships": [],
+                        "best_oa_location": {"pdf_url": "https://example.org/off-topic-methodless.pdf"},
+                    },
+                ]
+
+        class _NoopClient:
+            def search(self, query_plan, limit=8):
+                return []
+
+            def enrich(self, candidate):
+                return None
+
+        retriever = RetrieverNode(
+            openalex_client=_OpenAlexClient(),
+            semantic_scholar_client=_NoopClient(),
+            crossref_client=_NoopClient(),
+            per_lane_limit=8,
+            final_top_k=6,
+        )
+        task_spec = TaskSpec.model_validate(
+            {
+                "question": "What analytical method is suitable for trace Pb, Cd, and As in river water?",
+                "normalized_question": "what analytical method is suitable for trace pb cd and as in river water",
+                "question_type": "fact",
+                "recency_policy": "none",
+                "answer_sections": [],
+                "router_confidence": 0.9,
+                "query_constraints": {
+                    "must_include_terms": ["river water", "lead", "cadmium", "arsenic", "trace"],
+                    "should_include_terms": ["ICP-MS", "inductively coupled plasma mass spectrometry"],
+                    "exclude_terms": [],
+                    "allow_broad_expansion": False,
+                },
+            }
+        )
+
+        candidates = retriever.run(
+            task_spec=task_spec,
+            entity_pack=_entity_pack(),
+            query_plans=[
+                QueryPlan(
+                    lane="data",
+                    query_text="river water lead cadmium arsenic trace ICP-MS",
+                    must_terms=["river water", "lead", "cadmium", "arsenic", "trace"],
+                    exclude_terms=[],
+                    preferred_sources=["openalex"],
+                )
+            ],
+            artifact_store=QAArtifactStore(base_dir=self.temp_dir / "retriever_relevance"),
+        )
+
+        self.assertEqual(["10.1000/on-topic"], [candidate.doi for candidate in candidates])
+
+    def test_retriever_keeps_method_signal_candidates_when_should_terms_miss_exact_phrase(self):
+        class _OpenAlexClient:
+            def search(self, query_plan, limit=8):
+                return [
+                    {
+                        "display_name": "Anodic stripping voltammetry for trace lead, cadmium, and arsenic in river water",
+                        "doi": "10.1000/asv-method",
+                        "publication_year": 2024,
+                        "abstract": "A voltammetric determination method quantifies lead, cadmium, and arsenic in river water at trace levels.",
+                        "authorships": [],
+                        "best_oa_location": {"pdf_url": "https://example.org/asv-method.pdf"},
+                    },
+                    {
+                        "display_name": "Heavy metal exposure patterns in mining communities",
+                        "doi": "10.1000/exposure-only",
+                        "publication_year": 2021,
+                        "abstract": "Exposure pathways for lead, cadmium, and arsenic in mining communities are reviewed without an analytical measurement method.",
+                        "authorships": [],
+                        "best_oa_location": {"pdf_url": "https://example.org/exposure-only.pdf"},
+                    },
+                ]
+
+        class _NoopClient:
+            def search(self, query_plan, limit=8):
+                return []
+
+            def enrich(self, candidate):
+                return None
+
+        retriever = RetrieverNode(
+            openalex_client=_OpenAlexClient(),
+            semantic_scholar_client=_NoopClient(),
+            crossref_client=_NoopClient(),
+            per_lane_limit=8,
+            final_top_k=6,
+        )
+        task_spec = TaskSpec.model_validate(
+            {
+                "question": "What analytical method is suitable for trace Pb, Cd, and As in river water?",
+                "normalized_question": "what analytical method is suitable for trace pb cd and as in river water",
+                "question_type": "fact",
+                "recency_policy": "none",
+                "answer_sections": [],
+                "router_confidence": 0.9,
+                "query_constraints": {
+                    "must_include_terms": ["river water", "lead", "cadmium", "arsenic", "trace"],
+                    "should_include_terms": ["ICP-MS", "inductively coupled plasma mass spectrometry"],
+                    "exclude_terms": [],
+                    "allow_broad_expansion": False,
+                },
+            }
+        )
+
+        candidates = retriever.run(
+            task_spec=task_spec,
+            entity_pack=_entity_pack(),
+            query_plans=[
+                QueryPlan(
+                    lane="data",
+                    query_text="river water lead cadmium arsenic trace analytical method",
+                    must_terms=["river water", "lead", "cadmium", "arsenic", "trace"],
+                    exclude_terms=[],
+                    preferred_sources=["openalex"],
+                )
+            ],
+            artifact_store=QAArtifactStore(base_dir=self.temp_dir / "retriever_method_signal"),
+        )
+
+        self.assertEqual(["10.1000/asv-method"], [candidate.doi for candidate in candidates])
+
+    def test_grobid_paper_profile_builder_prefers_grobid_then_supplements_local_fulltext(self):
+        artifact_store = QAArtifactStore(base_dir=self.temp_dir / "paper_profile_local")
+        source_pdf_path = artifact_store.write_bytes("fulltext/paper-1.pdf", b"%PDF-1.4\n%fixture\n")
+        fulltext_path = artifact_store.write_text(
+            "fulltext/paper-1.fulltext.txt",
+            "\n".join(
+                [
+                    "Abstract",
+                    "ICP-MS was used to quantify lead, cadmium, and arsenic in river water at trace levels.",
+                    "Methods",
+                    "Samples were acidified and analyzed by inductively coupled plasma mass spectrometry.",
+                    "Results",
+                    "Trace-level multi-element quantification was achieved with ICP-MS.",
+                ]
+            ),
+        )
+        def _loader_factory(_path):
+            return SimpleNamespace(
+                load=lambda: [
+                    SimpleNamespace(
+                        page_content="ICP-MS quantified lead, cadmium, and arsenic in surface water.",
+                        metadata={"section_title": "Abstract"},
+                    )
+                ]
+            )
+
+        builder = GrobidPaperProfileBuilder(loader_factory=_loader_factory)
+        paper_record = PaperRecord.model_validate(
+            {
+                "paper_id": "paper-1",
+                "doi": "10.1000/paper-1",
+                "title": "ICP-MS trace metals in river water",
+                "abstract": "River-water trace metals measured by ICP-MS.",
+                "year": 2024,
+                "venue": "Journal",
+                "fulltext_available": True,
+                "fulltext_status": "fulltext_indexed",
+                "source_artifact_path": source_pdf_path,
+                "fulltext_artifact_path": fulltext_path,
+            }
+        )
+
+        profile = builder.build(paper_record=paper_record, artifact_store=artifact_store)
+
+        self.assertEqual("ready", profile.profile_status)
+        self.assertEqual("langchain_community.GenericLoader+GrobidParser+local_fulltext_text", profile.parser_name)
+        self.assertIn("surface water", profile.abstract_or_summary)
+        self.assertIn("Methods", profile.section_headings)
+        self.assertIn("inductively coupled plasma mass spectrometry", profile.methods_or_experimental_setup.lower())
+        self.assertIn("Results", profile.evidence_rich_sections)
+
+    def test_workspace_build_paper_profile_indexes_binary_pdf_before_grobid(self):
+        loader_calls: list[str] = []
+
+        workspace = self._make_workspace(
+            paper_profile_builder=GrobidPaperProfileBuilder(
+                loader_factory=lambda path: (
+                    loader_calls.append(str(path)),
+                    SimpleNamespace(
+                        load=lambda: [
+                            SimpleNamespace(
+                                page_content="ICP-MS workflow for trace metals in river water.",
+                                metadata={"section_title": "Abstract"},
+                            )
+                        ]
+                    ),
+                )[1]
+            )
+        )
+        workspace.paper_candidates = {"paper-1": _paper_candidate("paper-1")}
+
+        profile_payload = workspace.build_paper_profile(
+            paper_id="paper-1",
+            requested_via="screen_papers",
+            write_snapshot=False,
+        )
+
+        self.assertEqual("ready", profile_payload["profile_status"])
+        self.assertEqual(
+            "langchain_community.GenericLoader+GrobidParser+local_fulltext_text",
+            profile_payload["parser_name"],
+        )
+        self.assertEqual("fulltext_indexed", workspace.paper_records["paper-1"].fulltext_status)
+        self.assertTrue(str(workspace.paper_records["paper-1"].fulltext_artifact_path).endswith(".txt"))
+        self.assertEqual(1, len(loader_calls))
+
+    def test_grobid_paper_profile_builder_falls_back_to_local_fulltext_when_server_unavailable(self):
+        artifact_store = QAArtifactStore(base_dir=self.temp_dir / "paper_profile_local_fallback")
+        source_pdf_path = artifact_store.write_bytes("fulltext/paper-local.pdf", b"%PDF-1.4\n%fixture\n")
+        fulltext_path = artifact_store.write_text(
+            "fulltext/paper-local.fulltext.txt",
+            "\n".join(
+                [
+                    "Abstract",
+                    "ICP-MS quantified lead, cadmium, and arsenic in river water.",
+                    "Methods",
+                    "Samples were filtered, acidified, and analyzed by ICP-MS.",
+                ]
+            ),
+        )
+        builder = GrobidPaperProfileBuilder(grobid_url="http://127.0.0.1:9")
+        paper_record = PaperRecord.model_validate(
+            {
+                "paper_id": "paper-local",
+                "doi": "10.1000/paper-local",
+                "title": "River-water ICP-MS workflow",
+                "abstract": "River-water ICP-MS workflow.",
+                "year": 2024,
+                "venue": "Journal",
+                "fulltext_available": True,
+                "fulltext_status": "fulltext_indexed",
+                "source_artifact_path": source_pdf_path,
+                "fulltext_artifact_path": fulltext_path,
+            }
+        )
+
+        profile = builder.build(paper_record=paper_record, artifact_store=artifact_store)
+
+        self.assertEqual("ready", profile.profile_status)
+        self.assertEqual("local_fulltext_text", profile.parser_name)
+        self.assertIn("filtered, acidified", profile.methods_or_experimental_setup)
+
+    def test_grobid_paper_profile_builder_fails_fast_when_server_unavailable(self):
+        artifact_store = QAArtifactStore(base_dir=self.temp_dir / "paper_profile_grobid_unavailable")
+        source_pdf_path = artifact_store.write_bytes("fulltext/paper-2.pdf", b"%PDF-1.4\n%fixture\n")
+        builder = GrobidPaperProfileBuilder(grobid_url="http://127.0.0.1:9")
+        paper_record = PaperRecord.model_validate(
+            {
+                "paper_id": "paper-2",
+                "doi": "10.1000/paper-2",
+                "title": "PDF only paper",
+                "abstract": "PDF only abstract.",
+                "year": 2024,
+                "venue": "Journal",
+                "fulltext_available": True,
+                "fulltext_status": "binary_only",
+                "source_artifact_path": source_pdf_path,
+                "fulltext_artifact_path": source_pdf_path,
+            }
+        )
+
+        started_at = time.perf_counter()
+        with self.assertRaises(RuntimeError) as ctx:
+            builder.build(paper_record=paper_record, artifact_store=artifact_store)
+        elapsed_seconds = time.perf_counter() - started_at
+
+        self.assertIn("GROBID server unavailable", str(ctx.exception))
+        self.assertLess(elapsed_seconds, 5.0)
 
     def test_normalize_submission_citations_does_not_backfill_irrelevant_abstract(self):
         proposer = ReactReviewedProposerAgent(

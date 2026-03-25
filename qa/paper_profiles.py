@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
+from urllib.error import URLError
+from urllib.request import urlopen
 
 from qa.artifacts import QAArtifactStore
 from qa.retrieval_state import PaperProfile, PaperRecord
@@ -47,13 +49,69 @@ class GrobidPaperProfileBuilder:
 
     def build(self, *, paper_record: PaperRecord, artifact_store: Optional[QAArtifactStore] = None) -> PaperProfile:
         store = artifact_store or QAArtifactStore()
+        source_pdf_path = self._resolve_local_pdf_artifact_path(paper_record)
+        local_text_path = self._resolve_local_text_artifact_path(paper_record)
+        grobid_error: Optional[Exception] = None
+        if source_pdf_path is not None:
+            try:
+                grobid_profile = self._build_from_grobid(
+                    paper_record=paper_record,
+                    source_path=source_pdf_path,
+                    artifact_store=store,
+                )
+                if local_text_path is None:
+                    return grobid_profile
+                local_profile = self._build_from_local_text(
+                    paper_record=paper_record,
+                    text_path=local_text_path,
+                    artifact_store=store,
+                )
+                return self._merge_profiles(
+                    primary=grobid_profile,
+                    supplement=local_profile,
+                    artifact_store=store,
+                )
+            except Exception as exc:
+                grobid_error = exc
+
+        if local_text_path is not None:
+            return self._build_from_local_text(
+                paper_record=paper_record,
+                text_path=local_text_path,
+                artifact_store=store,
+            )
+
+        if grobid_error is not None:
+            raise grobid_error
+
         source_artifact_path = str(paper_record.source_artifact_path or "").strip()
         if not source_artifact_path:
             raise ValueError(f"paper_id={paper_record.paper_id} has no source_artifact_path for GROBID parsing.")
-        source_path = Path(source_artifact_path)
-        if source_path.suffix.lower() != ".pdf":
-            raise ValueError(f"paper_id={paper_record.paper_id} does not have a PDF source artifact for GROBID parsing.")
+        raise ValueError(f"paper_id={paper_record.paper_id} does not have a PDF source artifact for GROBID parsing.")
 
+    def _resolve_local_pdf_artifact_path(self, paper_record: PaperRecord) -> Optional[Path]:
+        candidates = [
+            str(paper_record.source_artifact_path or "").strip(),
+            str(paper_record.fulltext_artifact_path or "").strip(),
+        ]
+        for candidate_path in candidates:
+            if not candidate_path:
+                continue
+            path = Path(candidate_path)
+            if not path.exists():
+                continue
+            if path.suffix.lower() == ".pdf":
+                return path
+        return None
+
+    def _build_from_grobid(
+        self,
+        *,
+        paper_record: PaperRecord,
+        source_path: Path,
+        artifact_store: QAArtifactStore,
+    ) -> PaperProfile:
+        self._assert_grobid_available()
         loader = self._build_loader(source_path)
         documents = list(loader.load() or [])
         if not documents:
@@ -68,16 +126,164 @@ class GrobidPaperProfileBuilder:
                     "metadata": dict(getattr(document, "metadata", {}) or {}),
                 }
             )
-        raw_artifact_path = store.write_json(
-            f"proposer_profiles/{paper_record.paper_id}.grobid_raw.json",
-            raw_payload,
+        return self._build_profile_from_payload(
+            paper_record=paper_record,
+            raw_payload=raw_payload,
+            artifact_store=artifact_store,
+            parser_name="langchain_community.GenericLoader+GrobidParser",
+            raw_artifact_name=f"proposer_profiles/{paper_record.paper_id}.grobid_raw.json",
         )
 
-        text_fragments = [_compact_text(item["page_content"]) for item in raw_payload if _compact_text(item["page_content"])]
-        combined_text = "\n".join(text_fragments).strip()
-        if not combined_text:
-            raise ValueError(f"paper_id={paper_record.paper_id} produced no usable GROBID text.")
+    def _resolve_local_text_artifact_path(self, paper_record: PaperRecord) -> Optional[Path]:
+        candidates = [
+            str(paper_record.fulltext_artifact_path or "").strip(),
+            str(paper_record.source_artifact_path or "").strip(),
+        ]
+        for candidate_path in candidates:
+            if not candidate_path:
+                continue
+            path = Path(candidate_path)
+            if not path.exists():
+                continue
+            if path.suffix.lower() in {".txt", ".md", ".text"}:
+                return path
+        return None
 
+    def _build_from_local_text(
+        self,
+        *,
+        paper_record: PaperRecord,
+        text_path: Path,
+        artifact_store: QAArtifactStore,
+    ) -> PaperProfile:
+        combined_text = text_path.read_text(encoding="utf-8", errors="ignore").strip()
+        if not combined_text:
+            raise ValueError(f"paper_id={paper_record.paper_id} produced no usable indexed full-text.")
+        raw_payload = [
+            {
+                "index": 0,
+                "page_content": combined_text,
+                "metadata": {
+                    "source_path": str(text_path),
+                    "source_kind": "local_fulltext_text",
+                },
+            }
+        ]
+        return self._build_profile_from_payload(
+            paper_record=paper_record,
+            raw_payload=raw_payload,
+            artifact_store=artifact_store,
+            parser_name="local_fulltext_text",
+            raw_artifact_name=f"proposer_profiles/{paper_record.paper_id}.local_raw.json",
+        )
+
+    def _merge_profiles(
+        self,
+        *,
+        primary: PaperProfile,
+        supplement: PaperProfile,
+        artifact_store: QAArtifactStore,
+    ) -> PaperProfile:
+        merged_section_headings = self._merge_text_lists(primary.section_headings, supplement.section_headings)
+        merged_entities = self._merge_text_lists(primary.materials_or_entities, supplement.materials_or_entities)
+        merged_metrics = self._merge_text_lists(primary.reported_metrics, supplement.reported_metrics)
+        merged_evidence_sections = self._merge_text_lists(
+            primary.evidence_rich_sections,
+            supplement.evidence_rich_sections,
+        ) or self._evidence_rich_sections(merged_section_headings)
+        merged_methods = self._merge_methods(primary=primary, supplement=supplement)
+        merged_summary = self._prefer_text(primary.abstract_or_summary, supplement.abstract_or_summary)
+        merged_problem = self._prefer_text(primary.problem_or_task, supplement.problem_or_task)
+        merged_limitations = self._profile_limitations(merged_section_headings, merged_methods, merged_metrics)
+        merged_parser_name = f"{primary.parser_name}+{supplement.parser_name}"
+        merged_profile = primary.model_copy(
+            update={
+                "parser_name": merged_parser_name,
+                "abstract_or_summary": merged_summary,
+                "section_headings": merged_section_headings,
+                "problem_or_task": merged_problem,
+                "materials_or_entities": merged_entities,
+                "methods_or_experimental_setup": merged_methods,
+                "reported_metrics": merged_metrics,
+                "evidence_rich_sections": merged_evidence_sections,
+                "citation_readiness_summary": self._citation_readiness_summary(
+                    merged_section_headings,
+                    merged_metrics,
+                    merged_evidence_sections,
+                ),
+                "limitations": merged_limitations,
+            }
+        )
+        parser_artifact_path = artifact_store.write_json(
+            f"proposer_profiles/{primary.paper_id}.profile.json",
+            merged_profile.model_dump(exclude_none=True),
+        )
+        return merged_profile.model_copy(update={"parser_artifact_path": parser_artifact_path})
+
+    def _prefer_text(self, primary_value: Optional[str], supplement_value: Optional[str]) -> Optional[str]:
+        primary_text = _compact_text(primary_value)
+        if primary_text:
+            return primary_text
+        supplement_text = _compact_text(supplement_value)
+        return supplement_text or None
+
+    def _merge_text_lists(self, primary_values: Sequence[str], supplement_values: Sequence[str]) -> List[str]:
+        merged: List[str] = []
+        seen = set()
+        for value in [*list(primary_values or []), *list(supplement_values or [])]:
+            cleaned = _compact_text(value)
+            if not cleaned:
+                continue
+            normalized = cleaned.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(cleaned)
+        return merged
+
+    def _merge_methods(self, *, primary: PaperProfile, supplement: PaperProfile) -> Optional[str]:
+        primary_has_method_heading = any(
+            term in heading.lower()
+            for heading in list(primary.section_headings or [])
+            for term in ("method", "experimental", "materials and methods")
+        )
+        if primary_has_method_heading:
+            return self._prefer_text(primary.methods_or_experimental_setup, supplement.methods_or_experimental_setup)
+        return self._prefer_text(supplement.methods_or_experimental_setup, primary.methods_or_experimental_setup)
+
+    def _assert_grobid_available(self) -> None:
+        if self.loader_factory is not None:
+            return
+        grobid_health_url = f"{self.grobid_url.rstrip('/')}/api/isalive"
+        try:
+            with urlopen(grobid_health_url, timeout=2.0) as response:
+                if getattr(response, "status", 200) >= 500:
+                    raise RuntimeError(f"GROBID health check returned HTTP {response.status}.")
+        except (URLError, TimeoutError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"GROBID server unavailable at {self.grobid_url}; cannot parse PDF-only paper profiles."
+            ) from exc
+
+    def _build_profile_from_payload(
+        self,
+        *,
+        paper_record: PaperRecord,
+        raw_payload: Sequence[Dict[str, Any]],
+        artifact_store: QAArtifactStore,
+        parser_name: str,
+        raw_artifact_name: str,
+    ) -> PaperProfile:
+        text_fragments = [
+            str(item.get("page_content") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+            for item in raw_payload
+            if str(item.get("page_content") or "").strip()
+        ]
+        combined_text = "\n\n".join(fragment for fragment in text_fragments if fragment).strip()
+        if not combined_text:
+            raise ValueError(f"paper_id={paper_record.paper_id} produced no usable parsed text.")
+
+        raw_artifact_path = artifact_store.write_json(raw_artifact_name, list(raw_payload))
+        source_artifact_path = _compact_text(paper_record.source_artifact_path) or _compact_text(paper_record.fulltext_artifact_path) or None
         section_headings = self._section_headings(raw_payload, combined_text)
         summary = self._abstract_or_summary(raw_payload, combined_text, fallback=paper_record.abstract)
         methods = self._section_summary(raw_payload, combined_text, target_terms=("method", "experimental"))
@@ -94,7 +300,7 @@ class GrobidPaperProfileBuilder:
             venue=paper_record.venue,
             oa_source_url=_compact_text(paper_record.oa_url) or None,
             source_artifact_path=source_artifact_path,
-            parser_name="langchain_community.GenericLoader+GrobidParser",
+            parser_name=parser_name,
             profile_status="ready",
             abstract_or_summary=summary,
             section_headings=section_headings,
@@ -107,7 +313,7 @@ class GrobidPaperProfileBuilder:
             limitations=limitations,
             raw_artifact_path=raw_artifact_path,
         )
-        parser_artifact_path = store.write_json(
+        parser_artifact_path = artifact_store.write_json(
             f"proposer_profiles/{paper_record.paper_id}.profile.json",
             profile.model_dump(exclude_none=True),
         )

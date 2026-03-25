@@ -104,9 +104,9 @@ class ChembenchSmokeTests(unittest.TestCase):
         cases = load_smoke_cases(str(REPO_ROOT / "evals" / "chembench_smoke_cases.yaml"))
 
         self.assertEqual(3, len(cases))
-        self.assertEqual("analytical_chemistry_3", cases[0].name)
-        self.assertEqual("choice_text", cases[0].type)
-        self.assertEqual("72b8c8f0-a0c6-49d2-b417-df8cb43598da", cases[1].uuid)
+        self.assertEqual("oxidation_states", cases[0].name)
+        self.assertEqual("integer", cases[0].type)
+        self.assertEqual("4e846028-9f8f-44f2-eb3e-59316479df10", cases[1].uuid)
 
     def test_extract_short_answer_prefers_explicit_marker(self):
         answer, extracted_ok, source = extract_short_answer(
@@ -178,7 +178,7 @@ class ChembenchSmokeTests(unittest.TestCase):
     def test_main_filters_selected_case_and_writes_suite_report(self):
         selected_case = load_smoke_cases(str(REPO_ROOT / "evals" / "chembench_smoke_cases.yaml"))[1]
         _StubSmokeSystem.response_by_question = {
-            selected_case.question: "FINAL_SHORT_ANSWER: 174",
+            selected_case.question: f"FINAL_SHORT_ANSWER: {selected_case.gold}",
         }
         _StubSmokeSystem.citations = []
 

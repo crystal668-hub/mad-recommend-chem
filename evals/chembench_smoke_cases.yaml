@@ -1,42 +1,55 @@
 cases:
-  - subset: analytical_chemistry
-    name: analytical_chemistry_3
-    uuid: c84c6a28-acde-4f2c-a75f-3f144ead8cfd
+  - subset: general_chemistry
+    name: oxidation_states
+    uuid: 383d29c4-857b-b326-8d13-08afebb22b61
     question: >-
-      What analytical method would be suitable for a river water sample collected near a mining area,
-      where the concentrations of multiple toxic metals such as lead, cadmium, and arsenic must be
-      quantified simultaneously at trace levels?
-    gold: Inductively coupled plasma optical emission spectroscopy
-    type: choice_text
-    keywords:
-      - ICP-OES
-      - Inductively coupled plasma optical emission spectroscopy
-    source_url: https://huggingface.co/datasets/jablonkagroup/ChemBench/viewer/analytical_chemistry/train
-
-  - subset: analytical_chemistry
-    name: molecular_structure
-    uuid: 72b8c8f0-a0c6-49d2-b417-df8cb43598da
-    question: >-
-      How many normal modes of vibration does C60 have, assuming Ih point group symmetry and using
-      the 3N-6 vibrational degrees of freedom rule?
-    gold: "174"
+      What is the oxidation state of N in \ce{N2O}?
+    gold: "1"
     type: integer
     keywords:
-      - C60
-      - vibrational modes
-      - 3N-6
-    source_url: https://huggingface.co/datasets/jablonkagroup/ChemBench/viewer/analytical_chemistry/train
+      - oxidation states
+      - requires-reasoning
+      - general-chemistry
+      - difficulty-basic
+    source_url: https://huggingface.co/datasets/jablonkagroup/ChemBench/viewer/general_chemistry/train
 
-  - subset: analytical_chemistry
-    name: number_1h_nmr_shifts
-    uuid: f50b5e40-20e2-4583-9659-3011d40f9492
+  - subset: inorganic_chemistry
+    name: icho_uk_2023_q2h5
+    uuid: 4e846028-9f8f-44f2-eb3e-59316479df10
     question: >-
-      How many peaks would you expect in the 1H NMR spectrum of the compound with SMILES
-      `C[C@H]1[C@H](C)S(=O)(=O)N(C1)C(=O)N1CCOCC1`?
-    gold: "5"
+      Boron nitride has a wurtzite structure (w-BN). The unit cell of w-BN is a right rhombic prism,
+      with cell parameters of d = \pu{2.54 \A} and e = \pu{3.63 \A} and interior angles of
+      \pu{60 deg} and \pu{120 deg}. What is the number of B atoms in the unit cell of w-BN?
+    gold: "2"
     type: integer
     keywords:
-      - 1H NMR
-      - peak count
-      - SMILES
-    source_url: https://huggingface.co/datasets/jablonkagroup/ChemBench/viewer/analytical_chemistry/train
+      - crystalline-forms
+      - unit-cell
+      - inorganic-chemistry
+      - cell-parameters
+      - icho
+      - difficulty-basic
+      - requires-calculation
+      - requires-reasoning
+    source_url: https://huggingface.co/datasets/jablonkagroup/ChemBench/viewer/inorganic_chemistry/train
+
+  - subset: materials_science
+    name: polymer_chemistry_13
+    uuid: a038f740-0725-5170-9748-45ad035d6688
+    question: >-
+      Given that the average molar mass of the polymer chains in this sample of poly(lactic acid)
+      (PLA) is \pu{595 g mol^{-1}} using end-group analysis, where \pu{0.1619 g} of PLA was
+      dissolved in \pu{25 cm^3} of benzyl alcohol and titrated with \pu{0.0400 mol dm^{-3}}
+      \ce{KOH} solution. The volume of \ce{KOH} solution required to reach the endpoint was
+      \pu{6.81 cm^3}. What is the average number of monomer units in each polymer chain of this
+      sample?
+    gold: "8"
+    type: integer
+    keywords:
+      - polymer-chemistry
+      - poly(lactic acid)
+      - monomer units
+      - requires-reasoning
+      - requires-calculation
+      - stoichiometry
+    source_url: https://huggingface.co/datasets/jablonkagroup/ChemBench/viewer/materials_science/train

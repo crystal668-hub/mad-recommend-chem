@@ -1,0 +1,10 @@
+name: chemqa
+
+services:
+  grobid:
+    image: grobid/grobid:0.8.2.1-crf
+    container_name: chemqa-grobid
+    restart: unless-stopped
+    ports:
+      - "8070:8070"
+      

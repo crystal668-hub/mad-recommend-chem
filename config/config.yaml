@@ -19,7 +19,7 @@ llm:
     model: "deepseek/deepseek-v3.2"
     api_key: "${DEEPSEEK_API_KEY}"
     base_url: "https://openrouter.ai/api/v1"
-    temperature: 1.0
+    temperature: 0.5
     max_tokens: 2000
     embedding_model: "voyage-3-large"
     voyage_api_key: "${VOYAGE_API_KEY}"
@@ -30,7 +30,7 @@ llm:
     model: "google/gemini-3-pro-preview"
     api_key: "${GOOGLE_API_KEY}"
     base_url: "https://openrouter.ai/api/v1"
-    temperature: 1.0
+    temperature: 0.5
     max_tokens: 2000
     embedding_model: "google/gemini-embedding-001"
     emb_url: "https://openrouter.ai/api/v1/embeddings"
@@ -41,7 +41,7 @@ llm:
     model: "qwen/qwen3-max-thinking"
     api_key: "${OPENAI_API_KEY}"
     base_url: "https://openrouter.ai/api/v1"
-    temperature: 1.0
+    temperature: 0.5
     max_tokens: 2000
     embedding_api_key: "${QWEN_API_KEY}"
     embedding_model: "text-embedding-v4"
@@ -81,10 +81,12 @@ qa:
     proposer_repair_attempts: 1
     proposer_evidence_policy: "prefer_fulltext"
     grobid_url: "http://localhost:8070"
-    proposer_candidate_target: 15
+    proposer_candidate_target: 20
     proposer_rerank_top_k: 5
+
     stage_watchdog_seconds: 120.0
     max_review_cycles: 3
+
     reviewer_max_steps: 3
     reviewer_max_concurrency: 4
     reviewer_max_retrieval_actions: 1
@@ -93,6 +95,7 @@ qa:
       evidence_trace: 0
       reasoning_consistency: 0
       counterevidence: 2
+
     max_review_items_per_reviewer: 3
     max_review_items_per_step_section: 1
     stop_on_no_blocking_items: true
@@ -113,22 +116,22 @@ qa:
     preserve_page_blocks: true
 
   models:
-    router: "agent1"
-    entity_resolver: "agent1"
-    query_planner: "agent1"
-    evidence_extractor: "agent1"
-    claim_miner: "agent1"
-    methodology_reviewer: "agent1"
-    citation_reviewer: "agent1"
-    contradiction_reviewer: "agent1"
-    claim_revision: "agent1"
-    review_merge: "agent1"
-    synthesizer: "agent1"
-    react_proposer: "agent1"
-    react_reviewer_search_coverage: "agent1"
-    react_reviewer_evidence_trace: "agent1"
-    react_reviewer_reasoning_consistency: "agent1"
-    react_reviewer_counterevidence: "agent1"
+    router: "agent2"
+    entity_resolver: "agent2"
+    query_planner: "agent2"
+    evidence_extractor: "agent2"
+    claim_miner: "agent2"
+    methodology_reviewer: "agent2"
+    citation_reviewer: "agent2"
+    contradiction_reviewer: "agent2"
+    claim_revision: "agent2"
+    review_merge: "agent2"
+    synthesizer: "agent2"
+    react_proposer: "agent2"
+    react_reviewer_search_coverage: "agent2"
+    react_reviewer_evidence_trace: "agent2"
+    react_reviewer_reasoning_consistency: "agent2"
+    react_reviewer_counterevidence: "agent2"
 
   providers:
     openalex_mailto: "${OPENALEX_MAILTO}"

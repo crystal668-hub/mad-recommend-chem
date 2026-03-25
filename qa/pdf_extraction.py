@@ -210,6 +210,18 @@ class PDFExtractionPipeline:
                 attempts=attempts,
                 warnings=warnings,
             )
+        if self._should_salvage_attempt(primary_attempt):
+            warnings.append(
+                f"{paper_id}: PyMuPDF extraction contained limited garbled fragments but was retained for fallback indexing."
+            )
+            return self._finalize_success(
+                paper_id=paper_id,
+                artifact_store=artifact_store,
+                source_artifact_path=source_artifact_path,
+                attempt=primary_attempt,
+                attempts=attempts,
+                warnings=warnings,
+            )
 
         secondary_attempt: Optional[ExtractionAttempt] = None
         if self.config.secondary_backend == "docling":
@@ -509,6 +521,29 @@ class PDFExtractionPipeline:
             "reasons": reasons,
         }
 
+    def _should_salvage_attempt(self, attempt: ExtractionAttempt) -> bool:
+        if not attempt.succeeded or not attempt.fulltext:
+            return False
+        reasons = list(attempt.metrics.get("reasons") or [])
+        if reasons != ["garbled_text_detected"]:
+            return False
+        total_chars = int(attempt.metrics.get("total_chars") or 0)
+        printable_raw = attempt.metrics.get("printable_ratio")
+        repeated_line_raw = attempt.metrics.get("repeated_line_ratio")
+        quality_raw = attempt.metrics.get("quality_score")
+        printable_ratio = float(0.0 if printable_raw is None else printable_raw)
+        repeated_line_ratio = float(1.0 if repeated_line_raw is None else repeated_line_raw)
+        quality_score = float(0.0 if quality_raw is None else quality_raw)
+        if total_chars < max(self.config.min_total_chars * 5, 5000):
+            return False
+        if printable_ratio < 0.98:
+            return False
+        if repeated_line_ratio > REPEATED_LINE_RATIO_THRESHOLD:
+            return False
+        if quality_score < 0.6:
+            return False
+        return True
+
     def _build_snippets(self, *, paper_id: str, attempt: ExtractionAttempt) -> list[dict[str, Any]]:
         if len(attempt.sections) == 1 and attempt.sections[0].section_type == UNKNOWN_SECTION_TYPE and attempt.blocks:
             snippets = self._snippets_from_blocks(paper_id=paper_id, attempt=attempt)
@@ -659,7 +694,7 @@ class PDFExtractionPipeline:
                     section_type=self._section_type_for_heading(heading),
                     text=text,
                     page_start=page_start,
-                    page_end=page_end,
+                    page_end=max(page_start, page_end),
                     fulltext_char_start=start,
                     fulltext_char_end=end,
                 )
@@ -730,8 +765,8 @@ class PDFExtractionPipeline:
                     heading=heading,
                     section_type=section.section_type,
                     text=text,
-                    page_start=section.page_start,
-                    page_end=section.page_end,
+                    page_start=max(1, int(section.page_start)),
+                    page_end=max(max(1, int(section.page_start)), max(1, int(section.page_end))),
                     fulltext_char_start=start,
                     fulltext_char_end=end,
                 )
@@ -754,8 +789,8 @@ class PDFExtractionPipeline:
             "section_id": f"sec_{section.section_type}_{section.fulltext_char_start}",
             "section_type": section.section_type,
             "heading": section.heading,
-            "page_start": section.page_start,
-            "page_end": section.page_end,
+            "page_start": max(1, int(section.page_start)),
+            "page_end": max(max(1, int(section.page_start)), max(1, int(section.page_end))),
             "fulltext_char_start": section.fulltext_char_start,
             "fulltext_char_end": section.fulltext_char_end,
             "text": section.text,

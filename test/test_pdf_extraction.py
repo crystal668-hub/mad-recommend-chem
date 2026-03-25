@@ -150,6 +150,48 @@ class PDFExtractionPipelineTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    def test_process_salvages_high_quality_text_when_only_garbled_flag_is_triggered(self):
+        pipeline = PDFExtractionPipeline()
+        salvaged_attempt = _build_usable_attempt(pipeline, extractor="pymupdf")
+        salvaged_attempt.usable = False
+        salvaged_attempt.metrics = {
+            **salvaged_attempt.metrics,
+            "total_chars": 6000,
+            "quality_score": 0.65,
+            "reasons": ["garbled_text_detected"],
+        }
+        pipeline._extract_with_pymupdf = lambda pdf_bytes, ocr_applied=False: salvaged_attempt  # type: ignore[method-assign]
+
+        tmpdir = _workspace_tmpdir()
+        try:
+            result = pipeline.process(
+                paper_id="paper-2",
+                pdf_bytes=_make_pdf_bytes(["Results\nUseful extracted text."] * 3),
+                artifact_store=QAArtifactStore(base_dir=tmpdir),
+            )
+            self.assertEqual("fulltext_indexed", result.fulltext_status)
+            self.assertTrue(any("retained for fallback indexing" in warning.lower() for warning in result.warnings))
+            self.assertTrue(Path(result.fulltext_artifact_path).exists())
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_section_payload_normalizes_page_end_when_offsets_are_reversed(self):
+        pipeline = PDFExtractionPipeline()
+        payload = pipeline._section_payload(
+            ExtractedSection(
+                heading="Results",
+                section_type="results",
+                text="Useful text.",
+                page_start=7,
+                page_end=3,
+                fulltext_char_start=0,
+                fulltext_char_end=12,
+            )
+        )
+
+        self.assertEqual(7, payload["page_start"])
+        self.assertEqual(7, payload["page_end"])
+
 
 if __name__ == "__main__":
     unittest.main()

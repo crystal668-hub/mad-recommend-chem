@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from qa.artifacts import QAArtifactStore
@@ -38,6 +39,50 @@ LANE_FEATURE_TERMS: Dict[str, Sequence[str]] = {
     "frontier": ("recent", "latest", "advance"),
     "data": ("benchmark", "yield", "selectivity", "current density", "overpotential"),
     "contrarian": ("limitation", "challenge", "negative", "null", "controvers"),
+}
+METHOD_SIGNAL_TERMS: Sequence[str] = (
+    "icp",
+    "spectrom",
+    "optical emission",
+    "mass spectrom",
+    "voltammetry",
+    "chromatograph",
+    "sensor",
+    "determination",
+    "detection",
+    "quantification",
+    "quantify",
+    "assay",
+)
+RETRIEVAL_SIGNAL_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "into",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "to",
+    "using",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
 }
 
 
@@ -97,14 +142,21 @@ class RetrieverNode:
                     else:
                         self._merge_candidates(existing, normalized)
 
-        for candidate in candidates:
+        shortlist = self._shortlist_candidates_for_enrichment(
+            candidates=candidates,
+            task_spec=task_spec,
+            entity_pack=entity_pack,
+            query_plans=query_plans,
+        )
+
+        for candidate in shortlist:
             self._enrich_with_crossref(candidate=candidate, store=store)
             self._enrich_with_semantic_scholar(candidate=candidate, store=store)
             candidate.retrieval_score = self._score_candidate(candidate, task_spec, entity_pack)
 
         self.last_diagnostics = self._finalize_diagnostics()
         self.last_provider_health = self._collect_provider_health()
-        return self._select_diverse_candidates(candidates, query_plans)
+        return self._select_diverse_candidates(shortlist, query_plans)
 
     __call__ = run
 
@@ -501,9 +553,18 @@ class RetrieverNode:
         corpus = normalize_text(f"{candidate.title} {candidate.abstract or ''}").lower()
         anchor_terms = self._collect_anchor_terms(task_spec=task_spec, entity_pack=entity_pack)
         entity_hits = sum(1 for term in anchor_terms if term and term in corpus)
+        required_terms = self._required_query_terms(task_spec)
+        required_phrase_hits = sum(1 for term in required_terms if term and term in corpus)
+        should_phrase_hits = sum(1 for term in self._suggested_query_terms(task_spec) if term and term in corpus)
+        corpus_tokens = self._signal_tokens(corpus)
+        required_token_hits = sum(1 for token in self._signal_tokens(" ".join(required_terms)) if token in corpus_tokens)
+        question_token_hits = sum(
+            1 for token in self._signal_tokens(task_spec.normalized_question) if token in corpus_tokens
+        )
         question_type_hits = sum(
             1 for term in QUESTION_TYPE_MATCH_TERMS.get(task_spec.question_type, ()) if term in corpus
         )
+        method_signal_hits = sum(1 for term in METHOD_SIGNAL_TERMS if term in corpus)
         lane_feature_hits = sum(
             1
             for lane in candidate.lane_sources
@@ -517,7 +578,12 @@ class RetrieverNode:
         candidate.ranking_features.update(
             {
                 "entity_anchor_hits": entity_hits,
+                "required_phrase_hits": required_phrase_hits,
+                "required_token_hits": required_token_hits,
+                "question_token_hits": question_token_hits,
+                "should_phrase_hits": should_phrase_hits,
                 "question_type_hits": question_type_hits,
+                "method_signal_hits": method_signal_hits,
                 "time_window_hit": time_window_hit,
                 "lane_feature_hits": lane_feature_hits,
                 "abstract_available": abstract_available,
@@ -527,13 +593,46 @@ class RetrieverNode:
 
         score = (
             4.0 * min(entity_hits, 3)
+            + 3.0 * min(required_phrase_hits, 3)
+            + 0.75 * min(required_token_hits, 4)
+            + 0.75 * min(should_phrase_hits, 2)
+            + 0.5 * min(question_token_hits, 4)
             + 2.0 * min(question_type_hits, 2)
+            + 1.25 * min(method_signal_hits, 2)
             + 1.5 * time_window_hit
             + 1.0 * min(lane_feature_hits, 3)
             + 0.75 * abstract_available
             + 0.5 * doi_complete
         )
         return round(score, 4)
+
+    def _shortlist_candidates_for_enrichment(
+        self,
+        *,
+        candidates: Sequence[PaperCandidate],
+        task_spec: TaskSpec,
+        entity_pack: EntityPack,
+        query_plans: Sequence[QueryPlan],
+    ) -> List[PaperCandidate]:
+        scored_candidates: List[PaperCandidate] = []
+        for candidate in candidates:
+            candidate.retrieval_score = self._score_candidate(candidate, task_spec, entity_pack)
+            scored_candidates.append(candidate)
+
+        gated_candidates = [
+            candidate for candidate in scored_candidates if self._passes_required_term_gate(candidate, task_spec)
+        ]
+        if gated_candidates:
+            effective_candidates = gated_candidates
+        else:
+            method_signal_candidates = [
+                candidate
+                for candidate in scored_candidates
+                if int(candidate.ranking_features.get("method_signal_hits") or 0) > 0
+            ]
+            effective_candidates = method_signal_candidates or scored_candidates
+        shortlist_limit = max(self.final_top_k + max(1, len(query_plans)), self.per_lane_limit)
+        return sorted(effective_candidates, key=lambda item: item.retrieval_score, reverse=True)[:shortlist_limit]
 
     def _collect_anchor_terms(self, task_spec: TaskSpec, entity_pack: EntityPack) -> List[str]:
         terms: List[str] = []
@@ -545,6 +644,74 @@ class RetrieverNode:
             if cleaned:
                 terms.append(cleaned)
         return list(dict.fromkeys(terms))
+
+    def _required_query_terms(self, task_spec: TaskSpec) -> List[str]:
+        terms: List[str] = []
+        for term in list(task_spec.query_constraints.must_include_terms or []):
+            cleaned = normalize_text(term).lower()
+            if cleaned:
+                terms.append(cleaned)
+        return list(dict.fromkeys(terms))
+
+    def _suggested_query_terms(self, task_spec: TaskSpec) -> List[str]:
+        terms: List[str] = []
+        for term in list(task_spec.query_constraints.should_include_terms or []):
+            cleaned = normalize_text(term).lower()
+            if cleaned:
+                terms.append(cleaned)
+        return list(dict.fromkeys(terms))
+
+    def _signal_tokens(self, text: Optional[str]) -> List[str]:
+        tokens: List[str] = []
+        for token in re.findall(r"[a-z0-9][a-z0-9/+\-.]*", normalize_text(text).lower()):
+            if token in RETRIEVAL_SIGNAL_STOPWORDS:
+                continue
+            if len(token) < 3 and not any(char.isdigit() for char in token):
+                continue
+            tokens.append(token)
+        return list(dict.fromkeys(tokens))
+
+    def _passes_required_term_gate(self, candidate: PaperCandidate, task_spec: TaskSpec) -> bool:
+        required_terms = self._required_query_terms(task_spec)
+        if not required_terms:
+            return True
+
+        corpus = normalize_text(f"{candidate.title} {candidate.abstract or ''}").lower()
+        corpus_tokens = set(self._signal_tokens(corpus))
+        required_phrase_hits = int(candidate.ranking_features.get("required_phrase_hits") or 0)
+        required_token_hits = int(candidate.ranking_features.get("required_token_hits") or 0)
+        question_token_hits = int(candidate.ranking_features.get("question_token_hits") or 0)
+        should_phrase_hits = int(candidate.ranking_features.get("should_phrase_hits") or 0)
+        method_signal_hits = int(candidate.ranking_features.get("method_signal_hits") or 0)
+        required_tokens = self._signal_tokens(" ".join(required_terms))
+        should_terms = self._suggested_query_terms(task_spec)
+        normalized_question = normalize_text(task_spec.normalized_question).lower()
+        multiword_required_terms = [term for term in required_terms if len(self._signal_tokens(term)) >= 2]
+        phrase_target = 1 if len(required_terms) <= 2 else 2
+        token_target = min(max(2, len(required_tokens) // 2), 5) if required_tokens else 0
+        question_target = min(max(2, len(self._signal_tokens(task_spec.normalized_question)) // 3), 4)
+        requires_method_signal = bool(should_terms) and any(
+            token in normalized_question for token in ("method", "analytical", "technique", "instrument")
+        )
+        requires_context_phrase = bool(multiword_required_terms)
+
+        if requires_context_phrase:
+            context_phrase_hit = any(term in corpus for term in multiword_required_terms)
+            context_token_hit = any(
+                all(token in corpus_tokens for token in self._signal_tokens(term))
+                for term in multiword_required_terms
+            )
+            if not context_phrase_hit and not context_token_hit:
+                return False
+
+        if requires_method_signal and should_phrase_hits <= 0 and method_signal_hits <= 0:
+            return False
+
+        if required_phrase_hits >= phrase_target:
+            return True
+        if required_token_hits >= token_target and question_token_hits >= question_target:
+            return True
+        return False
 
     def _select_diverse_candidates(
         self,

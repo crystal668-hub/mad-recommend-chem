@@ -72,7 +72,7 @@ python -m qa.chembench_smoke
 Optional flags:
 
 - `--cases-file ./evals/chembench_smoke_cases.yaml`
-- `--case molecular_structure`
+- `--case oxidation_states`
 - `--artifact-root ./outputs/chembench_smoke/manual_run`
 - `--shadow-config <path>`
 

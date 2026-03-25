@@ -75,7 +75,7 @@ from qa.synthesis_state import AnswerSectionOutput, CitationRecord, ConfidenceRa
 logger = logging.getLogger("MAD.qa.react_reviewed")
 
 MIN_REACT_REVIEWED_PROPOSER_STEPS = 6
-PROPOSER_CANDIDATE_TARGET = 18
+PROPOSER_CANDIDATE_TARGET = 20
 PROPOSER_RERANK_TOP_K = 5
 
 PROPOSER_TOOL_NAMES = (
@@ -2192,6 +2192,7 @@ class ReactReviewedWorkspace:
         normalized_paper_id = str(paper_id or "").strip()
         paper_record, _ = self._ensure_document(
             normalized_paper_id,
+            require_indexed=True,
             artifact_store=artifact_store,
             requested_via=requested_via or "screen_papers",
             write_snapshot=write_snapshot,
