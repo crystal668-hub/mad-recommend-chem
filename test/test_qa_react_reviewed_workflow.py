@@ -22,6 +22,7 @@ from qa.nodes.query_planner import QueryPlannerExecutionError
 from qa.nodes.router import RouterExecutionError
 from qa.nodes.retriever import RetrieverNode
 from qa.paper_profiles import GrobidPaperProfileBuilder, extract_profile_xml_segments
+from qa.pdf_extraction import PDFExtractionPipeline
 from qa.react_reviewed_state import AnswerSubmission, ReviewItem, ReviewerRunStatus, SubmissionCitation, SubmissionConfidenceRating, SubmissionSection, SubmissionStepRef
 from qa.react_reviewed_workflow import (
     PROPOSER_TOOL_NAMES,
@@ -5067,6 +5068,52 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(1, retriever.calls)
         self.assertEqual([0, 1], sorted(session.budget_state.actions_used for session in sessions))
 
+    def test_search_papers_batch_records_one_budget_action_and_returns_partial_success(self):
+        class _BatchRetriever:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.last_diagnostics = []
+                self.last_provider_health = {}
+
+            def run(self, *, task_spec: TaskSpec, entity_pack: EntityPack, query_plans, artifact_store=None):
+                del task_spec, entity_pack, artifact_store
+                self.calls += 1
+                query_text = str(query_plans[0].query_text or "")
+                if "bad" in query_text:
+                    raise RuntimeError("synthetic batch search failure")
+                return [
+                    PaperCandidate(
+                        paper_id=f"paper-{self.calls}",
+                        title=f"Result for {query_text}",
+                        abstract="Pt/C improves HER activity in alkaline media.",
+                        year=2024,
+                        provider_hits=["openalex"],
+                        lane_sources=["contrarian"],
+                        retrieval_score=0.9,
+                        oa_url=f"https://example.org/{self.calls}.pdf",
+                    )
+                ]
+
+        workspace = self._make_workspace(retriever=_BatchRetriever())
+        session = self._make_session("counterevidence", 1)
+
+        payload = workspace.search_papers_batch(
+            query_texts=["good query", "bad query"],
+            lane="contrarian",
+            reason="batch test",
+            artifact_store=session.artifact_store,
+            session=session,
+            charge_budget=True,
+            requested_via="search_papers",
+            write_snapshot=False,
+        )
+
+        self.assertEqual(1, session.budget_state.actions_used)
+        self.assertEqual(1, payload["batch_summary"]["successful_query_count"])
+        self.assertEqual(1, payload["batch_summary"]["failed_query_count"])
+        self.assertEqual(1, len(payload["papers"]))
+        self.assertEqual("RuntimeError", payload["search_warnings"][0]["reason"])
+
     def test_download_document_cache_dedupes(self):
         document_acquirer = _CountingDocumentAcquirer(delay=0.2)
         workspace = self._make_workspace(document_acquirer=document_acquirer)
@@ -5105,6 +5152,68 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             raise errors[0]
 
         self.assertEqual(1, document_acquirer.calls)
+        self.assertEqual([0, 1], sorted(session.budget_state.actions_used for session in sessions))
+
+    def test_download_documents_batch_records_one_budget_action_and_returns_partial_success(self):
+        class _PartialDocumentAcquirer(_CountingDocumentAcquirer):
+            def run(self, *, candidates, artifact_store=None, parse_fulltext: bool = True):
+                candidate = candidates[0]
+                if candidate.paper_id == "paper-bad":
+                    raise RuntimeError("synthetic batch download failure")
+                return super().run(candidates=candidates, artifact_store=artifact_store, parse_fulltext=parse_fulltext)
+
+        workspace = self._make_workspace(document_acquirer=_PartialDocumentAcquirer())
+        workspace.paper_candidates["paper-good"] = _paper_candidate("paper-good", score=0.9)
+        workspace.paper_candidates["paper-bad"] = _paper_candidate("paper-bad", score=0.8)
+        session = self._make_session("counterevidence", 1)
+
+        payload = workspace.download_documents(
+            paper_ids=["paper-good", "paper-bad"],
+            artifact_store=session.artifact_store,
+            session=session,
+            charge_budget=True,
+            requested_via="download_document",
+            write_snapshot=False,
+        )
+
+        self.assertEqual(1, session.budget_state.actions_used)
+        self.assertEqual(1, payload["batch_summary"]["successful_count"])
+        self.assertEqual(1, payload["batch_summary"]["failed_count"])
+        self.assertEqual(["paper-good"], [item["paper_id"] for item in payload["documents"]])
+        self.assertEqual("paper-bad", payload["download_warnings"][0]["paper_id"])
+
+    def test_download_documents_batch_cache_dedupes_and_only_one_session_is_charged(self):
+        document_acquirer = _CountingDocumentAcquirer(delay=0.2)
+        workspace = self._make_workspace(document_acquirer=document_acquirer)
+        workspace.paper_candidates["paper-1"] = _paper_candidate("paper-1", score=0.9)
+        workspace.paper_candidates["paper-2"] = _paper_candidate("paper-2", score=0.8)
+        sessions = [self._make_session("search_coverage", 1), self._make_session("counterevidence", 1)]
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def _worker(session: ReviewerSession) -> None:
+            try:
+                barrier.wait(timeout=3)
+                workspace.download_documents(
+                    paper_ids=["paper-1", "paper-2"],
+                    artifact_store=session.artifact_store,
+                    session=session,
+                    charge_budget=True,
+                    requested_via="download_document",
+                    write_snapshot=False,
+                )
+            except BaseException as exc:  # pragma: no cover - test plumbing
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_worker, args=(session,)) for session in sessions]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise errors[0]
+
+        self.assertEqual(2, document_acquirer.calls)
         self.assertEqual([0, 1], sorted(session.budget_state.actions_used for session in sessions))
 
     def test_extract_evidence_cache_dedupes_without_double_charging_acquire(self):
@@ -5188,6 +5297,51 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual("binary_only", payload["fulltext_status"])
         self.assertEqual(0, payload["section_count"])
         self.assertTrue(str(payload["artifact_path"]).endswith(".pdf"))
+
+    def test_screen_candidate_papers_rejects_invalid_pdf_before_profile_build(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        paper_profile_builder = _FakePaperProfileBuilder()
+        workspace = self._make_workspace(
+            document_acquirer=_CountingDocumentAcquirer(),
+            paper_profile_builder=paper_profile_builder,
+        )
+        workspace.document_acquirer.pdf_extractor = PDFExtractionPipeline()
+        workspace.paper_candidates = {
+            "paper-bad": _paper_candidate("paper-bad", score=0.7),
+        }
+        invalid_pdf_path = workspace.store.write_bytes("fulltext/paper-bad.pdf", b"not-a-real-pdf")
+        workspace.paper_records = {
+            "paper-bad": PaperRecord(
+                paper_id="paper-bad",
+                title="Bad PDF candidate",
+                abstract="Bad PDF abstract.",
+                fulltext_available=True,
+                fulltext_status="binary_only",
+                fulltext_format="application/pdf",
+                fulltext_artifact_path=invalid_pdf_path,
+                source_artifact_path=invalid_pdf_path,
+            )
+        }
+
+        payload = proposer._screen_candidate_papers(
+            workspace=workspace,
+            cycle_number=1,
+            open_review_items=[],
+            paper_ids=["paper-bad"],
+            max_candidates=1,
+            fail_on_no_usable=False,
+        )
+
+        self.assertEqual("input_exhausted", payload["screen_status"])
+        self.assertEqual("pdf_input", payload["failure_domain"])
+        self.assertTrue(payload["retryable"])
+        self.assertEqual([], paper_profile_builder.calls)
+        self.assertEqual("pdf_precheck_failed", payload["ranked_candidates"][0]["profile_status"])
 
     def test_screen_candidate_papers_locks_top_k_after_profile_indexing(self):
         proposer = ReactReviewedProposerAgent(

@@ -1,0 +1,15 @@
+prompt: |
+  CURRENT PHASE: ACTION
+  Allowed tools: $tool_names.
+  Charged retrieval budget: $retrieval_budget cache-miss actions.
+  Use conclude only when the review item list is ready.
+
+  For conclude:
+  - $tool_call_rule
+  - The final step must call the conclude tool with the completed review payload.
+
+  Correct conclude example:
+  $tool_call_example_json
+
+  Common invalid outputs:
+  $invalid_examples_json

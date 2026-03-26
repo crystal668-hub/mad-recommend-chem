@@ -934,6 +934,9 @@ class _ProposerRunState:
     dropped_candidate_paper_ids: List[str] = field(default_factory=list)
     candidate_screening: List[Dict[str, Any]] = field(default_factory=list)
     candidate_profiles: List[Dict[str, Any]] = field(default_factory=list)
+    latest_screen_status: str = ""
+    latest_screen_failure_domain: str = ""
+    screening_input_exhaustions: int = 0
 
     def record_plan_queries(self, payload: Sequence[Dict[str, Any]]) -> None:
         for item in list(payload or []):
@@ -957,6 +960,10 @@ class _ProposerRunState:
 
     def record_screening(self, payload: Dict[str, Any]) -> None:
         self.screening_generation = self.acquisition_generation
+        self.latest_screen_status = str((payload or {}).get("screen_status") or "").strip()
+        self.latest_screen_failure_domain = str((payload or {}).get("failure_domain") or "").strip()
+        if self.latest_screen_status == "input_exhausted":
+            self.screening_input_exhaustions += 1
         self.locked_candidate_paper_ids = [
             str(paper_id).strip()
             for paper_id in list((payload or {}).get("locked_paper_ids") or [])
@@ -992,13 +999,19 @@ class _ProposerRunState:
             self.fulltext_available_by_paper[paper_id] = bool(item.get("fulltext_available"))
 
     def record_acquisition(self, payload: Dict[str, Any]) -> None:
-        paper_id = str((payload or {}).get("paper_id") or "").strip()
+        payload_dict = dict(payload or {})
+        document_payloads = list(payload_dict.get("documents") or [])
+        if document_payloads:
+            for item in document_payloads:
+                self.record_acquisition(dict(item or {}))
+            return
+        paper_id = str(payload_dict.get("paper_id") or "").strip()
         if not paper_id:
             return
         self.acquired_paper_ids.add(paper_id)
         self.acquisition_generation = self.search_generation
-        self.fulltext_status_by_paper[paper_id] = str((payload or {}).get("fulltext_status") or "").strip()
-        self.fulltext_available_by_paper[paper_id] = bool((payload or {}).get("fulltext_available"))
+        self.fulltext_status_by_paper[paper_id] = str(payload_dict.get("fulltext_status") or "").strip()
+        self.fulltext_available_by_paper[paper_id] = bool(payload_dict.get("fulltext_available"))
 
     def record_sections(self, paper_id: str, payload: Sequence[Dict[str, Any]]) -> None:
         normalized_paper_id = str(paper_id or "").strip()
@@ -1060,6 +1073,9 @@ class _ProposerRunState:
             "evidence_ids": sorted(self.evidence_ids),
             "candidate_screening": copy.deepcopy(self.candidate_screening),
             "candidate_profiles": copy.deepcopy(self.candidate_profiles),
+            "latest_screen_status": self.latest_screen_status,
+            "latest_screen_failure_domain": self.latest_screen_failure_domain,
+            "screening_input_exhaustions": self.screening_input_exhaustions,
             "fulltext_status_by_paper": {
                 paper_id: self.fulltext_status_by_paper.get(paper_id)
                 for paper_id in sorted(self.fulltext_status_by_paper)
@@ -1452,14 +1468,18 @@ class ReactReviewedWorkspace:
         self.current_cycle_number: int = 1
         self._ad_hoc_query_plan_ids: Dict[Tuple[str, str], str] = {}
         self._search_result_cache: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+        self._search_batch_result_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._acquire_result_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        self._acquire_batch_result_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._index_result_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._section_read_cache: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
         self._profile_result_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._extract_result_cache: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
         self._citation_context_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._search_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
+        self._search_batch_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
         self._acquire_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
+        self._acquire_batch_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
         self._index_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
         self._profile_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
         self._extract_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
@@ -1620,7 +1640,9 @@ class ReactReviewedWorkspace:
                 "provider_health": copy.deepcopy(self.provider_health),
                 "execution_warnings": list(self.execution_warnings),
                 "search_result_cache": copy.deepcopy(self._search_result_cache),
+                "search_batch_result_cache": copy.deepcopy(self._search_batch_result_cache),
                 "acquire_result_cache": copy.deepcopy(self._acquire_result_cache),
+                "acquire_batch_result_cache": copy.deepcopy(self._acquire_batch_result_cache),
                 "index_result_cache": copy.deepcopy(self._index_result_cache),
                 "section_read_cache": copy.deepcopy(self._section_read_cache),
                 "profile_result_cache": copy.deepcopy(self._profile_result_cache),
@@ -1639,14 +1661,18 @@ class ReactReviewedWorkspace:
             self.provider_health = copy.deepcopy(snapshot.get("provider_health", {}))
             self.execution_warnings = list(snapshot.get("execution_warnings", []))
             self._search_result_cache = copy.deepcopy(snapshot.get("search_result_cache", {}))
+            self._search_batch_result_cache = copy.deepcopy(snapshot.get("search_batch_result_cache", {}))
             self._acquire_result_cache = copy.deepcopy(snapshot.get("acquire_result_cache", {}))
+            self._acquire_batch_result_cache = copy.deepcopy(snapshot.get("acquire_batch_result_cache", {}))
             self._index_result_cache = copy.deepcopy(snapshot.get("index_result_cache", {}))
             self._section_read_cache = copy.deepcopy(snapshot.get("section_read_cache", {}))
             self._profile_result_cache = copy.deepcopy(snapshot.get("profile_result_cache", {}))
             self._extract_result_cache = copy.deepcopy(snapshot.get("extract_result_cache", {}))
             self._citation_context_cache = copy.deepcopy(snapshot.get("citation_context_cache", {}))
             self._search_inflight = {}
+            self._search_batch_inflight = {}
             self._acquire_inflight = {}
+            self._acquire_batch_inflight = {}
             self._index_inflight = {}
             self._profile_inflight = {}
             self._extract_inflight = {}
@@ -1661,6 +1687,49 @@ class ReactReviewedWorkspace:
 
     def _canonical_section_ids(self, section_ids: Optional[Sequence[str]]) -> Tuple[str, ...]:
         return tuple(str(item).strip() for item in (section_ids or []) if str(item).strip())
+
+    def _canonical_query_batch(
+        self,
+        *,
+        query_plan_id: Optional[str] = None,
+        query_plan_ids: Optional[Sequence[str]] = None,
+        query_text: Optional[str] = None,
+        query_texts: Optional[Sequence[str]] = None,
+    ) -> Tuple[List[str], List[str]]:
+        normalized_plan_ids: List[str] = []
+        single_plan_id = str(query_plan_id or "").strip()
+        if single_plan_id:
+            normalized_plan_ids.append(single_plan_id)
+        for item in list(query_plan_ids or []):
+            normalized_item = str(item or "").strip()
+            if normalized_item and normalized_item not in normalized_plan_ids:
+                normalized_plan_ids.append(normalized_item)
+
+        normalized_query_texts: List[str] = []
+        single_query_text = str(query_text or "").strip()
+        if single_query_text:
+            normalized_query_texts.append(single_query_text)
+        for item in list(query_texts or []):
+            normalized_item = str(item or "").strip()
+            if normalized_item and normalized_item not in normalized_query_texts:
+                normalized_query_texts.append(normalized_item)
+        return normalized_plan_ids, normalized_query_texts
+
+    def _canonical_paper_id_batch(
+        self,
+        *,
+        paper_id: Optional[str] = None,
+        paper_ids: Optional[Sequence[str]] = None,
+    ) -> List[str]:
+        normalized: List[str] = []
+        single_paper_id = str(paper_id or "").strip()
+        if single_paper_id:
+            normalized.append(single_paper_id)
+        for item in list(paper_ids or []):
+            normalized_item = str(item or "").strip()
+            if normalized_item and normalized_item not in normalized:
+                normalized.append(normalized_item)
+        return normalized
 
     def _prepare_cached_operation(
         self,
@@ -2176,6 +2245,272 @@ class ReactReviewedWorkspace:
             }
             for item in candidate_payloads
         ]
+
+    def search_papers_batch(
+        self,
+        *,
+        query_plan_id: Optional[str] = None,
+        query_plan_ids: Optional[Sequence[str]] = None,
+        query_text: Optional[str] = None,
+        query_texts: Optional[Sequence[str]] = None,
+        lane: str = "data",
+        reason: str = "",
+        artifact_store: Optional[QAArtifactStore] = None,
+        session: Optional[ReviewerSession] = None,
+        charge_budget: bool = False,
+        requested_via: Optional[str] = None,
+        write_snapshot: bool = True,
+        proposer_only_semantic: bool = False,
+    ) -> Dict[str, Any]:
+        store = artifact_store or self.store
+        normalized_plan_ids, normalized_query_texts = self._canonical_query_batch(
+            query_plan_id=query_plan_id,
+            query_plan_ids=query_plan_ids,
+            query_text=query_text,
+            query_texts=query_texts,
+        )
+        input_count = len(normalized_plan_ids) or len(normalized_query_texts) or 1
+        batch_search_timeout = _batched_search_stage_timeout(self.stage_watchdog_seconds, input_count)
+        cache_key = (
+            "batch_search",
+            tuple(normalized_plan_ids),
+            tuple(self._normalize_cache_text(item) for item in normalized_query_texts),
+            str(lane or "").strip().lower(),
+            bool(proposer_only_semantic),
+        )
+        state, payload = self._prepare_cached_operation(
+            cache=self._search_batch_result_cache,
+            inflight_map=self._search_batch_inflight,
+            cache_key=cache_key,
+            session=session,
+            charge_budget=charge_budget,
+            tool_name="search_papers",
+            requested_via=requested_via,
+        )
+        if state == "blocked":
+            raise ReviewerBudgetBlocked(payload)
+        if state == "wait":
+            result = self._wait_for_cached_operation(payload)
+            if session is not None:
+                session.record_hit(tool_name="search_papers", cache_key=cache_key, requested_via=requested_via)
+        elif state == "hit":
+            result = payload
+            if session is not None:
+                session.record_hit(tool_name="search_papers", cache_key=cache_key, requested_via=requested_via)
+        else:
+            tasks: List[Tuple[str, str]] = []
+            if normalized_plan_ids:
+                tasks = [("query_plan_id", item) for item in normalized_plan_ids]
+            elif normalized_query_texts:
+                tasks = [("query_text", item) for item in normalized_query_texts]
+            else:
+                tasks = [("query_plan_id", str(query_plan_id or "").strip())]
+
+            papers_by_input: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+            search_warnings: List[Dict[str, Any]] = []
+
+            with ThreadPoolExecutor(max_workers=max(1, min(len(tasks), 4))) as executor:
+                future_map = {
+                    executor.submit(
+                        self.search_papers,
+                        query_plan_id=value if kind == "query_plan_id" else None,
+                        query_text=value if kind == "query_text" else None,
+                        lane=lane,
+                        reason=reason,
+                        artifact_store=store,
+                        session=None,
+                        charge_budget=False,
+                        requested_via=requested_via,
+                        write_snapshot=False,
+                        stage_watchdog_seconds=batch_search_timeout,
+                        proposer_only_semantic=proposer_only_semantic,
+                    ): (kind, value)
+                    for kind, value in tasks
+                }
+                for future, task in list(future_map.items()):
+                    kind, value = task
+                    try:
+                        papers_by_input[task] = list(future.result() or [])
+                    except Exception as exc:
+                        warning = {
+                            kind: value,
+                            "reason": type(exc).__name__,
+                            "message": str(exc),
+                        }
+                        search_warnings.append(warning)
+                        papers_by_input[task] = []
+
+            deduped_payloads: List[Dict[str, Any]] = []
+            seen_paper_ids: set[str] = set()
+            for task in tasks:
+                for payload_item in list(papers_by_input.get(task) or []):
+                    if not isinstance(payload_item, dict):
+                        continue
+                    paper_id = str(payload_item.get("paper_id") or "").strip()
+                    if paper_id and paper_id in seen_paper_ids:
+                        continue
+                    if paper_id:
+                        seen_paper_ids.add(paper_id)
+                    deduped_payloads.append(payload_item)
+
+            if not deduped_payloads and search_warnings and len(search_warnings) == len(tasks):
+                error = RuntimeError(
+                    "batch search failed for all queries: "
+                    + "; ".join(str(item.get("message") or item.get("reason") or "unknown") for item in search_warnings)
+                )
+                self._finalize_cached_operation(
+                    inflight_map=self._search_batch_inflight,
+                    cache_key=cache_key,
+                    error=error,
+                )
+                raise error
+
+            result = {
+                "papers": deduped_payloads,
+                "search_warnings": search_warnings,
+                "batch_summary": {
+                    "input_query_count": len(tasks),
+                    "successful_query_count": sum(1 for task in tasks if papers_by_input.get(task)),
+                    "failed_query_count": len(search_warnings),
+                    "deduped_paper_count": len(deduped_payloads),
+                },
+            }
+            with self._state_lock:
+                self._search_batch_result_cache[cache_key] = copy.deepcopy(result)
+            self._finalize_cached_operation(
+                inflight_map=self._search_batch_inflight,
+                cache_key=cache_key,
+                result=result,
+            )
+        if write_snapshot:
+            self._write_retrieval_snapshot()
+        return result
+
+    def download_documents(
+        self,
+        *,
+        paper_id: Optional[str] = None,
+        paper_ids: Optional[Sequence[str]] = None,
+        artifact_store: Optional[QAArtifactStore] = None,
+        session: Optional[ReviewerSession] = None,
+        charge_budget: bool = False,
+        requested_via: Optional[str] = None,
+        write_snapshot: bool = True,
+        proposer_pdf_download: bool = False,
+    ) -> Dict[str, Any]:
+        store = artifact_store or self.store
+        normalized_paper_ids = self._canonical_paper_id_batch(paper_id=paper_id, paper_ids=paper_ids)
+        cache_key = (
+            "batch_download",
+            tuple(normalized_paper_ids),
+            bool(proposer_pdf_download),
+        )
+        state, payload = self._prepare_cached_operation(
+            cache=self._acquire_batch_result_cache,
+            inflight_map=self._acquire_batch_inflight,
+            cache_key=cache_key,
+            session=session,
+            charge_budget=charge_budget,
+            tool_name="download_document",
+            requested_via=requested_via,
+        )
+        if state == "blocked":
+            raise ReviewerBudgetBlocked(payload)
+        if state == "wait":
+            result = self._wait_for_cached_operation(payload)
+            if session is not None:
+                session.record_hit(tool_name="download_document", cache_key=cache_key, requested_via=requested_via)
+        elif state == "hit":
+            result = payload
+            if session is not None:
+                session.record_hit(tool_name="download_document", cache_key=cache_key, requested_via=requested_via)
+        else:
+            if not normalized_paper_ids:
+                error = ValueError("download_document requires paper_id or paper_ids.")
+                self._finalize_cached_operation(
+                    inflight_map=self._acquire_batch_inflight,
+                    cache_key=cache_key,
+                    error=error,
+                )
+                raise error
+            cached_hit_count = 0
+            with self._state_lock:
+                for normalized_paper_id in normalized_paper_ids:
+                    single_key = ("paper_id", normalized_paper_id)
+                    if (
+                        single_key in self._acquire_result_cache
+                        or (normalized_paper_id in self.paper_records and normalized_paper_id in self.section_indices)
+                    ):
+                        cached_hit_count += 1
+
+            documents_by_paper: Dict[str, Dict[str, Any]] = {}
+            download_warnings: List[Dict[str, Any]] = []
+            with ThreadPoolExecutor(max_workers=max(1, min(len(normalized_paper_ids), 4))) as executor:
+                future_map = {
+                    executor.submit(
+                        self.download_document,
+                        paper_id=current_paper_id,
+                        artifact_store=store,
+                        session=None,
+                        charge_budget=False,
+                        requested_via=requested_via,
+                        write_snapshot=False,
+                        proposer_pdf_download=proposer_pdf_download,
+                    ): current_paper_id
+                    for current_paper_id in normalized_paper_ids
+                }
+                for future, current_paper_id in list(future_map.items()):
+                    try:
+                        documents_by_paper[current_paper_id] = dict(future.result() or {})
+                    except Exception as exc:
+                        download_warnings.append(
+                            {
+                                "paper_id": current_paper_id,
+                                "status": "failure",
+                                "error_type": type(exc).__name__,
+                                "error": str(exc),
+                            }
+                        )
+
+            documents = [
+                documents_by_paper[paper_id]
+                for paper_id in normalized_paper_ids
+                if paper_id in documents_by_paper
+            ]
+            if not documents and download_warnings and len(download_warnings) == len(normalized_paper_ids):
+                error = RuntimeError(
+                    "batch download failed for all papers: "
+                    + "; ".join(
+                        f"{item.get('paper_id')}: {item.get('error') or item.get('error_type') or 'unknown'}"
+                        for item in download_warnings
+                    )
+                )
+                self._finalize_cached_operation(
+                    inflight_map=self._acquire_batch_inflight,
+                    cache_key=cache_key,
+                    error=error,
+                )
+                raise error
+            result = {
+                "documents": documents,
+                "download_warnings": download_warnings,
+                "batch_summary": {
+                    "requested_count": len(normalized_paper_ids),
+                    "successful_count": len(documents),
+                    "failed_count": len(download_warnings),
+                    "cached_hit_count": cached_hit_count,
+                },
+            }
+            with self._state_lock:
+                self._acquire_batch_result_cache[cache_key] = copy.deepcopy(result)
+            self._finalize_cached_operation(
+                inflight_map=self._acquire_batch_inflight,
+                cache_key=cache_key,
+                result=result,
+            )
+        if write_snapshot:
+            self._write_retrieval_snapshot()
+        return result
 
     def download_document(
         self,
@@ -2969,6 +3304,58 @@ class ReactReviewedProposerAgent:
             "profile_body_text": xml_segments["body_text"],
         }
 
+    def _precheck_downloaded_pdf_candidate(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        paper_id: str,
+    ) -> Dict[str, Any]:
+        paper_record = workspace.paper_records.get(str(paper_id or "").strip())
+        source_artifact_path = str(getattr(paper_record, "source_artifact_path", "") or "").strip()
+        if not source_artifact_path or not source_artifact_path.lower().endswith(".pdf") or not Path(source_artifact_path).exists():
+            return {
+                "status": "failed",
+                "reason": "missing_local_pdf_artifact",
+                "message": "Downloaded candidate does not have a readable local PDF artifact.",
+            }
+        pdf_extractor = getattr(workspace.document_acquirer, "pdf_extractor", None)
+        if pdf_extractor is None or not all(
+            hasattr(pdf_extractor, attr)
+            for attr in ("_is_true_pdf", "_extract_with_pymupdf", "_should_salvage_attempt")
+        ):
+            return {
+                "status": "skipped",
+                "reason": "precheck_backend_unavailable",
+            }
+        pdf_bytes = Path(source_artifact_path).read_bytes()
+        if not bool(pdf_extractor._is_true_pdf(pdf_bytes)):  # type: ignore[attr-defined]
+            return {
+                "status": "failed",
+                "reason": "invalid_pdf_header",
+                "message": "Downloaded content did not match a valid PDF header.",
+            }
+        attempt = pdf_extractor._extract_with_pymupdf(pdf_bytes=pdf_bytes)  # type: ignore[attr-defined]
+        if not getattr(attempt, "succeeded", False):
+            return {
+                "status": "failed",
+                "reason": "pymupdf_open_failed",
+                "message": str(getattr(attempt, "failure_reason", "") or "PyMuPDF could not open the downloaded PDF."),
+            }
+        metrics = dict(getattr(attempt, "metrics", {}) or {})
+        if getattr(attempt, "usable", False) or bool(pdf_extractor._should_salvage_attempt(attempt)):  # type: ignore[attr-defined]
+            return {
+                "status": "passed",
+                "reason": "ok",
+                "metrics": metrics,
+            }
+        failure_reasons = list(metrics.get("reasons") or []) or ["pdf_quality_gate_failed"]
+        return {
+            "status": "failed",
+            "reason": str(failure_reasons[0]),
+            "message": "PDF precheck rejected the downloaded artifact before profile generation.",
+            "metrics": metrics,
+        }
+
     def _llm_screen_candidate_papers(
         self,
         *,
@@ -3075,6 +3462,7 @@ class ReactReviewedProposerAgent:
         open_review_items: Sequence[ReviewItem],
         paper_ids: Sequence[str],
         max_candidates: int,
+        fail_on_no_usable: bool = True,
     ) -> Dict[str, Any]:
         ordered_ids: List[str] = []
         seen = set()
@@ -3092,6 +3480,24 @@ class ReactReviewedProposerAgent:
             paper_record = workspace.paper_records.get(paper_id)
             candidate = workspace.paper_candidates.get(paper_id)
             if candidate is None or paper_record is None:
+                continue
+            precheck_payload = self._precheck_downloaded_pdf_candidate(
+                workspace=workspace,
+                paper_id=paper_id,
+            )
+            if str(precheck_payload.get("status") or "").strip().lower() == "failed":
+                dropped_candidates.append(
+                    {
+                        "paper_id": paper_id,
+                        "title": candidate.title,
+                        "decision": "drop",
+                        "reason": _compact_text(precheck_payload.get("message"))
+                        or "PDF precheck rejected the downloaded artifact before profile generation.",
+                        "profile_status": "pdf_precheck_failed",
+                        "profile_xml_artifact_path": None,
+                        "pdf_precheck": copy.deepcopy(precheck_payload),
+                    }
+                )
                 continue
             profile_payload = workspace.build_paper_profile(
                 paper_id=paper_id,
@@ -3123,10 +3529,17 @@ class ReactReviewedProposerAgent:
             )
 
         if not ranked_candidates:
+            failure_domain = "pdf_input" if any(
+                str(item.get("profile_status") or "").strip().lower() == "pdf_precheck_failed"
+                for item in dropped_candidates
+            ) else "profile_infra"
             payload = {
                 "stage": "proposer_screening",
                 "cycle_number": cycle_number,
                 "message": "candidate screening could not build any usable XML paper profiles after download",
+                "screen_status": "input_exhausted" if failure_domain == "pdf_input" else "infra_failure",
+                "failure_domain": failure_domain,
+                "retryable": failure_domain == "pdf_input",
                 "ranked_candidates": dropped_candidates,
                 "paper_profiles": profile_payloads,
                 "llm_screening_used": False,
@@ -3135,13 +3548,16 @@ class ReactReviewedProposerAgent:
                 f"proposer_cycle_{cycle_number}_candidate_screening.json",
                 payload,
             )
+            if not fail_on_no_usable:
+                return payload
             self._raise_execution_failure(
                 workspace=workspace,
                 cycle_number=cycle_number,
                 stage="proposer_screening",
                 message="Candidate screening could not build any usable XML paper profiles after download.",
                 details={
-                    "reason": "no_profile_ready_candidates",
+                    "reason": "screening_input_exhausted" if failure_domain == "pdf_input" else "screening_profile_infra_failure",
+                    "failure_domain": failure_domain,
                     "requested_candidate_count": len(ordered_ids),
                 },
                 structured_output=payload,
@@ -3238,6 +3654,9 @@ class ReactReviewedProposerAgent:
                 structured_output=payload,
             )
         payload = dict(llm_payload)
+        payload.setdefault("screen_status", "ready")
+        payload.setdefault("failure_domain", "")
+        payload.setdefault("retryable", False)
         payload["paper_profiles"] = profile_payloads
         payload["ranked_candidates"] = [
             *list(payload.get("ranked_candidates") or []),
@@ -3355,91 +3774,32 @@ class ReactReviewedProposerAgent:
                 if normalized_item and normalized_item not in normalized_query_texts:
                     normalized_query_texts.append(normalized_item)
 
-            search_payloads: List[Dict[str, Any]] = []
-            seen_paper_ids: set[str] = set()
-            search_warnings: List[Dict[str, Any]] = []
-            batch_size = len(normalized_plan_ids) or len(normalized_query_texts) or 1
-            batch_search_timeout = _batched_search_stage_timeout(workspace.stage_watchdog_seconds, batch_size)
-
-            def _append_payloads(items: Sequence[Dict[str, Any]]) -> None:
-                for payload_item in list(items or []):
-                    if not isinstance(payload_item, dict):
-                        continue
-                    paper_id = str(payload_item.get("paper_id") or "").strip()
-                    if paper_id and paper_id in seen_paper_ids:
-                        continue
-                    if paper_id:
-                        seen_paper_ids.add(paper_id)
-                    search_payloads.append(payload_item)
-
-            if normalized_plan_ids:
-                for current_query_plan_id in normalized_plan_ids:
-                    try:
-                        _append_payloads(
-                            workspace.search_papers(
-                                query_plan_id=current_query_plan_id,
-                                lane=lane,
-                                reason=reason,
-                                stage_watchdog_seconds=batch_search_timeout,
-                                proposer_only_semantic=True,
-                            )
-                        )
-                    except Exception as exc:
-                        if not search_payloads:
-                            raise
-                        search_warnings.append(
-                            {
-                                "query_plan_id": current_query_plan_id,
-                                "reason": type(exc).__name__,
-                                "message": str(exc),
-                            }
-                        )
-                        break
-            elif normalized_query_texts:
-                for current_query_text in normalized_query_texts:
-                    try:
-                        _append_payloads(
-                            workspace.search_papers(
-                                query_text=current_query_text,
-                                lane=lane,
-                                reason=reason,
-                                stage_watchdog_seconds=batch_search_timeout,
-                                proposer_only_semantic=True,
-                            )
-                        )
-                    except Exception as exc:
-                        if not search_payloads:
-                            raise
-                        search_warnings.append(
-                            {
-                                "query_text": current_query_text,
-                                "reason": type(exc).__name__,
-                                "message": str(exc),
-                            }
-                        )
-                        break
-            else:
-                _append_payloads(
-                    workspace.search_papers(
-                        query_plan_id=query_plan_id,
-                        query_text=query_text,
-                        lane=lane,
-                        reason=reason,
-                        proposer_only_semantic=True,
-                    )
-                )
-
-            payload = list(search_payloads)
+            batch_payload = workspace.search_papers_batch(
+                query_plan_id=query_plan_id,
+                query_plan_ids=normalized_plan_ids,
+                query_text=query_text,
+                query_texts=normalized_query_texts,
+                lane=lane,
+                reason=reason,
+                proposer_only_semantic=True,
+            )
+            payload = list(batch_payload.get("papers") or [])
+            search_warnings = list(batch_payload.get("search_warnings") or [])
             run_state.record_search_results(payload)
             observation_payload = {
                 "count": len(payload),
                 "paper_ids": [item.get("paper_id") for item in payload[:5]],
+                "batch_summary": batch_payload.get("batch_summary"),
             }
             if search_warnings:
                 observation_payload["search_warnings"] = search_warnings
             return ToolResult(
                 observation=_json_preview(observation_payload),
-                data={"papers": payload, "search_warnings": search_warnings},
+                data={
+                    "papers": payload,
+                    "search_warnings": search_warnings,
+                    "batch_summary": batch_payload.get("batch_summary"),
+                },
             )
 
         def screen_papers(
@@ -3492,9 +3852,39 @@ class ReactReviewedProposerAgent:
                 open_review_items=open_review_items,
                 paper_ids=candidate_ids,
                 max_candidates=resolved_max_candidates,
+                fail_on_no_usable=False,
             )
             run_state.record_screening(payload)
+            if str(payload.get("failure_domain") or "").strip() == "profile_infra":
+                self._raise_execution_failure(
+                    workspace=workspace,
+                    cycle_number=cycle_number,
+                    stage="proposer_screening",
+                    message="Candidate screening failed because proposer profile infrastructure is unavailable.",
+                    details={
+                        "reason": "screening_profile_infra_failure",
+                        "failure_domain": "profile_infra",
+                    },
+                    structured_output=payload,
+                )
+            if str(payload.get("screen_status") or "").strip() == "input_exhausted":
+                payload["recovery_search_remaining"] = max(0, 2 - run_state.screening_input_exhaustions)
+                if run_state.screening_input_exhaustions > 1:
+                    self._raise_execution_failure(
+                        workspace=workspace,
+                        cycle_number=cycle_number,
+                        stage="proposer_screening",
+                        message="Candidate screening exhausted the available PDF-backed inputs after one recovery search.",
+                        details={
+                            "reason": "screening_input_exhausted",
+                            "failure_domain": "pdf_input",
+                            "recovery_attempts_used": run_state.screening_input_exhaustions - 1,
+                        },
+                        structured_output=payload,
+                    )
             observation_payload = {
+                "screen_status": payload.get("screen_status"),
+                "failure_domain": payload.get("failure_domain"),
                 "locked_candidates": [
                     {
                         "paper_id": item.get("paper_id"),
@@ -3519,16 +3909,30 @@ class ReactReviewedProposerAgent:
                 data=payload,
             )
 
-        def download_document(paper_id: str) -> ToolResult:
-            """Download and cache the selected paper PDF via Unpaywall first, then Semantic Scholar fallback."""
-            normalized_paper_id = str(paper_id or "").strip()
-            if normalized_paper_id not in run_state.searched_paper_ids:
+        def download_document(
+            paper_id: Optional[str] = None,
+            paper_ids: Optional[List[str]] = None,
+        ) -> ToolResult:
+            """Download and cache selected paper PDFs via Unpaywall first, then Semantic Scholar fallback."""
+            requested_paper_ids = workspace._canonical_paper_id_batch(paper_id=paper_id, paper_ids=paper_ids)
+            unknown_paper_ids = [
+                current_paper_id
+                for current_paper_id in requested_paper_ids
+                if current_paper_id not in run_state.searched_paper_ids
+            ]
+            if unknown_paper_ids:
                 return _policy_block(
-                    f"download_document requires a paper selected from prior search_papers results; unknown paper_id={normalized_paper_id}.",
+                    "download_document requires papers selected from prior search_papers results; "
+                    f"unknown paper_ids={unknown_paper_ids}.",
                     code="paper_not_searched",
                 )
-            payload = workspace.download_document(
-                paper_id=paper_id,
+            if not requested_paper_ids:
+                return _policy_block(
+                    "download_document requires at least one searched paper_id.",
+                    code="paper_not_searched",
+                )
+            payload = workspace.download_documents(
+                paper_ids=requested_paper_ids,
                 proposer_pdf_download=True,
             )
             run_state.record_acquisition(payload)
@@ -4498,6 +4902,30 @@ class ReactReviewedProposerAgent:
         error: ReactReviewedStructuredOutputError,
         trajectory: Optional[ReActTrajectory],
     ) -> None:
+        structured_output = error.structured_output if isinstance(error.structured_output, dict) else {}
+        failure_domain = str(structured_output.get("failure_domain") or "").strip()
+        screen_status = str(structured_output.get("screen_status") or "").strip()
+        if failure_domain in {"pdf_input", "profile_infra"} or screen_status in {"input_exhausted", "infra_failure"}:
+            failure_reason = "screening_input_exhausted" if failure_domain == "pdf_input" else "screening_profile_infra_failure"
+            message = (
+                "Proposer exhausted PDF-backed screening inputs before extracting current-cycle evidence anchors."
+                if failure_domain == "pdf_input"
+                else "Proposer could not build screening profiles because the profile infrastructure was unavailable."
+            )
+            self._raise_execution_failure(
+                workspace=workspace,
+                cycle_number=cycle_number,
+                stage="proposer_screening",
+                message=message,
+                details={
+                    "reason": failure_reason,
+                    "failure_domain": failure_domain or "unknown",
+                    "upstream_error": str(error),
+                },
+                response_content=error.response_content,
+                structured_output=error.structured_output,
+                trajectory=trajectory,
+            )
         self._raise_execution_failure(
             workspace=workspace,
             cycle_number=cycle_number,
@@ -4842,51 +5270,45 @@ class ReactReviewedProposerAgent:
         )
 
         search_plan_ids = [item["query_plan_id"] for item in planned_queries[:2]]
-        search_results: List[Dict[str, Any]] = []
-        search_tool_calls: List[ToolCallRecord] = []
-        for query_plan_id in search_plan_ids:
-            result = workspace.search_papers(
-                query_plan_id=query_plan_id,
-                reason="deterministic proposer",
-                proposer_only_semantic=True,
+        batch_search_result = workspace.search_papers_batch(
+            query_plan_ids=search_plan_ids,
+            reason="deterministic proposer",
+            proposer_only_semantic=True,
+        )
+        search_results = list(batch_search_result.get("papers") or [])
+        search_tool_calls: List[ToolCallRecord] = [
+            ToolCallRecord(
+                tool_name="search_papers",
+                tool_call_id=f"tc_{uuid.uuid4().hex[:8]}",
+                tool_args={"query_plan_ids": search_plan_ids, "reason": "deterministic proposer"},
+                observation=_json_preview(batch_search_result),
+                observation_data=batch_search_result,
             )
-            search_results.extend(result)
-            search_tool_calls.append(
-                ToolCallRecord(
-                    tool_name="search_papers",
-                    tool_call_id=f"tc_{uuid.uuid4().hex[:8]}",
-                    tool_args={"query_plan_id": query_plan_id, "reason": "deterministic proposer"},
-                    observation=_json_preview(result),
-                    observation_data=result,
-                )
-            )
+        ]
         search_step = self._add_tool_step(
             trajectory=trajectory,
             thought="Search the highest-value planned lanes before forming a submission.",
             tool_calls=search_tool_calls,
         )
 
-        downloaded_payloads: List[Dict[str, Any]] = []
-        download_tool_calls: List[ToolCallRecord] = []
         candidate_paper_ids = _merge_unique_text(
             [],
             [item.get("paper_id") for item in search_results if item.get("paper_id")],
         )
-        for paper_id in candidate_paper_ids:
-            payload = workspace.download_document(
-                paper_id=str(paper_id),
-                proposer_pdf_download=True,
+        batch_download_result = workspace.download_documents(
+            paper_ids=candidate_paper_ids,
+            proposer_pdf_download=True,
+        )
+        downloaded_payloads = list(batch_download_result.get("documents") or [])
+        download_tool_calls: List[ToolCallRecord] = [
+            ToolCallRecord(
+                tool_name="download_document",
+                tool_call_id=f"tc_{uuid.uuid4().hex[:8]}",
+                tool_args={"paper_ids": candidate_paper_ids},
+                observation=_json_preview(batch_download_result),
+                observation_data=batch_download_result,
             )
-            downloaded_payloads.append(payload)
-            download_tool_calls.append(
-                ToolCallRecord(
-                    tool_name="download_document",
-                    tool_call_id=f"tc_{uuid.uuid4().hex[:8]}",
-                    tool_args={"paper_id": paper_id},
-                    observation=_json_preview(payload),
-                    observation_data=payload,
-                )
-            )
+        ]
         download_step = self._add_tool_step(
             trajectory=trajectory,
             thought="Download the retrieved OA papers before profile-based reranking.",
@@ -5520,104 +5942,31 @@ class ReactReviewedReviewerAgent:
             reason: str = "",
         ) -> ToolResult:
             """Search external literature providers within reviewer role permissions."""
-            normalized_plan_ids: List[str] = []
-            for item in list(query_plan_ids or []):
-                normalized_item = str(item or "").strip()
-                if normalized_item and normalized_item not in normalized_plan_ids:
-                    normalized_plan_ids.append(normalized_item)
-            single_plan_id = str(query_plan_id or "").strip()
-            if single_plan_id and single_plan_id not in normalized_plan_ids:
-                normalized_plan_ids.insert(0, single_plan_id)
-
-            normalized_query_texts: List[str] = []
-            single_query_text = str(query_text or "").strip()
-            if single_query_text:
-                normalized_query_texts.append(single_query_text)
-            for item in list(query_texts or []):
-                normalized_item = str(item or "").strip()
-                if normalized_item and normalized_item not in normalized_query_texts:
-                    normalized_query_texts.append(normalized_item)
-
-            def _run_batch_search() -> List[Dict[str, Any]]:
-                payloads: List[Dict[str, Any]] = []
-                seen_paper_ids: set[str] = set()
-                batch_size = len(normalized_plan_ids) or len(normalized_query_texts) or 1
-                batch_search_timeout = _batched_search_stage_timeout(workspace.stage_watchdog_seconds, batch_size)
-
-                def _append_payloads(items: Sequence[Dict[str, Any]]) -> None:
-                    for payload_item in list(items or []):
-                        if not isinstance(payload_item, dict):
-                            continue
-                        paper_id = str(payload_item.get("paper_id") or "").strip()
-                        if paper_id and paper_id in seen_paper_ids:
-                            continue
-                        if paper_id:
-                            seen_paper_ids.add(paper_id)
-                        payloads.append(payload_item)
-
-                if normalized_plan_ids:
-                    for current_query_plan_id in normalized_plan_ids:
-                        try:
-                            _append_payloads(
-                                workspace.search_papers(
-                                    query_plan_id=current_query_plan_id,
-                                    lane=lane,
-                                    reason=reason,
-                                    artifact_store=session.artifact_store,
-                                    session=session,
-                                    charge_budget=True,
-                                    requested_via="search_papers",
-                                    write_snapshot=False,
-                                    stage_watchdog_seconds=batch_search_timeout,
-                                )
-                            )
-                        except Exception:
-                            if not payloads:
-                                raise
-                            break
-                elif normalized_query_texts:
-                    for current_query_text in normalized_query_texts:
-                        try:
-                            _append_payloads(
-                                workspace.search_papers(
-                                    query_text=current_query_text,
-                                    lane=lane,
-                                    reason=reason,
-                                    artifact_store=session.artifact_store,
-                                    session=session,
-                                    charge_budget=True,
-                                    requested_via="search_papers",
-                                    write_snapshot=False,
-                                    stage_watchdog_seconds=batch_search_timeout,
-                                )
-                            )
-                        except Exception:
-                            if not payloads:
-                                raise
-                            break
-                else:
-                    _append_payloads(
-                        workspace.search_papers(
-                            query_plan_id=query_plan_id,
-                            query_text=query_text,
-                            lane=lane,
-                            reason=reason,
-                            artifact_store=session.artifact_store,
-                            session=session,
-                            charge_budget=True,
-                            requested_via="search_papers",
-                            write_snapshot=False,
-                        )
-                    )
-                return payloads
-
-            return _budget_safe(_run_batch_search)
-
-        def download_document(paper_id: str) -> ToolResult:
-            """Download a paper artifact within reviewer budget rules."""
             return _budget_safe(
-                lambda: workspace.download_document(
+                lambda: workspace.search_papers_batch(
+                    query_plan_id=query_plan_id,
+                    query_plan_ids=query_plan_ids,
+                    query_text=query_text,
+                    query_texts=query_texts,
+                    lane=lane,
+                    reason=reason,
+                    artifact_store=session.artifact_store,
+                    session=session,
+                    charge_budget=True,
+                    requested_via="search_papers",
+                    write_snapshot=False,
+                )
+            )
+
+        def download_document(
+            paper_id: Optional[str] = None,
+            paper_ids: Optional[List[str]] = None,
+        ) -> ToolResult:
+            """Download paper artifacts within reviewer budget rules."""
+            return _budget_safe(
+                lambda: workspace.download_documents(
                     paper_id=paper_id,
+                    paper_ids=paper_ids,
                     artifact_store=session.artifact_store,
                     session=session,
                     charge_budget=True,

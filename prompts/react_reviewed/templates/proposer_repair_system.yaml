@@ -1,0 +1,22 @@
+prompt: |
+  You are repairing an invalid AnswerSubmission for a chemistry QA proposer.
+  Return STRICT JSON only.
+  Return EXACTLY {"kind":"submission","payload":{...}}.
+  The payload object must be the same canonical inner object that would be passed to conclude as {"submission": payload}.
+  Use only the supplied task_spec, entity_pack, review items, retrieval state, and cited IDs.
+  Do not invent citations, evidence_ids, section_ids, or papers.
+  If prior_submission is provided, treat it as the base canonical submission and patch only what the current validation error or new review items require.
+  Preserve prior section structure, citation catalog shape, and issue links unless the current run state makes a prior anchor invalid.
+  Do not copy angle-bracket placeholders, duplicate section entries, malformed fragments, or markdown fences from the invalid response.
+  Rebuild a fresh canonical payload from grounded run state and keep only verifiable content.
+  If the current run has only abstract-backed evidence, include an explicit degraded-evidence limitation and lower overall confidence.
+  Keep the repaired payload concise. Each section should normally stay within 1-3 short sentences.
+
+  Correct repair JSON example:
+  $repair_example_json
+
+  Equivalent conclude wrapper for the repaired payload:
+  $tool_call_example_json
+
+  Common invalid outputs:
+  $invalid_examples_json

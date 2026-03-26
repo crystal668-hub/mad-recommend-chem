@@ -67,7 +67,7 @@ def build_reviewer_thought_prompt() -> str:
 
 def build_proposer_system_prompt(*, conclude_contract: Dict[str, Any]) -> str:
     return render_template(
-        "proposer_system.txt",
+        "proposer_system.yaml",
         tool_call_rule=str(conclude_contract.get("tool_call_rule") or ""),
         conclude_contract_json=json_block(conclude_contract),
         tool_call_example_json=json_block(conclude_contract.get("tool_call_example") or {}),
@@ -77,7 +77,7 @@ def build_proposer_system_prompt(*, conclude_contract: Dict[str, Any]) -> str:
 
 def build_proposer_action_prompt(*, tool_names: Sequence[str], retrieval_tools: Sequence[str], conclude_contract: Dict[str, Any]) -> str:
     return render_template(
-        "proposer_action.txt",
+        "proposer_action.yaml",
         tool_names=", ".join(tool_names),
         retrieval_tools=", ".join(retrieval_tools),
         tool_call_rule=str(conclude_contract.get("tool_call_rule") or ""),
@@ -94,7 +94,7 @@ def build_reviewer_system_prompt(
     conclude_contract: Dict[str, Any],
 ) -> str:
     return render_template(
-        "reviewer_system.txt",
+        "reviewer_system.yaml",
         reviewer_role=reviewer_role,
         role_note=role_note,
         max_retrieval_actions=str(max_retrieval_actions),
@@ -112,7 +112,7 @@ def build_reviewer_action_prompt(
     conclude_contract: Dict[str, Any],
 ) -> str:
     return render_template(
-        "reviewer_action.txt",
+        "reviewer_action.yaml",
         tool_names=", ".join(tool_names),
         retrieval_budget=str(retrieval_budget),
         tool_call_rule=str(conclude_contract.get("tool_call_rule") or ""),
@@ -136,7 +136,7 @@ def build_screening_system_prompt(*, max_candidates: int) -> str:
         "```json\n{\"locked_paper_ids\": [\"paper-1\"]}\n```",
     ]
     return render_template(
-        "screening_system.txt",
+        "screening_system.yaml",
         max_candidates=str(max_candidates),
         screening_example_json=json_block(screening_example),
         invalid_examples_json=json_block(invalid_examples),
@@ -145,7 +145,7 @@ def build_screening_system_prompt(*, max_candidates: int) -> str:
 
 def build_proposer_repair_system_prompt(*, conclude_contract: Dict[str, Any]) -> str:
     return render_template(
-        "proposer_repair_system.txt",
+        "proposer_repair_system.yaml",
         repair_example_json=json_block(conclude_contract.get("repair_json_example") or {}),
         tool_call_example_json=json_block(conclude_contract.get("tool_call_example") or {}),
         invalid_examples_json=json_block(conclude_contract.get("invalid_examples") or []),
@@ -154,7 +154,7 @@ def build_proposer_repair_system_prompt(*, conclude_contract: Dict[str, Any]) ->
 
 def build_reviewer_repair_system_prompt(*, conclude_contract: Dict[str, Any]) -> str:
     return render_template(
-        "reviewer_repair_system.txt",
+        "reviewer_repair_system.yaml",
         repair_example_json=json_block(conclude_contract.get("repair_json_example") or {}),
         tool_call_example_json=json_block(conclude_contract.get("tool_call_example") or {}),
         invalid_examples_json=json_block(conclude_contract.get("invalid_examples") or []),

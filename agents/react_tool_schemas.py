@@ -68,7 +68,14 @@ class ReviewerSearchPapersToolInput(SearchPapersToolInput):
 
 
 class DownloadDocumentToolInput(ToolArgsModel):
-    paper_id: StrictStr = Field(description="Stable paper identifier from search_papers.")
+    paper_id: Optional[StrictStr] = Field(
+        default=None,
+        description="Optional stable paper identifier from search_papers.",
+    )
+    paper_ids: List[StrictStr] = Field(
+        default_factory=list,
+        description="Optional stable paper identifiers to download in one batch call.",
+    )
 
 
 class ParseDocumentToolInput(ToolArgsModel):

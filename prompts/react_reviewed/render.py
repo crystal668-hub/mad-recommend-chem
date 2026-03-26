@@ -6,13 +6,29 @@ from pathlib import Path
 from string import Template
 from typing import Any
 
+import yaml
+
 
 _TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
 
 @lru_cache(maxsize=None)
 def load_template(name: str) -> str:
-    return (_TEMPLATE_DIR / name).read_text(encoding="utf-8")
+    path = _TEMPLATE_DIR / name
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ValueError(f"React-reviewed prompt template {name!r} is not valid YAML.") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"React-reviewed prompt template {name!r} must be a YAML mapping with a 'prompt' field.")
+
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str):
+        raise ValueError(f"React-reviewed prompt template {name!r} must define 'prompt' as a string.")
+    if not prompt.strip():
+        raise ValueError(f"React-reviewed prompt template {name!r} must define a non-empty 'prompt' string.")
+    return prompt
 
 
 def render_template(name: str, **values: str) -> str:
