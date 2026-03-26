@@ -1,38 +1,52 @@
 from __future__ import annotations
 
-import re
+import copy
+import subprocess
+import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
-from urllib.error import URLError
-from urllib.request import urlopen
+from typing import Any, Callable, Dict, Optional
+
+import requests
 
 from qa.artifacts import QAArtifactStore
 from qa.retrieval_state import PaperProfile, PaperRecord
-
-
-SECTION_HEADING_PATTERN = re.compile(
-    r"(?mi)^(?:\d+(?:\.\d+)*\s+)?(abstract|introduction|background|materials?\s+and\s+methods|methods?|experimental|results?|discussion|conclusions?|limitations?)\s*$"
-)
-METRIC_PATTERN = re.compile(
-    r"\b(?:overpotential|tafel|faradaic efficiency|current density|exchange current|yield|selectivity|stability|durability)\b",
-    re.I,
-)
-ENTITY_PATTERN = re.compile(r"\b(?:Pt/C|Pt|NiMo|Ru|IrO2|CO2RR|HER|OER|ORR|KOH|NaOH|electrolyte)\b", re.I)
 
 
 def _compact_text(value: Any) -> str:
     return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split()).strip()
 
 
-def _lazy_grobid_loader_imports():
-    try:
-        from langchain_community.document_loaders.generic import GenericLoader
-        from langchain_community.document_loaders.parsers import GrobidParser
-    except Exception as exc:  # pragma: no cover - exercised through integration environments
-        raise RuntimeError(
-            "GROBID profile extraction requires langchain-community with GenericLoader and GrobidParser."
-        ) from exc
-    return GenericLoader, GrobidParser
+def _tei_namespace(tag: str) -> str:
+    if tag.startswith("{") and "}" in tag:
+        return tag[1:].split("}", 1)[0]
+    return ""
+
+
+def _qualified(tag: str, namespace: str) -> str:
+    if namespace:
+        return f"{{{namespace}}}{tag}"
+    return tag
+
+
+def extract_profile_xml_segments(
+    profile_xml_artifact_path: str,
+    *,
+    max_header_chars: int = 4000,
+    max_body_chars: int = 12000,
+) -> Dict[str, str]:
+    xml_text = Path(profile_xml_artifact_path).read_text(encoding="utf-8")
+    root = ET.fromstring(xml_text)
+    namespace = _tei_namespace(root.tag)
+    header = root.find(_qualified("teiHeader", namespace))
+    text_node = root.find(_qualified("text", namespace))
+    body = text_node.find(_qualified("body", namespace)) if text_node is not None else None
+    header_text = _compact_text(" ".join(header.itertext()))[: max(200, int(max_header_chars or 4000))] if header is not None else ""
+    body_text = _compact_text(" ".join(body.itertext()))[: max(500, int(max_body_chars or 12000))] if body is not None else ""
+    return {
+        "header_text": header_text,
+        "body_text": body_text,
+    }
 
 
 class GrobidPaperProfileBuilder:
@@ -40,54 +54,58 @@ class GrobidPaperProfileBuilder:
         self,
         *,
         grobid_url: str = "http://localhost:8070",
+        tei_xml_factory: Optional[Callable[[Path], Any]] = None,
         loader_factory: Optional[Callable[[Path], Any]] = None,
-        max_summary_chars: int = 1200,
+        request_post: Optional[Callable[..., Any]] = None,
+        request_get: Optional[Callable[..., Any]] = None,
+        timeout_seconds: float = 45.0,
+        preflight_enabled: bool = True,
+        startup_enabled: bool = False,
+        startup_script: Optional[str] = None,
+        startup_timeout_seconds: float = 180.0,
+        startup_wait_timeout_seconds: float = 120.0,
+        startup_poll_interval_seconds: float = 2.0,
+        command_runner: Optional[Callable[..., Any]] = None,
     ) -> None:
         self.grobid_url = str(grobid_url or "http://localhost:8070").strip() or "http://localhost:8070"
-        self.loader_factory = loader_factory
-        self.max_summary_chars = max(200, int(max_summary_chars or 1200))
+        self.tei_xml_factory = tei_xml_factory or loader_factory
+        self.request_post = request_post or requests.post
+        self.request_get = request_get or requests.get
+        self.timeout_seconds = max(1.0, float(timeout_seconds or 45.0))
+        self.preflight_enabled = bool(preflight_enabled)
+        self.startup_enabled = bool(startup_enabled)
+        self.startup_script = str(startup_script or "").strip() or str(
+            Path(__file__).resolve().parent.parent / "scripts" / "grobid-up.sh"
+        )
+        self.startup_timeout_seconds = max(1.0, float(startup_timeout_seconds or 180.0))
+        self.startup_wait_timeout_seconds = max(1.0, float(startup_wait_timeout_seconds or 120.0))
+        self.startup_poll_interval_seconds = max(0.1, float(startup_poll_interval_seconds or 2.0))
+        self.command_runner = command_runner or subprocess.run
+        self.last_preflight_payload: Dict[str, Any] = {}
 
     def build(self, *, paper_record: PaperRecord, artifact_store: Optional[QAArtifactStore] = None) -> PaperProfile:
         store = artifact_store or QAArtifactStore()
         source_pdf_path = self._resolve_local_pdf_artifact_path(paper_record)
-        local_text_path = self._resolve_local_text_artifact_path(paper_record)
-        grobid_error: Optional[Exception] = None
-        if source_pdf_path is not None:
-            try:
-                grobid_profile = self._build_from_grobid(
-                    paper_record=paper_record,
-                    source_path=source_pdf_path,
-                    artifact_store=store,
-                )
-                if local_text_path is None:
-                    return grobid_profile
-                local_profile = self._build_from_local_text(
-                    paper_record=paper_record,
-                    text_path=local_text_path,
-                    artifact_store=store,
-                )
-                return self._merge_profiles(
-                    primary=grobid_profile,
-                    supplement=local_profile,
-                    artifact_store=store,
-                )
-            except Exception as exc:
-                grobid_error = exc
+        if source_pdf_path is None:
+            raise ValueError(f"paper_id={paper_record.paper_id} does not have a readable PDF artifact for GROBID parsing.")
 
-        if local_text_path is not None:
-            return self._build_from_local_text(
-                paper_record=paper_record,
-                text_path=local_text_path,
-                artifact_store=store,
-            )
-
-        if grobid_error is not None:
-            raise grobid_error
-
-        source_artifact_path = str(paper_record.source_artifact_path or "").strip()
-        if not source_artifact_path:
-            raise ValueError(f"paper_id={paper_record.paper_id} has no source_artifact_path for GROBID parsing.")
-        raise ValueError(f"paper_id={paper_record.paper_id} does not have a PDF source artifact for GROBID parsing.")
+        self._assert_grobid_available()
+        tei_xml = self._generate_tei_xml(source_pdf_path)
+        clipped_xml = self._clip_tei_xml(tei_xml=tei_xml, paper_id=paper_record.paper_id)
+        profile_xml_artifact_path = store.write_text(
+            f"proposer_profiles/{paper_record.paper_id}.profile.xml",
+            clipped_xml,
+        )
+        return PaperProfile(
+            paper_id=paper_record.paper_id,
+            title=paper_record.title,
+            doi=paper_record.doi,
+            year=paper_record.year,
+            venue=paper_record.venue,
+            source_artifact_path=str(source_pdf_path),
+            profile_status="ready",
+            profile_xml_artifact_path=profile_xml_artifact_path,
+        )
 
     def _resolve_local_pdf_artifact_path(self, paper_record: PaperRecord) -> Optional[Path]:
         candidates = [
@@ -98,370 +116,180 @@ class GrobidPaperProfileBuilder:
             if not candidate_path:
                 continue
             path = Path(candidate_path)
-            if not path.exists():
-                continue
-            if path.suffix.lower() == ".pdf":
+            if path.exists() and path.suffix.lower() == ".pdf":
                 return path
         return None
-
-    def _build_from_grobid(
-        self,
-        *,
-        paper_record: PaperRecord,
-        source_path: Path,
-        artifact_store: QAArtifactStore,
-    ) -> PaperProfile:
-        self._assert_grobid_available()
-        loader = self._build_loader(source_path)
-        documents = list(loader.load() or [])
-        if not documents:
-            raise ValueError(f"paper_id={paper_record.paper_id} produced no GROBID documents.")
-
-        raw_payload = []
-        for index, document in enumerate(documents):
-            raw_payload.append(
-                {
-                    "index": index,
-                    "page_content": getattr(document, "page_content", ""),
-                    "metadata": dict(getattr(document, "metadata", {}) or {}),
-                }
-            )
-        return self._build_profile_from_payload(
-            paper_record=paper_record,
-            raw_payload=raw_payload,
-            artifact_store=artifact_store,
-            parser_name="langchain_community.GenericLoader+GrobidParser",
-            raw_artifact_name=f"proposer_profiles/{paper_record.paper_id}.grobid_raw.json",
-        )
-
-    def _resolve_local_text_artifact_path(self, paper_record: PaperRecord) -> Optional[Path]:
-        candidates = [
-            str(paper_record.fulltext_artifact_path or "").strip(),
-            str(paper_record.source_artifact_path or "").strip(),
-        ]
-        for candidate_path in candidates:
-            if not candidate_path:
-                continue
-            path = Path(candidate_path)
-            if not path.exists():
-                continue
-            if path.suffix.lower() in {".txt", ".md", ".text"}:
-                return path
-        return None
-
-    def _build_from_local_text(
-        self,
-        *,
-        paper_record: PaperRecord,
-        text_path: Path,
-        artifact_store: QAArtifactStore,
-    ) -> PaperProfile:
-        combined_text = text_path.read_text(encoding="utf-8", errors="ignore").strip()
-        if not combined_text:
-            raise ValueError(f"paper_id={paper_record.paper_id} produced no usable indexed full-text.")
-        raw_payload = [
-            {
-                "index": 0,
-                "page_content": combined_text,
-                "metadata": {
-                    "source_path": str(text_path),
-                    "source_kind": "local_fulltext_text",
-                },
-            }
-        ]
-        return self._build_profile_from_payload(
-            paper_record=paper_record,
-            raw_payload=raw_payload,
-            artifact_store=artifact_store,
-            parser_name="local_fulltext_text",
-            raw_artifact_name=f"proposer_profiles/{paper_record.paper_id}.local_raw.json",
-        )
-
-    def _merge_profiles(
-        self,
-        *,
-        primary: PaperProfile,
-        supplement: PaperProfile,
-        artifact_store: QAArtifactStore,
-    ) -> PaperProfile:
-        merged_section_headings = self._merge_text_lists(primary.section_headings, supplement.section_headings)
-        merged_entities = self._merge_text_lists(primary.materials_or_entities, supplement.materials_or_entities)
-        merged_metrics = self._merge_text_lists(primary.reported_metrics, supplement.reported_metrics)
-        merged_evidence_sections = self._merge_text_lists(
-            primary.evidence_rich_sections,
-            supplement.evidence_rich_sections,
-        ) or self._evidence_rich_sections(merged_section_headings)
-        merged_methods = self._merge_methods(primary=primary, supplement=supplement)
-        merged_summary = self._prefer_text(primary.abstract_or_summary, supplement.abstract_or_summary)
-        merged_problem = self._prefer_text(primary.problem_or_task, supplement.problem_or_task)
-        merged_limitations = self._profile_limitations(merged_section_headings, merged_methods, merged_metrics)
-        merged_parser_name = f"{primary.parser_name}+{supplement.parser_name}"
-        merged_profile = primary.model_copy(
-            update={
-                "parser_name": merged_parser_name,
-                "abstract_or_summary": merged_summary,
-                "section_headings": merged_section_headings,
-                "problem_or_task": merged_problem,
-                "materials_or_entities": merged_entities,
-                "methods_or_experimental_setup": merged_methods,
-                "reported_metrics": merged_metrics,
-                "evidence_rich_sections": merged_evidence_sections,
-                "citation_readiness_summary": self._citation_readiness_summary(
-                    merged_section_headings,
-                    merged_metrics,
-                    merged_evidence_sections,
-                ),
-                "limitations": merged_limitations,
-            }
-        )
-        parser_artifact_path = artifact_store.write_json(
-            f"proposer_profiles/{primary.paper_id}.profile.json",
-            merged_profile.model_dump(exclude_none=True),
-        )
-        return merged_profile.model_copy(update={"parser_artifact_path": parser_artifact_path})
-
-    def _prefer_text(self, primary_value: Optional[str], supplement_value: Optional[str]) -> Optional[str]:
-        primary_text = _compact_text(primary_value)
-        if primary_text:
-            return primary_text
-        supplement_text = _compact_text(supplement_value)
-        return supplement_text or None
-
-    def _merge_text_lists(self, primary_values: Sequence[str], supplement_values: Sequence[str]) -> List[str]:
-        merged: List[str] = []
-        seen = set()
-        for value in [*list(primary_values or []), *list(supplement_values or [])]:
-            cleaned = _compact_text(value)
-            if not cleaned:
-                continue
-            normalized = cleaned.lower()
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            merged.append(cleaned)
-        return merged
-
-    def _merge_methods(self, *, primary: PaperProfile, supplement: PaperProfile) -> Optional[str]:
-        primary_has_method_heading = any(
-            term in heading.lower()
-            for heading in list(primary.section_headings or [])
-            for term in ("method", "experimental", "materials and methods")
-        )
-        if primary_has_method_heading:
-            return self._prefer_text(primary.methods_or_experimental_setup, supplement.methods_or_experimental_setup)
-        return self._prefer_text(supplement.methods_or_experimental_setup, primary.methods_or_experimental_setup)
 
     def _assert_grobid_available(self) -> None:
-        if self.loader_factory is not None:
+        if self.tei_xml_factory is not None:
             return
-        grobid_health_url = f"{self.grobid_url.rstrip('/')}/api/isalive"
-        try:
-            with urlopen(grobid_health_url, timeout=2.0) as response:
-                if getattr(response, "status", 200) >= 500:
-                    raise RuntimeError(f"GROBID health check returned HTTP {response.status}.")
-        except (URLError, TimeoutError, RuntimeError) as exc:
+        probe = self._probe_health(timeout_seconds=2.0)
+        if probe.get("available"):
+            return
+        raise RuntimeError(
+            f"GROBID server unavailable at {self.grobid_url}; cannot build proposer XML profiles."
+        )
+
+    def ensure_service_available(self) -> Dict[str, Any]:
+        if self.tei_xml_factory is not None or not self.preflight_enabled:
+            payload = {
+                "status": "skipped",
+                "grobid_url": self.grobid_url,
+                "startup_attempted": False,
+                "reason": "preflight disabled or local TEI factory in use",
+            }
+            self.last_preflight_payload = dict(payload)
+            return payload
+
+        initial_probe = self._probe_health(timeout_seconds=2.0)
+        if initial_probe.get("available"):
+            payload = {
+                "status": "healthy",
+                "grobid_url": self.grobid_url,
+                "startup_attempted": False,
+                "health_check": initial_probe,
+            }
+            self.last_preflight_payload = dict(payload)
+            return payload
+
+        payload: Dict[str, Any] = {
+            "status": "unavailable",
+            "grobid_url": self.grobid_url,
+            "startup_attempted": False,
+            "health_check": initial_probe,
+            "startup_enabled": self.startup_enabled,
+            "startup_script": self.startup_script,
+        }
+        self.last_preflight_payload = dict(payload)
+        if not self.startup_enabled:
             raise RuntimeError(
-                f"GROBID server unavailable at {self.grobid_url}; cannot parse PDF-only paper profiles."
-            ) from exc
+                f"GROBID server unavailable at {self.grobid_url}; preflight failed before react_reviewed execution."
+            )
 
-    def _build_profile_from_payload(
-        self,
-        *,
-        paper_record: PaperRecord,
-        raw_payload: Sequence[Dict[str, Any]],
-        artifact_store: QAArtifactStore,
-        parser_name: str,
-        raw_artifact_name: str,
-    ) -> PaperProfile:
-        text_fragments = [
-            str(item.get("page_content") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-            for item in raw_payload
-            if str(item.get("page_content") or "").strip()
-        ]
-        combined_text = "\n\n".join(fragment for fragment in text_fragments if fragment).strip()
-        if not combined_text:
-            raise ValueError(f"paper_id={paper_record.paper_id} produced no usable parsed text.")
+        startup_result = self._run_startup_script()
+        deadline = time.perf_counter() + self.startup_wait_timeout_seconds
+        final_probe = initial_probe
+        while time.perf_counter() < deadline:
+            final_probe = self._probe_health(timeout_seconds=2.0)
+            if final_probe.get("available"):
+                payload = {
+                    "status": "healthy",
+                    "grobid_url": self.grobid_url,
+                    "startup_attempted": True,
+                    "health_check": final_probe,
+                    "startup_enabled": self.startup_enabled,
+                    "startup_script": self.startup_script,
+                    "startup_result": startup_result,
+                }
+                self.last_preflight_payload = dict(payload)
+                return payload
+            time.sleep(self.startup_poll_interval_seconds)
 
-        raw_artifact_path = artifact_store.write_json(raw_artifact_name, list(raw_payload))
-        source_artifact_path = _compact_text(paper_record.source_artifact_path) or _compact_text(paper_record.fulltext_artifact_path) or None
-        section_headings = self._section_headings(raw_payload, combined_text)
-        summary = self._abstract_or_summary(raw_payload, combined_text, fallback=paper_record.abstract)
-        methods = self._section_summary(raw_payload, combined_text, target_terms=("method", "experimental"))
-        problem = self._problem_or_task(raw_payload, combined_text, title=paper_record.title)
-        metrics = self._reported_metrics(combined_text)
-        entities = self._materials_or_entities(combined_text, title=paper_record.title)
-        evidence_rich_sections = self._evidence_rich_sections(section_headings)
-        limitations = self._profile_limitations(section_headings, methods, metrics)
-        profile = PaperProfile(
-            paper_id=paper_record.paper_id,
-            title=paper_record.title,
-            doi=paper_record.doi,
-            year=paper_record.year,
-            venue=paper_record.venue,
-            oa_source_url=_compact_text(paper_record.oa_url) or None,
-            source_artifact_path=source_artifact_path,
-            parser_name=parser_name,
-            profile_status="ready",
-            abstract_or_summary=summary,
-            section_headings=section_headings,
-            problem_or_task=problem,
-            materials_or_entities=entities,
-            methods_or_experimental_setup=methods,
-            reported_metrics=metrics,
-            evidence_rich_sections=evidence_rich_sections,
-            citation_readiness_summary=self._citation_readiness_summary(section_headings, metrics, evidence_rich_sections),
-            limitations=limitations,
-            raw_artifact_path=raw_artifact_path,
+        payload = {
+            "status": "unavailable",
+            "grobid_url": self.grobid_url,
+            "startup_attempted": True,
+            "health_check": final_probe,
+            "startup_enabled": self.startup_enabled,
+            "startup_script": self.startup_script,
+            "startup_result": startup_result,
+        }
+        self.last_preflight_payload = dict(payload)
+        raise RuntimeError(
+            f"GROBID server unavailable at {self.grobid_url}; startup was attempted but the service did not become healthy in time."
         )
-        parser_artifact_path = artifact_store.write_json(
-            f"proposer_profiles/{paper_record.paper_id}.profile.json",
-            profile.model_dump(exclude_none=True),
+
+    def _probe_health(self, *, timeout_seconds: float) -> Dict[str, Any]:
+        health_url = f"{self.grobid_url.rstrip('/')}/api/isalive"
+        try:
+            response = self.request_get(health_url, timeout=timeout_seconds)
+            status_code = int(getattr(response, "status_code", 200))
+            body_text = _compact_text(getattr(response, "text", "") or "")
+            available = 200 <= status_code < 300 and body_text.lower() == "true"
+            return {
+                "available": available,
+                "url": health_url,
+                "status_code": status_code,
+                "body": body_text[:200],
+            }
+        except Exception as exc:
+            return {
+                "available": False,
+                "url": health_url,
+                "error": _compact_text(str(exc)) or exc.__class__.__name__,
+            }
+
+    def _run_startup_script(self) -> Dict[str, Any]:
+        startup_path = Path(self.startup_script)
+        if not startup_path.is_absolute():
+            startup_path = (Path(__file__).resolve().parent.parent / startup_path).resolve()
+        if not startup_path.exists():
+            raise RuntimeError(
+                f"GROBID startup script is missing at {startup_path}; cannot auto-start the service."
+            )
+        result = self.command_runner(
+            ["/bin/bash", str(startup_path)],
+            capture_output=True,
+            text=True,
+            timeout=self.startup_timeout_seconds,
+            check=False,
         )
-        return profile.model_copy(update={"parser_artifact_path": parser_artifact_path})
+        payload = {
+            "returncode": int(getattr(result, "returncode", 1) or 0),
+            "stdout": _compact_text(getattr(result, "stdout", "") or "")[:500],
+            "stderr": _compact_text(getattr(result, "stderr", "") or "")[:500],
+        }
+        if payload["returncode"] != 0:
+            raise RuntimeError(
+                f"GROBID startup script failed with exit code {payload['returncode']} at {startup_path}."
+            )
+        return payload
 
-    def _build_loader(self, source_path: Path) -> Any:
-        if self.loader_factory is not None:
-            return self.loader_factory(source_path)
-        GenericLoader, GrobidParser = _lazy_grobid_loader_imports()
-        parser = None
-        parser_attempts = (
-            {"segment_sentences": False, "grobid_url": self.grobid_url},
-            {"segment_sentences": False, "grobid_server": self.grobid_url},
-            {"segment_sentences": False},
-            {},
-        )
-        for kwargs in parser_attempts:
-            try:
-                parser = GrobidParser(**kwargs)
-                break
-            except TypeError:
-                continue
-        if parser is None:
-            parser = GrobidParser()
-        from_filesystem = getattr(GenericLoader, "from_filesystem", None)
-        if not callable(from_filesystem):
-            raise RuntimeError("GenericLoader.from_filesystem is unavailable for GROBID profile extraction.")
-        return from_filesystem(str(source_path.parent), glob=source_path.name, parser=parser)
+    def _generate_tei_xml(self, source_path: Path) -> str:
+        if self.tei_xml_factory is not None:
+            payload = self.tei_xml_factory(source_path)
+            if isinstance(payload, bytes):
+                return payload.decode("utf-8", errors="ignore")
+            return str(payload)
 
-    def _section_headings(self, raw_payload: Sequence[Dict[str, Any]], combined_text: str) -> List[str]:
-        headings: List[str] = []
-        for item in list(raw_payload or []):
-            metadata = dict(item.get("metadata") or {})
-            for key in ("section_title", "section", "header", "title"):
-                candidate = _compact_text(metadata.get(key))
-                if candidate and candidate.lower() not in {value.lower() for value in headings}:
-                    headings.append(candidate)
-        for match in SECTION_HEADING_PATTERN.finditer(combined_text):
-            heading = _compact_text(match.group(1)).title()
-            if heading and heading.lower() not in {value.lower() for value in headings}:
-                headings.append(heading)
-        return headings[:12]
+        with source_path.open("rb") as handle:
+            response = self.request_post(
+                f"{self.grobid_url.rstrip('/')}/api/processFulltextDocument",
+                files={"input": (source_path.name, handle, "application/pdf")},
+                headers={"Accept": "application/xml"},
+                timeout=self.timeout_seconds,
+            )
+        status_code = int(getattr(response, "status_code", 200))
+        if status_code >= 400:
+            raise RuntimeError(f"GROBID returned HTTP {status_code} for {source_path.name}.")
+        tei_xml = str(getattr(response, "text", "") or "").strip()
+        if not tei_xml:
+            raise RuntimeError(f"GROBID returned empty TEI XML for {source_path.name}.")
+        return tei_xml
 
-    def _abstract_or_summary(
-        self,
-        raw_payload: Sequence[Dict[str, Any]],
-        combined_text: str,
-        *,
-        fallback: Optional[str],
-    ) -> str:
-        for item in list(raw_payload or []):
-            metadata = dict(item.get("metadata") or {})
-            if "abstract" in _compact_text(metadata.get("section_title") or metadata.get("section")).lower():
-                text = _compact_text(item.get("page_content"))
-                if text:
-                    return text[: self.max_summary_chars]
-        if _compact_text(fallback):
-            return _compact_text(fallback)[: self.max_summary_chars]
-        return combined_text[: self.max_summary_chars]
+    def _clip_tei_xml(self, *, tei_xml: str, paper_id: str) -> str:
+        try:
+            root = ET.fromstring(tei_xml)
+        except ET.ParseError as exc:
+            raise RuntimeError(f"paper_id={paper_id} produced invalid TEI XML from GROBID.") from exc
 
-    def _section_summary(
-        self,
-        raw_payload: Sequence[Dict[str, Any]],
-        combined_text: str,
-        *,
-        target_terms: Sequence[str],
-    ) -> Optional[str]:
-        lowered_terms = {str(term).strip().lower() for term in list(target_terms or []) if str(term).strip()}
-        for item in list(raw_payload or []):
-            metadata = dict(item.get("metadata") or {})
-            heading = _compact_text(metadata.get("section_title") or metadata.get("section") or metadata.get("title")).lower()
-            if not heading:
-                continue
-            if any(term in heading for term in lowered_terms):
-                text = _compact_text(item.get("page_content"))
-                if text:
-                    return text[: self.max_summary_chars]
-        return combined_text[: min(600, self.max_summary_chars)] if combined_text else None
+        namespace = _tei_namespace(root.tag)
+        if namespace:
+            ET.register_namespace("", namespace)
 
-    def _problem_or_task(self, raw_payload: Sequence[Dict[str, Any]], combined_text: str, *, title: str) -> str:
-        for item in list(raw_payload or []):
-            text = _compact_text(item.get("page_content"))
-            if not text:
-                continue
-            metadata = dict(item.get("metadata") or {})
-            heading = _compact_text(metadata.get("section_title") or metadata.get("section")).lower()
-            if heading in {"abstract", "introduction", "background"}:
-                return text[: self.max_summary_chars]
-        if _compact_text(title):
-            return f"{_compact_text(title)}. {combined_text[: min(500, self.max_summary_chars)]}".strip()
-        return combined_text[: self.max_summary_chars]
+        tei_header = root.find(_qualified("teiHeader", namespace))
+        text_node = root.find(_qualified("text", namespace))
+        body = text_node.find(_qualified("body", namespace)) if text_node is not None else None
+        if tei_header is None:
+            raise RuntimeError(f"paper_id={paper_id} TEI XML is missing teiHeader.")
+        if body is None:
+            raise RuntimeError(f"paper_id={paper_id} TEI XML is missing text/body.")
 
-    def _reported_metrics(self, combined_text: str) -> List[str]:
-        metrics: List[str] = []
-        for match in METRIC_PATTERN.finditer(combined_text):
-            metric = _compact_text(match.group(0))
-            if metric and metric.lower() not in {value.lower() for value in metrics}:
-                metrics.append(metric)
-        return metrics[:10]
-
-    def _materials_or_entities(self, combined_text: str, *, title: str) -> List[str]:
-        entities: List[str] = []
-        corpus = f"{_compact_text(title)} {_compact_text(combined_text)}"
-        for match in ENTITY_PATTERN.finditer(corpus):
-            entity = _compact_text(match.group(0))
-            if entity and entity.lower() not in {value.lower() for value in entities}:
-                entities.append(entity)
-        return entities[:12]
-
-    def _evidence_rich_sections(self, headings: Sequence[str]) -> List[str]:
-        preferred = [
-            heading
-            for heading in list(headings or [])
-            if any(term in heading.lower() for term in ("result", "discussion", "conclusion", "abstract"))
-        ]
-        if preferred:
-            return preferred[:6]
-        return list(headings or [])[:4]
-
-    def _profile_limitations(
-        self,
-        headings: Sequence[str],
-        methods: Optional[str],
-        metrics: Sequence[str],
-    ) -> List[str]:
-        limitations: List[str] = []
-        normalized_headings = {heading.lower() for heading in list(headings or [])}
-        if "results" not in normalized_headings and "result" not in normalized_headings:
-            limitations.append("GROBID profile did not recover an explicit Results section heading.")
-        if not _compact_text(methods):
-            limitations.append("Methods summary is weak or missing from the parsed profile.")
-        if not list(metrics or []):
-            limitations.append("No canonical metric terms were recovered from the parsed profile.")
-        return limitations
-
-    def _citation_readiness_summary(
-        self,
-        headings: Sequence[str],
-        metrics: Sequence[str],
-        evidence_rich_sections: Sequence[str],
-    ) -> str:
-        if list(evidence_rich_sections or []) and list(metrics or []):
-            return "Profile indicates explicit evidence-bearing sections and metric language for downstream citation extraction."
-        if list(evidence_rich_sections or []):
-            return "Profile includes likely evidence-bearing sections, but reported metric coverage is limited."
-        if list(headings or []):
-            return "Profile recovered section structure, but evidence-bearing signals are weak."
-        return "Profile quality is limited and may not support reliable evidence extraction."
+        clipped_root = ET.Element(root.tag, dict(root.attrib))
+        clipped_root.append(copy.deepcopy(tei_header))
+        clipped_text = ET.SubElement(clipped_root, _qualified("text", namespace))
+        clipped_text.append(copy.deepcopy(body))
+        return ET.tostring(clipped_root, encoding="utf-8", xml_declaration=True).decode("utf-8")
 
 
 def write_profile_failure(

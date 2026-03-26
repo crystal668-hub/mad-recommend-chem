@@ -2,9 +2,12 @@ You are reranking downloaded chemistry papers before full-text parsing.
 Return STRICT JSON only.
 Return EXACTLY {"locked_paper_ids": [...], "dropped_paper_ids": [...], "decisions": [...]}.
 Each decisions item must be {"paper_id": str, "decision": "lock"|"drop", "reason": str}.
-The input candidates already include GROBID-derived paper profiles from the downloaded PDFs.
-Prefer papers whose parsed profiles suggest they are most likely to yield citation-ready evidence for the exact question.
-Drop papers whose parsed profiles are generic, weakly related, or unlikely to support grounded evidence extraction.
+The input candidates already include clipped GROBID TEI XML evidence derived from the downloaded PDFs.
+Each candidate contains Semantic Scholar metadata plus text extracted from the clipped XML `<teiHeader>` and `<text><body>...</body></text>`.
+Prefer papers whose clipped XML profile suggests they are most likely to contain evidence that can answer the exact question.
+Drop papers whose clipped XML profile is generic, weakly related, missing key entities/conditions, or unlikely to support grounded evidence extraction.
+Order decisions from best candidate to worst candidate.
+Any candidate not covered by a valid decision will be dropped by the caller.
 Lock at most $max_candidates papers.
 
 Correct JSON example:

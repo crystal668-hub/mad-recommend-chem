@@ -359,6 +359,13 @@ class RetrieverNode:
         doi = normalize_doi(((raw_item.get("externalIds") or {}).get("DOI")) or raw_item.get("doi"))
         year = raw_item.get("year")
         abstract = normalize_text(raw_item.get("abstract")) or None
+        tldr = normalize_text(((raw_item.get("tldr") or {}).get("text")) or raw_item.get("tldr")) or None
+        fields_of_study = [
+            normalize_text(item)
+            for item in list(raw_item.get("fieldsOfStudy") or [])
+            if normalize_text(item)
+        ]
+        is_open_access = raw_item.get("isOpenAccess")
         authors = flatten_author_names(raw_item.get("authors"))
         venue = normalize_text(raw_item.get("venue")) or None
         best_oa_pdf_url = ((raw_item.get("openAccessPdf") or {}).get("url")) or None
@@ -370,6 +377,10 @@ class RetrieverNode:
             doi=doi,
             title=title,
             abstract=abstract,
+            tldr=tldr,
+            fields_of_study=fields_of_study,
+            is_open_access=bool(is_open_access) if is_open_access is not None else None,
+            open_access_pdf_url=best_oa_pdf_url,
             authors=authors,
             year=year,
             venue=venue,
@@ -466,6 +477,14 @@ class RetrieverNode:
             target.doi = incoming.doi
         if len(incoming.abstract or "") > len(target.abstract or ""):
             target.abstract = incoming.abstract
+        if len(incoming.tldr or "") > len(target.tldr or ""):
+            target.tldr = incoming.tldr
+        if not target.fields_of_study and incoming.fields_of_study:
+            target.fields_of_study = list(incoming.fields_of_study)
+        if target.is_open_access is None and incoming.is_open_access is not None:
+            target.is_open_access = incoming.is_open_access
+        if not target.open_access_pdf_url and incoming.open_access_pdf_url:
+            target.open_access_pdf_url = incoming.open_access_pdf_url
         if not target.authors and incoming.authors:
             target.authors = incoming.authors
         if target.year is None and incoming.year is not None:
@@ -642,6 +661,13 @@ class RetrieverNode:
         artifact_path = store.write_json(f"provider_raw/semantic_scholar/{candidate.paper_id}.json", raw)
         doi = normalize_doi(((raw.get("externalIds") or {}).get("DOI")) or raw.get("doi"))
         abstract = normalize_text(raw.get("abstract")) or None
+        tldr = normalize_text(((raw.get("tldr") or {}).get("text")) or raw.get("tldr")) or None
+        fields_of_study = [
+            normalize_text(item)
+            for item in list(raw.get("fieldsOfStudy") or [])
+            if normalize_text(item)
+        ]
+        is_open_access = raw.get("isOpenAccess")
         authors = flatten_author_names(raw.get("authors"))
         venue = normalize_text(raw.get("venue")) or None
         year = raw.get("year")
@@ -653,12 +679,20 @@ class RetrieverNode:
             candidate.doi = doi
         if abstract and len(abstract) > len(candidate.abstract or ""):
             candidate.abstract = abstract
+        if tldr and len(tldr) > len(candidate.tldr or ""):
+            candidate.tldr = tldr
+        if fields_of_study and not candidate.fields_of_study:
+            candidate.fields_of_study = fields_of_study
+        if is_open_access is not None and candidate.is_open_access is None:
+            candidate.is_open_access = bool(is_open_access)
         if authors and not candidate.authors:
             candidate.authors = authors
         if venue and not candidate.venue:
             candidate.venue = venue
         if year and candidate.year is None:
             candidate.year = year
+        if not candidate.open_access_pdf_url:
+            candidate.open_access_pdf_url = ((raw.get("openAccessPdf") or {}).get("url")) or None
         candidate.ranking_features["citation_count"] = int(citation_count or 0)
         self._record_diagnostic(provider="semantic_scholar", stage="enrichment", outcome="hit")
 

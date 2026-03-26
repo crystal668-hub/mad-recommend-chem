@@ -12,7 +12,7 @@ import pymupdf as fitz
 from qa.artifacts import QAArtifactStore
 from qa.handoff import EvidenceExtractorHandoff
 from qa.nodes.document_acquirer import DocumentAcquirerNode
-from qa.providers import FetchedDocument, HttpTextFetcher, ProviderRequestError
+from qa.providers import DEFAULT_BROWSER_USER_AGENT, FetchedDocument, HttpTextFetcher, ProviderRequestError
 from qa.retrieval_state import PaperCandidate, PaperRecord, Section, SectionIndex
 from qa.state import QueryConstraints, TaskSpec
 
@@ -32,6 +32,29 @@ class _SlowFetcher:
     def fetch(self, url: str) -> FetchedDocument:
         time.sleep(self.delay_seconds)
         return FetchedDocument(url=url, content_type="text/plain", text="slow response")
+
+
+class _LookupClient:
+    def __init__(self, payload: dict) -> None:
+        self.payload = dict(payload)
+        self.calls: list[str] = []
+
+    def lookup(self, doi: str):
+        self.calls.append(doi)
+        return dict(self.payload)
+
+
+class _RecordedFetcher:
+    def __init__(self, responses: dict[str, object]) -> None:
+        self.responses = dict(responses)
+        self.urls: list[str] = []
+
+    def fetch(self, url: str) -> FetchedDocument:
+        self.urls.append(url)
+        response = self.responses[url]
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def _make_pdf_bytes(pages: list[str]) -> bytes:
@@ -88,6 +111,31 @@ def _workspace_tmpdir() -> Path:
 
 
 class DocumentAcquisitionTests(unittest.TestCase):
+    def test_http_text_fetcher_uses_browser_user_agent_by_default(self):
+        seen_headers: list[dict] = []
+
+        class _Response:
+            status_code = 200
+            headers = {"content-type": "application/pdf"}
+            content = b"%PDF-1.4\n"
+            text = ""
+            url = "https://example.test/paper.pdf"
+            history = []
+
+            def raise_for_status(self) -> None:
+                return None
+
+        def _request_get(url, *, headers=None, timeout=None, params=None):
+            del url, timeout, params
+            seen_headers.append(dict(headers or {}))
+            return _Response()
+
+        fetcher = HttpTextFetcher(request_get=_request_get)
+        fetched = fetcher.fetch("https://example.test/paper.pdf")
+
+        self.assertEqual("application/pdf", fetched.content_type)
+        self.assertEqual(DEFAULT_BROWSER_USER_AGENT, seen_headers[0]["User-Agent"])
+
     def test_http_text_fetcher_keeps_image_payload_binary(self):
         class _Response:
             status_code = 200
@@ -274,6 +322,186 @@ class DocumentAcquisitionTests(unittest.TestCase):
             runtime_payload = json.loads((tmpdir / "diagnostics" / "document_acquirer_runtime.json").read_text(encoding="utf-8"))
             self.assertEqual("paper-1", runtime_payload["paper_id"])
             self.assertIn(runtime_payload["status"], {"timeout", "success"})
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_download_pdf_only_with_fallback_uses_unpaywall_pdf_first(self):
+        unpaywall_url = "https://oa.example.test/paper.pdf"
+        fallback_url = "https://ss.example.test/paper.pdf"
+        fetcher = _RecordedFetcher(
+            {
+                unpaywall_url: FetchedDocument(
+                    url=unpaywall_url,
+                    content_type="application/pdf",
+                    binary=b"%PDF-1.4\nunpaywall\n",
+                )
+            }
+        )
+        node = DocumentAcquirerNode(
+            unpaywall_client=_LookupClient(
+                {
+                    "best_oa_location": {
+                        "url_for_pdf": unpaywall_url,
+                    }
+                }
+            ),
+            fetcher=fetcher,
+        )
+        candidate = _candidate().model_copy(update={"open_access_pdf_url": fallback_url})
+
+        tmpdir = _workspace_tmpdir()
+        try:
+            record, index = node.download_pdf_only_with_fallback(
+                candidate=candidate,
+                artifact_store=QAArtifactStore(base_dir=tmpdir),
+            )
+
+            self.assertEqual([unpaywall_url], fetcher.urls)
+            self.assertEqual("binary_only", record.fulltext_status)
+            self.assertEqual("binary_only", index.fulltext_status)
+            self.assertTrue(str(record.fulltext_artifact_path).endswith(".pdf"))
+            self.assertIn("unpaywall_pdf", record.provider_sources)
+            self.assertNotIn("semantic_scholar_pdf_fallback", record.provider_sources)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_download_pdf_only_with_fallback_retries_semantic_scholar_once(self):
+        unpaywall_url = "https://oa.example.test/paper.pdf"
+        fallback_url = "https://ss.example.test/paper.pdf"
+        fetcher = _RecordedFetcher(
+            {
+                unpaywall_url: RuntimeError("upstream 403"),
+                fallback_url: FetchedDocument(
+                    url=fallback_url,
+                    content_type="application/pdf",
+                    binary=b"%PDF-1.4\nsemantic\n",
+                ),
+            }
+        )
+        node = DocumentAcquirerNode(
+            unpaywall_client=_LookupClient(
+                {
+                    "best_oa_location": {
+                        "url_for_pdf": unpaywall_url,
+                    }
+                }
+            ),
+            fetcher=fetcher,
+        )
+        candidate = _candidate().model_copy(update={"open_access_pdf_url": fallback_url})
+
+        tmpdir = _workspace_tmpdir()
+        try:
+            record, index = node.download_pdf_only_with_fallback(
+                candidate=candidate,
+                artifact_store=QAArtifactStore(base_dir=tmpdir),
+            )
+
+            self.assertEqual([unpaywall_url, fallback_url], fetcher.urls)
+            self.assertEqual("binary_only", record.fulltext_status)
+            self.assertEqual("binary_only", index.fulltext_status)
+            self.assertIn("semantic_scholar_pdf_fallback", record.provider_sources)
+            self.assertNotIn("unpaywall_pdf", record.provider_sources[-1:])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_download_pdf_only_with_fallback_uses_semantic_scholar_when_unpaywall_pdf_url_missing(self):
+        fallback_url = "https://ss.example.test/paper.pdf"
+        fetcher = _RecordedFetcher(
+            {
+                fallback_url: FetchedDocument(
+                    url=fallback_url,
+                    content_type="application/pdf",
+                    binary=b"%PDF-1.4\nsemantic\n",
+                ),
+            }
+        )
+        node = DocumentAcquirerNode(
+            unpaywall_client=_LookupClient(
+                {
+                    "best_oa_location": {},
+                }
+            ),
+            fetcher=fetcher,
+        )
+        candidate = _candidate().model_copy(update={"open_access_pdf_url": fallback_url})
+
+        tmpdir = _workspace_tmpdir()
+        try:
+            record, index = node.download_pdf_only_with_fallback(
+                candidate=candidate,
+                artifact_store=QAArtifactStore(base_dir=tmpdir),
+            )
+
+            self.assertEqual([fallback_url], fetcher.urls)
+            self.assertEqual("binary_only", record.fulltext_status)
+            self.assertEqual("binary_only", index.fulltext_status)
+            self.assertIn("semantic_scholar_pdf_fallback", record.provider_sources)
+            runtime_payload = json.loads((tmpdir / "diagnostics" / "document_acquirer_runtime.json").read_text(encoding="utf-8"))
+            self.assertEqual("semantic_scholar_pdf_fallback", runtime_payload["download_source"])
+            self.assertEqual("missing_unpaywall_url_for_pdf", runtime_payload["fallback_reason"])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_download_pdf_only_with_fallback_fails_when_both_sources_fail(self):
+        unpaywall_url = "https://oa.example.test/paper.pdf"
+        fallback_url = "https://ss.example.test/paper.pdf"
+        fetcher = _RecordedFetcher(
+            {
+                unpaywall_url: RuntimeError("upstream 403"),
+                fallback_url: RuntimeError("fallback 404"),
+            }
+        )
+        node = DocumentAcquirerNode(
+            unpaywall_client=_LookupClient(
+                {
+                    "best_oa_location": {
+                        "url_for_pdf": unpaywall_url,
+                    }
+                }
+            ),
+            fetcher=fetcher,
+        )
+        candidate = _candidate().model_copy(update={"open_access_pdf_url": fallback_url})
+
+        tmpdir = _workspace_tmpdir()
+        try:
+            with self.assertRaises(RuntimeError):
+                node.download_pdf_only_with_fallback(
+                    candidate=candidate,
+                    artifact_store=QAArtifactStore(base_dir=tmpdir),
+                )
+            self.assertEqual([unpaywall_url, fallback_url], fetcher.urls)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_download_pdf_only_with_fallback_skips_duplicate_semantic_retry_url(self):
+        unpaywall_url = "https://oa.example.test/paper.pdf"
+        fetcher = _RecordedFetcher(
+            {
+                unpaywall_url: RuntimeError("upstream 403"),
+            }
+        )
+        node = DocumentAcquirerNode(
+            unpaywall_client=_LookupClient(
+                {
+                    "best_oa_location": {
+                        "url_for_pdf": unpaywall_url,
+                    }
+                }
+            ),
+            fetcher=fetcher,
+        )
+        candidate = _candidate().model_copy(update={"open_access_pdf_url": unpaywall_url})
+
+        tmpdir = _workspace_tmpdir()
+        try:
+            with self.assertRaises(RuntimeError):
+                node.download_pdf_only_with_fallback(
+                    candidate=candidate,
+                    artifact_store=QAArtifactStore(base_dir=tmpdir),
+                )
+            self.assertEqual([unpaywall_url], fetcher.urls)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 

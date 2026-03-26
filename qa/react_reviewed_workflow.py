@@ -39,7 +39,7 @@ from qa.artifacts import QAArtifactStore
 from qa.evidence import EvidenceExtractor
 from qa.handoff import EvidenceExtractorHandoff
 from qa.llm_utils import invoke_llm, parse_json_payload
-from qa.paper_profiles import GrobidPaperProfileBuilder, write_profile_failure
+from qa.paper_profiles import GrobidPaperProfileBuilder, extract_profile_xml_segments, write_profile_failure
 from qa.nodes.document_acquirer import DocumentAcquirerNode
 from qa.nodes.entity_resolver import EntityResolverNode
 from qa.nodes.query_planner import QueryPlannerExecutionError, QueryPlannerNode
@@ -77,7 +77,7 @@ from qa.synthesis_state import AnswerSectionOutput, CitationRecord, ConfidenceRa
 logger = logging.getLogger("MAD.qa.react_reviewed")
 
 MIN_REACT_REVIEWED_PROPOSER_STEPS = 6
-PROPOSER_CANDIDATE_TARGET = 20
+PROPOSER_CANDIDATE_TARGET = 10
 PROPOSER_RERANK_TOP_K = 5
 
 PROPOSER_TOOL_NAMES = (
@@ -258,6 +258,25 @@ def _candidate_has_downloadable_pdf_signal(candidate: Optional[PaperCandidate]) 
     )
 
 
+def _url_is_strict_pdf_download(value: Any) -> bool:
+    text = _compact_text(value)
+    if not text:
+        return False
+    parsed = urlparse(text)
+    if parsed.query or parsed.fragment:
+        return False
+    return unquote(parsed.path or "").lower().endswith(".pdf")
+
+
+def _candidate_has_strict_proposer_pdf_signal(candidate: Optional[PaperCandidate]) -> bool:
+    if candidate is None:
+        return False
+    return bool(
+        _compact_text(getattr(candidate, "doi", None))
+        and _url_is_strict_pdf_download(getattr(candidate, "open_access_pdf_url", None))
+    )
+
+
 def _batched_search_stage_timeout(base_timeout_seconds: float, batch_size: int) -> float:
     normalized_base = max(0.01, float(base_timeout_seconds or 0.01))
     normalized_batch_size = max(1, int(batch_size or 1))
@@ -396,6 +415,53 @@ def _paper_relevance_metrics(
         "matched_terms": corpus_matches[:8],
         "has_abstract": bool(normalized_abstract),
     }
+
+
+def _query_hits_in_text(task_spec: TaskSpec, entity_pack: EntityPack, text: Optional[str]) -> List[str]:
+    normalized_text = _compact_text(text).lower()
+    if not normalized_text:
+        return []
+    return [term for term in _screen_query_terms(task_spec, entity_pack) if term and term in normalized_text]
+
+
+def _score_proposer_semantic_scholar_candidate(
+    *,
+    task_spec: TaskSpec,
+    entity_pack: EntityPack,
+    candidate: PaperCandidate,
+) -> float:
+    semantic_summary = _compact_text(
+        " ".join(
+            [
+                str(candidate.abstract or ""),
+                str(candidate.tldr or ""),
+                " ".join(str(item) for item in list(candidate.fields_of_study or [])),
+            ]
+        )
+    )
+    summary_metrics = _paper_relevance_metrics(
+        task_spec=task_spec,
+        entity_pack=entity_pack,
+        title=candidate.title,
+        abstract=semantic_summary,
+    )
+    tldr_hits = len(_query_hits_in_text(task_spec, entity_pack, candidate.tldr))
+    field_hits = len(
+        _query_hits_in_text(task_spec, entity_pack, " ".join(str(item) for item in list(candidate.fields_of_study or [])))
+    )
+    citation_count = int(candidate.ranking_features.get("citation_count") or 0)
+    citation_bonus = min(2.0, float(citation_count) / 100.0)
+    open_access_bonus = 1.0 if bool(candidate.is_open_access) else 0.0
+    return round(
+        4.0 * float(summary_metrics["title_hits"])
+        + 3.0 * float(summary_metrics["abstract_hits"])
+        + 1.5 * float(summary_metrics["question_hits"])
+        + 2.0 * float(min(tldr_hits, 3))
+        + 0.5 * float(min(field_hits, 4))
+        + citation_bonus
+        + open_access_bonus,
+        4,
+    )
 
 
 def _paper_has_useful_abstract_support(
@@ -1690,6 +1756,61 @@ class ReactReviewedWorkspace:
             )
         return self.document_acquirer
 
+    def _search_papers_with_semantic_scholar_only(
+        self,
+        *,
+        retriever: RetrieverNode,
+        query_plan: QueryPlan,
+        artifact_store: QAArtifactStore,
+    ) -> List[PaperCandidate]:
+        retriever._diagnostic_map = {}
+        retriever._provider_health_fallback = retriever._init_provider_health()
+        raw_results = retriever._run_provider_search(
+            provider_name="semantic_scholar",
+            query_plan=query_plan,
+        ) or []
+        artifact_store.write_json(
+            f"provider_raw/semantic_scholar/search_{query_plan.lane}.json",
+            raw_results,
+        )
+
+        candidates: List[PaperCandidate] = []
+        for raw_item in raw_results:
+            candidate = retriever._candidate_from_semantic_scholar(
+                raw_item=raw_item,
+                lane=query_plan.lane,
+                store=artifact_store,
+            )
+            if candidate is None:
+                continue
+            existing = retriever._find_duplicate(candidates, candidate)
+            if existing is None:
+                candidates.append(candidate)
+            else:
+                retriever._merge_candidates(existing, candidate)
+
+        filtered_candidates: List[PaperCandidate] = []
+        for candidate in candidates:
+            if not _candidate_has_strict_proposer_pdf_signal(candidate):
+                continue
+            candidate.retrieval_score = _score_proposer_semantic_scholar_candidate(
+                task_spec=self.task_spec,
+                entity_pack=self.entity_pack,
+                candidate=candidate,
+            )
+            filtered_candidates.append(candidate)
+
+        retriever.last_diagnostics = retriever._finalize_diagnostics()
+        retriever.last_provider_health = retriever._collect_provider_health()
+        filtered_candidates.sort(
+            key=lambda item: (
+                -float(item.retrieval_score or 0.0),
+                -int(item.ranking_features.get("citation_count") or 0),
+                str(item.paper_id),
+            )
+        )
+        return filtered_candidates[: self.proposer_candidate_target]
+
     def _index_downloaded_document(
         self,
         *,
@@ -1961,6 +2082,7 @@ class ReactReviewedWorkspace:
         requested_via: Optional[str] = None,
         write_snapshot: bool = True,
         stage_watchdog_seconds: Optional[float] = None,
+        proposer_only_semantic: bool = False,
     ) -> List[Dict[str, Any]]:
         store = artifact_store or self.store
         resolved_id, query_plan = self._ensure_query_plan(query_plan_id, query_text, lane)
@@ -1989,6 +2111,12 @@ class ReactReviewedWorkspace:
             retriever = self._build_retriever_clone()
             try:
                 def _retriever_operation() -> List[Dict[str, Any]]:
+                    if proposer_only_semantic and isinstance(retriever, RetrieverNode):
+                        return self._search_papers_with_semantic_scholar_only(
+                            retriever=retriever,
+                            query_plan=query_plan,
+                            artifact_store=store,
+                        )
                     retriever_kwargs = {
                         "task_spec": self.task_spec,
                         "entity_pack": self.entity_pack,
@@ -2011,11 +2139,13 @@ class ReactReviewedWorkspace:
                 )
                 self._merge_diagnostics(getattr(retriever, "last_diagnostics", []) or [])
                 self._merge_provider_health(getattr(retriever, "last_provider_health", {}) or {})
-                filtered_candidates = [
-                    candidate
-                    for candidate in list(candidates or [])
-                    if _candidate_has_downloadable_pdf_signal(candidate)
-                ]
+                filtered_candidates = list(candidates or [])
+                if not proposer_only_semantic:
+                    filtered_candidates = [
+                        candidate
+                        for candidate in filtered_candidates
+                        if _candidate_has_downloadable_pdf_signal(candidate)
+                    ]
                 with self._state_lock:
                     for candidate in filtered_candidates:
                         self.paper_candidates[candidate.paper_id] = candidate
@@ -2056,6 +2186,7 @@ class ReactReviewedWorkspace:
         charge_budget: bool = False,
         requested_via: Optional[str] = None,
         write_snapshot: bool = True,
+        proposer_pdf_download: bool = False,
     ) -> Dict[str, Any]:
         store = artifact_store or self.store
         normalized_paper_id = str(paper_id)
@@ -2104,6 +2235,12 @@ class ReactReviewedWorkspace:
             acquirer = self._build_document_acquirer_clone()
             try:
                 def _download_only_operation() -> Tuple[List[PaperRecord], List[SectionIndex]]:
+                    if proposer_pdf_download and hasattr(acquirer, "download_pdf_only_with_fallback"):
+                        paper_record, section_index = acquirer.download_pdf_only_with_fallback(
+                            candidate=candidate,
+                            artifact_store=store,
+                        )
+                        return [paper_record], [section_index]
                     try:
                         return acquirer.run(
                             candidates=[candidate],
@@ -2250,7 +2387,7 @@ class ReactReviewedWorkspace:
         normalized_paper_id = str(paper_id or "").strip()
         paper_record, _ = self._ensure_document(
             normalized_paper_id,
-            require_indexed=True,
+            require_indexed=False,
             artifact_store=artifact_store,
             requested_via=requested_via or "screen_papers",
             write_snapshot=write_snapshot,
@@ -2303,11 +2440,11 @@ class ReactReviewedWorkspace:
                     "doi": paper_record.doi,
                     "year": paper_record.year,
                     "venue": paper_record.venue,
-                    "oa_source_url": paper_record.oa_url,
                     "source_artifact_path": paper_record.source_artifact_path,
                     "profile_status": "error",
                     "error_message": str(exc),
-                    "parser_artifact_path": failure_artifact_path,
+                    "profile_xml_artifact_path": None,
+                    "failure_artifact_path": failure_artifact_path,
                 }
                 with self._state_lock:
                     self._profile_result_cache[cache_key] = copy.deepcopy(result)
@@ -2750,7 +2887,6 @@ class ReactReviewedWorkspace:
             ]
             paper_candidates = [item.model_dump(exclude_none=True) for item in self.paper_candidates.values()]
             paper_records = [item.model_dump(exclude_none=True) for item in self.paper_records.values()]
-            paper_profiles = [item.model_dump(exclude_none=True) for item in self.paper_profiles.values()]
             section_indices = [item.model_dump(exclude_none=True) for item in self.section_indices.values()]
             retrieval_diagnostics = [item.model_dump(exclude_none=True) for item in self.retrieval_diagnostics]
             provider_health = copy.deepcopy(self.provider_health)
@@ -2759,7 +2895,6 @@ class ReactReviewedWorkspace:
         self.store.write_json("query_plans.json", query_plans)
         self.store.write_json("paper_candidates.json", paper_candidates)
         self.store.write_json("paper_records.json", paper_records)
-        self.store.write_json("paper_profiles.json", paper_profiles)
         self.store.write_json("section_indices.json", section_indices)
         self.store.write_json("retrieval_diagnostics.json", retrieval_diagnostics)
         self.store.write_json("provider_health.json", provider_health)
@@ -2806,80 +2941,32 @@ class ReactReviewedProposerAgent:
             min(self.proposer_candidate_target, int(proposer_rerank_top_k)),
         )
 
-    def _score_screen_candidate(
+    def _build_screen_candidate_payload(
         self,
         *,
-        workspace: ReactReviewedWorkspace,
         candidate: PaperCandidate,
-        paper_profile: Dict[str, Any],
-        open_review_items: Sequence[ReviewItem],
+        profile_payload: Dict[str, Any],
     ) -> Dict[str, Any]:
-        profile_summary = _compact_text(
-            " ".join(
-                [
-                    str(paper_profile.get("abstract_or_summary") or ""),
-                    str(paper_profile.get("problem_or_task") or ""),
-                    str(paper_profile.get("methods_or_experimental_setup") or ""),
-                    " ".join(str(item) for item in list(paper_profile.get("reported_metrics") or [])),
-                    " ".join(str(item) for item in list(paper_profile.get("materials_or_entities") or [])),
-                    " ".join(str(item) for item in list(paper_profile.get("evidence_rich_sections") or [])),
-                    str(paper_profile.get("citation_readiness_summary") or ""),
-                ]
-            )
-        )
-        metrics = _paper_relevance_metrics(
-            task_spec=workspace.task_spec,
-            entity_pack=workspace.entity_pack,
-            title=candidate.title,
-            abstract=profile_summary,
-        )
-        review_priority_terms = _review_item_priority_terms(open_review_items)
-        normalized_corpus = _compact_text(f"{candidate.title} {profile_summary}").lower()
-        review_term_hits = [term for term in review_priority_terms if term and term in normalized_corpus]
-        evidence_rich_sections = list(paper_profile.get("evidence_rich_sections") or [])
-        reported_metrics = list(paper_profile.get("reported_metrics") or [])
-        limitations = list(paper_profile.get("limitations") or [])
-        score = (
-            4.0 * float(candidate.retrieval_score or 0.0)
-            + 2.5 * float(metrics["title_hits"])
-            + 2.0 * float(metrics["abstract_hits"])
-            + 1.5 * float(metrics["question_hits"])
-            + 1.0 * float(min(len(review_term_hits), 4))
-            + (1.5 if evidence_rich_sections else 0.0)
-            + (1.0 if reported_metrics else 0.0)
-            - min(len(limitations), 3) * 0.5
-        )
-        should_drop = metrics["title_hits"] == 0 and metrics["abstract_hits"] == 0 and metrics["question_hits"] == 0
-        reason = (
-            "Profile has weak question alignment after full-text parsing."
-            if should_drop
-            else "Profile shows stronger question alignment and better citation-ready evidence sections."
-        )
+        profile_xml_artifact_path = str(profile_payload.get("profile_xml_artifact_path") or "").strip()
+        xml_segments = extract_profile_xml_segments(profile_xml_artifact_path)
         return {
             "paper_id": candidate.paper_id,
             "title": candidate.title,
+            "doi": candidate.doi,
+            "year": candidate.year,
+            "venue": candidate.venue,
             "retrieval_score": round(float(candidate.retrieval_score or 0.0), 4),
-            "screen_score": round(score, 4),
-            "decision": "drop" if should_drop else "lock",
-            "reason": reason,
-            "matched_terms": metrics["matched_terms"],
-            "review_term_hits": review_term_hits,
-            "title_hits": metrics["title_hits"],
-            "profile_hits": metrics["abstract_hits"],
-            "question_hits": metrics["question_hits"],
-            "evidence_rich_sections": evidence_rich_sections,
-            "reported_metrics": reported_metrics,
-            "profile_status": paper_profile.get("profile_status"),
-            "paper_profile": {
-                "paper_id": candidate.paper_id,
-                "abstract_or_summary": paper_profile.get("abstract_or_summary"),
-                "problem_or_task": paper_profile.get("problem_or_task"),
-                "materials_or_entities": list(paper_profile.get("materials_or_entities") or []),
-                "reported_metrics": reported_metrics,
-                "evidence_rich_sections": evidence_rich_sections,
-                "citation_readiness_summary": paper_profile.get("citation_readiness_summary"),
-                "limitations": limitations,
+            "profile_status": profile_payload.get("profile_status"),
+            "profile_xml_artifact_path": profile_xml_artifact_path,
+            "semantic_scholar_metadata": {
+                "abstract": candidate.abstract,
+                "tldr": candidate.tldr,
+                "fields_of_study": list(candidate.fields_of_study or []),
+                "is_open_access": candidate.is_open_access,
+                "open_access_pdf_url": candidate.open_access_pdf_url,
             },
+            "profile_header_text": xml_segments["header_text"],
+            "profile_body_text": xml_segments["body_text"],
         }
 
     def _llm_screen_candidate_papers(
@@ -2921,9 +3008,13 @@ class ReactReviewedProposerAgent:
         parsed = parse_json_payload(raw_response)
         if not isinstance(parsed, dict):
             return None, raw_response
-        allowed_ids = {str(item.get("paper_id") or "").strip() for item in ranked_candidates if str(item.get("paper_id") or "").strip()}
-        decisions = []
+        allowed_ids = {
+            str(item.get("paper_id") or "").strip()
+            for item in ranked_candidates
+            if str(item.get("paper_id") or "").strip()
+        }
         decision_map: Dict[str, Dict[str, Any]] = {}
+        decision_order: List[str] = []
         for item in list(parsed.get("decisions") or []):
             if not isinstance(item, dict):
                 continue
@@ -2933,28 +3024,36 @@ class ReactReviewedProposerAgent:
             if paper_id not in allowed_ids or decision not in {"lock", "drop"} or not reason:
                 continue
             current = {"paper_id": paper_id, "decision": decision, "reason": reason}
-            decisions.append(current)
+            if paper_id not in decision_map:
+                decision_order.append(paper_id)
             decision_map[paper_id] = current
-        if not decisions:
+        if not decision_map:
             return None, raw_response
         locked_paper_ids: List[str] = []
         dropped_paper_ids: List[str] = []
         ranked_payload: List[Dict[str, Any]] = []
-        for item in ranked_candidates:
-            paper_id = str(item.get("paper_id") or "").strip()
+        candidate_map = {
+            str(item.get("paper_id") or "").strip(): item
+            for item in ranked_candidates
+            if str(item.get("paper_id") or "").strip()
+        }
+        ordered_rank_ids = decision_order + [
+            paper_id
+            for paper_id in candidate_map
+            if paper_id not in set(decision_order)
+        ]
+        for paper_id in ordered_rank_ids:
+            item = candidate_map[paper_id]
             llm_decision = decision_map.get(paper_id)
-            base_decision = str(item.get("decision") or "drop")
-            decision = llm_decision["decision"] if llm_decision else base_decision
-            if base_decision == "drop":
-                decision = "drop"
-            reason = llm_decision["reason"] if llm_decision else _compact_text(item.get("reason"))
+            decision = llm_decision["decision"] if llm_decision else "drop"
+            reason = llm_decision["reason"] if llm_decision else "Candidate was not selected by listwise reranking."
             current = copy.deepcopy(item)
             current["decision"] = decision
             current["reason"] = reason
             ranked_payload.append(current)
             if decision == "lock" and paper_id not in locked_paper_ids and len(locked_paper_ids) < max_candidates:
                 locked_paper_ids.append(paper_id)
-            elif paper_id not in dropped_paper_ids:
+            if decision != "lock" and paper_id not in dropped_paper_ids:
                 dropped_paper_ids.append(paper_id)
         if not locked_paper_ids:
             return None, raw_response
@@ -2963,11 +3062,6 @@ class ReactReviewedProposerAgent:
                 "locked_paper_ids": locked_paper_ids,
                 "dropped_paper_ids": dropped_paper_ids,
                 "ranked_candidates": ranked_payload,
-                "paper_profiles": [
-                    copy.deepcopy(item.get("paper_profile"))
-                    for item in ranked_payload
-                    if isinstance(item.get("paper_profile"), dict)
-                ],
                 "llm_screening_used": True,
             },
             raw_response,
@@ -2994,57 +3088,45 @@ class ReactReviewedProposerAgent:
         dropped_candidates: List[Dict[str, Any]] = []
         ranked_candidates: List[Dict[str, Any]] = []
 
-        def _collect_screening_inputs(candidate_ids: Sequence[str]) -> None:
-            for paper_id in candidate_ids:
-                paper_record = workspace.paper_records.get(paper_id)
-                candidate = workspace.paper_candidates.get(paper_id)
-                if candidate is None or paper_record is None:
-                    continue
-                profile_payload = workspace.build_paper_profile(
-                    paper_id=paper_id,
-                    requested_via="screen_papers",
-                    write_snapshot=False,
+        for paper_id in ordered_ids:
+            paper_record = workspace.paper_records.get(paper_id)
+            candidate = workspace.paper_candidates.get(paper_id)
+            if candidate is None or paper_record is None:
+                continue
+            profile_payload = workspace.build_paper_profile(
+                paper_id=paper_id,
+                requested_via="screen_papers",
+                write_snapshot=False,
+            )
+            if (
+                str(profile_payload.get("profile_status") or "").strip().lower() != "ready"
+                or not str(profile_payload.get("profile_xml_artifact_path") or "").strip()
+            ):
+                dropped_candidates.append(
+                    {
+                        "paper_id": paper_id,
+                        "title": candidate.title,
+                        "decision": "drop",
+                        "reason": _compact_text(profile_payload.get("error_message"))
+                        or "Paper XML profile generation failed after download.",
+                        "profile_status": profile_payload.get("profile_status"),
+                        "profile_xml_artifact_path": profile_payload.get("profile_xml_artifact_path"),
+                    }
                 )
-                if str(profile_payload.get("profile_status") or "").strip().lower() != "ready":
-                    dropped_candidates.append(
-                        {
-                            "paper_id": paper_id,
-                            "title": candidate.title,
-                            "decision": "drop",
-                            "reason": _compact_text(profile_payload.get("error_message"))
-                            or "Paper profile generation failed after download.",
-                            "profile_status": profile_payload.get("profile_status"),
-                        }
-                    )
-                    continue
-                profile_payloads.append(copy.deepcopy(profile_payload))
-                ranked_candidates.append(
-                    self._score_screen_candidate(
-                        workspace=workspace,
-                        candidate=candidate,
-                        paper_profile=profile_payload,
-                        open_review_items=open_review_items,
-                    )
+                continue
+            profile_payloads.append(copy.deepcopy(profile_payload))
+            ranked_candidates.append(
+                self._build_screen_candidate_payload(
+                    candidate=candidate,
+                    profile_payload=profile_payload,
                 )
-
-        _collect_screening_inputs(ordered_ids)
-        if not ranked_candidates:
-            fallback_ids = [
-                paper_id
-                for paper_id, candidate in sorted(
-                    workspace.paper_candidates.items(),
-                    key=lambda item: float(getattr(item[1], "retrieval_score", 0.0) or 0.0),
-                    reverse=True,
-                )
-                if paper_id not in seen and paper_id in workspace.paper_records
-            ]
-            _collect_screening_inputs(fallback_ids)
+            )
 
         if not ranked_candidates:
             payload = {
                 "stage": "proposer_screening",
                 "cycle_number": cycle_number,
-                "message": "candidate screening could not build any usable paper profiles after download",
+                "message": "candidate screening could not build any usable XML paper profiles after download",
                 "ranked_candidates": dropped_candidates,
                 "paper_profiles": profile_payloads,
                 "llm_screening_used": False,
@@ -3057,20 +3139,13 @@ class ReactReviewedProposerAgent:
                 workspace=workspace,
                 cycle_number=cycle_number,
                 stage="proposer_screening",
-                message="Candidate screening could not build any usable paper profiles after download.",
+                message="Candidate screening could not build any usable XML paper profiles after download.",
                 details={
                     "reason": "no_profile_ready_candidates",
                     "requested_candidate_count": len(ordered_ids),
                 },
                 structured_output=payload,
             )
-        ranked_candidates.sort(
-            key=lambda item: (
-                0 if str(item.get("decision") or "drop") == "lock" else 1,
-                -float(item.get("screen_score") or 0.0),
-                -float(item.get("retrieval_score") or 0.0),
-            )
-        )
         provider, model_name, has_api_key = describe_chat_model_config(self.model_config)
         if not provider or not model_name or not has_api_key:
             payload = {
@@ -3256,7 +3331,7 @@ class ReactReviewedProposerAgent:
             lane: str = "data",
             reason: str = "",
         ) -> ToolResult:
-            """Search external literature providers using a planned or ad hoc query."""
+            """Search Semantic Scholar for direct-PDF proposer candidates using planned or ad hoc queries."""
             if not run_state.query_plan_ids:
                 return _policy_block(
                     "plan_queries must be called before search_papers.",
@@ -3306,6 +3381,7 @@ class ReactReviewedProposerAgent:
                                 lane=lane,
                                 reason=reason,
                                 stage_watchdog_seconds=batch_search_timeout,
+                                proposer_only_semantic=True,
                             )
                         )
                     except Exception as exc:
@@ -3328,6 +3404,7 @@ class ReactReviewedProposerAgent:
                                 lane=lane,
                                 reason=reason,
                                 stage_watchdog_seconds=batch_search_timeout,
+                                proposer_only_semantic=True,
                             )
                         )
                     except Exception as exc:
@@ -3348,6 +3425,7 @@ class ReactReviewedProposerAgent:
                         query_text=query_text,
                         lane=lane,
                         reason=reason,
+                        proposer_only_semantic=True,
                     )
                 )
 
@@ -3368,7 +3446,7 @@ class ReactReviewedProposerAgent:
             paper_ids: Optional[List[str]] = None,
             max_candidates: Optional[int] = None,
         ) -> ToolResult:
-            """Rerank downloaded papers using GROBID-derived paper profiles and lock the strongest candidates."""
+            """Rerank downloaded PDFs using clipped GROBID XML profiles and lock the strongest candidates."""
             if not run_state.searched_paper_ids:
                 return _policy_block(
                     "screen_papers requires prior search_papers results in this cycle.",
@@ -3442,14 +3520,17 @@ class ReactReviewedProposerAgent:
             )
 
         def download_document(paper_id: str) -> ToolResult:
-            """Download and cache the selected paper PDF/full text artifact without parsing sections."""
+            """Download and cache the selected paper PDF via Unpaywall first, then Semantic Scholar fallback."""
             normalized_paper_id = str(paper_id or "").strip()
             if normalized_paper_id not in run_state.searched_paper_ids:
                 return _policy_block(
                     f"download_document requires a paper selected from prior search_papers results; unknown paper_id={normalized_paper_id}.",
                     code="paper_not_searched",
                 )
-            payload = workspace.download_document(paper_id=paper_id)
+            payload = workspace.download_document(
+                paper_id=paper_id,
+                proposer_pdf_download=True,
+            )
             run_state.record_acquisition(payload)
             return ToolResult(observation=_json_preview(payload), data=payload)
 
@@ -4764,7 +4845,11 @@ class ReactReviewedProposerAgent:
         search_results: List[Dict[str, Any]] = []
         search_tool_calls: List[ToolCallRecord] = []
         for query_plan_id in search_plan_ids:
-            result = workspace.search_papers(query_plan_id=query_plan_id, reason="deterministic proposer")
+            result = workspace.search_papers(
+                query_plan_id=query_plan_id,
+                reason="deterministic proposer",
+                proposer_only_semantic=True,
+            )
             search_results.extend(result)
             search_tool_calls.append(
                 ToolCallRecord(
@@ -4783,9 +4868,15 @@ class ReactReviewedProposerAgent:
 
         downloaded_payloads: List[Dict[str, Any]] = []
         download_tool_calls: List[ToolCallRecord] = []
-        candidate_paper_ids = [item.get("paper_id") for item in search_results if item.get("paper_id")]
+        candidate_paper_ids = _merge_unique_text(
+            [],
+            [item.get("paper_id") for item in search_results if item.get("paper_id")],
+        )
         for paper_id in candidate_paper_ids:
-            payload = workspace.download_document(paper_id=str(paper_id))
+            payload = workspace.download_document(
+                paper_id=str(paper_id),
+                proposer_pdf_download=True,
+            )
             downloaded_payloads.append(payload)
             download_tool_calls.append(
                 ToolCallRecord(
@@ -4897,8 +4988,9 @@ class ReactReviewedProposerAgent:
         step_refs = [
             _step_ref(trajectory, plan_step),
             _step_ref(trajectory, search_step),
-            _step_ref(trajectory, acquire_step),
+            _step_ref(trajectory, download_step),
             _step_ref(trajectory, screen_step),
+            _step_ref(trajectory, parse_step),
             _step_ref(trajectory, extract_step),
         ]
         submission = self._build_submission_from_workspace(
@@ -5231,9 +5323,9 @@ class ReactReviewedProposerAgent:
                 "selection_rubric": [
                     "entity_and_condition_alignment",
                     "question_type_and_lane_fit",
-                    "oa_fulltext_candidate_recall",
-                    "grobid_profile_evidence_density",
-                    "llm_listwise_rerank_for_citation_readiness",
+                    "semantic_scholar_strict_pdf_candidate_recall",
+                    "clipped_grobid_xml_profile_coverage",
+                    "llm_listwise_rerank_for_evidence_likelihood",
                     "coverage_diversity",
                 ],
             },
@@ -6106,6 +6198,9 @@ class ReactReviewedReviewerAgent:
 
 
 class SubmissionSynthesizerAgent:
+    def __init__(self, *, expose_candidate_submission_when_rejected: bool = False) -> None:
+        self.expose_candidate_submission_when_rejected = bool(expose_candidate_submission_when_rejected)
+
     def run(
         self,
         *,
@@ -6118,6 +6213,16 @@ class SubmissionSynthesizerAgent:
         execution_warnings: Sequence[str],
     ) -> QAResult:
         if not acceptance_decision.accepted:
+            if self.expose_candidate_submission_when_rejected:
+                return self._build_rejected_candidate_result(
+                    task_spec=task_spec,
+                    submission=submission,
+                    review_items=review_items,
+                    review_completion_status=review_completion_status,
+                    acceptance_decision=acceptance_decision,
+                    retrieval_diagnostics_summary=retrieval_diagnostics_summary,
+                    execution_warnings=execution_warnings,
+                )
             return self._build_rejected_result(
                 task_spec=task_spec,
                 submission=submission,
@@ -6212,6 +6317,41 @@ class SubmissionSynthesizerAgent:
             time_elapsed=0.0,
         )
 
+    def _build_submission_section_outputs(
+        self,
+        *,
+        task_spec: TaskSpec,
+        submission: AnswerSubmission,
+    ) -> Tuple[List[AnswerSectionOutput], List[SectionConfidenceRecord]]:
+        section_outputs: List[AnswerSectionOutput] = []
+        section_confidence: List[SectionConfidenceRecord] = []
+        section_lookup = {section.section_id: section for section in submission.sections}
+        for answer_section in task_spec.answer_sections:
+            section = section_lookup.get(answer_section.section_id)
+            if section is None:
+                continue
+            section_conf = _result_confidence(
+                section.section_confidence.score,
+                section.section_confidence.rationale,
+            )
+            section_outputs.append(
+                AnswerSectionOutput(
+                    section_id=section.section_id,
+                    title=section.title or answer_section.title,
+                    content=_compact_text(section.content) or "Evidence remains insufficient for a stronger section-level answer.",
+                    citation_ids=list(section.citation_ids),
+                    section_confidence=section_conf,
+                )
+            )
+            section_confidence.append(
+                SectionConfidenceRecord(
+                    section_id=section.section_id,
+                    title=section.title or answer_section.title,
+                    confidence=section_conf,
+                )
+            )
+        return section_outputs, section_confidence
+
     def _build_rejected_result(
         self,
         *,
@@ -6282,6 +6422,63 @@ class SubmissionSynthesizerAgent:
             time_elapsed=0.0,
         )
 
+    def _build_rejected_candidate_result(
+        self,
+        *,
+        task_spec: TaskSpec,
+        submission: AnswerSubmission,
+        review_items: Sequence[ReviewItem],
+        review_completion_status: ReviewCompletionStatus,
+        acceptance_decision: AcceptanceDecision,
+        retrieval_diagnostics_summary: str,
+        execution_warnings: Sequence[str],
+    ) -> QAResult:
+        section_outputs, section_confidence = self._build_submission_section_outputs(
+            task_spec=task_spec,
+            submission=submission,
+        )
+        blocker_summary = "; ".join(acceptance_decision.blocker_messages) or "Submission remains not acceptance-ready."
+        limitations_parts = list(submission.limitations)
+        limitations_parts.append(
+            "Candidate submission was surfaced despite rejection; outstanding blockers: " + blocker_summary
+        )
+        unresolved_blocking = [item for item in review_items if item.status == "open" and item.severity == "blocking"]
+        if unresolved_blocking:
+            limitations_parts.append(
+                "Unresolved blocking review items remain: "
+                + "; ".join(item.required_action for item in unresolved_blocking[:3])
+            )
+        if review_completion_status == "incomplete":
+            limitations_parts.append("Reviewer completion was incomplete.")
+        overall_score = submission.overall_confidence.score
+        if unresolved_blocking:
+            overall_score = min(overall_score, 0.45)
+        if review_completion_status == "incomplete":
+            overall_score = min(overall_score, 0.35)
+        return QAResult(
+            question=submission.question,
+            language="en",
+            workflow_mode="react_reviewed",
+            acceptance_status="rejected",
+            final_answer=_assemble_final_answer(section_outputs),
+            sections=section_outputs,
+            citations=_submission_to_citation_records(submission),
+            claim_trace=[],
+            submission_trace=_build_submission_trace(submission),
+            review_completion_status=review_completion_status,
+            overall_confidence=_result_confidence(
+                overall_score,
+                "Overall confidence is derived from the surfaced candidate submission and outstanding review issues.",
+            ),
+            section_confidence=section_confidence,
+            insufficient_evidence=bool(unresolved_blocking) or not submission.citations,
+            limitations_summary=" ".join(part for part in limitations_parts if _compact_text(part)).strip(),
+            retrieval_diagnostics_summary=str(retrieval_diagnostics_summary or "").strip(),
+            execution_warnings=list(_merge_unique_text([], execution_warnings)),
+            artifact_paths={},
+            time_elapsed=0.0,
+        )
+
 
 class ReactReviewedWorkflow:
     def __init__(
@@ -6311,6 +6508,8 @@ class ReactReviewedWorkflow:
         self.handoff = handoff
         self.evidence_extractor = evidence_extractor
         self.paper_profile_builder = paper_profile_builder or GrobidPaperProfileBuilder()
+        self.grobid_preflight_enabled = bool(react_config.get("grobid_preflight_enabled", True))
+        self._last_grobid_preflight_artifact_path: Optional[str] = None
         self.proposer_candidate_target = max(1, int(proposer_candidate_target))
         self.proposer_rerank_top_k = max(
             1,
@@ -6354,7 +6553,44 @@ class ReactReviewedWorkflow:
             )
             for reviewer_role in self.reviewer_role_order
         }
-        self.synthesizer = SubmissionSynthesizerAgent()
+        self.synthesizer = SubmissionSynthesizerAgent(
+            expose_candidate_submission_when_rejected=react_config.get(
+                "expose_candidate_submission_when_rejected",
+                False,
+            )
+        )
+
+    def _run_grobid_preflight(
+        self,
+        *,
+        store: QAArtifactStore,
+        workspace: ReactReviewedWorkspace,
+    ) -> Optional[str]:
+        if not self.grobid_preflight_enabled:
+            return None
+        ensure_available = getattr(self.paper_profile_builder, "ensure_service_available", None)
+        if not callable(ensure_available):
+            return None
+        try:
+            payload = ensure_available()
+            normalized_payload = dict(payload or {})
+            normalized_payload.setdefault("status", "healthy")
+            artifact_path = store.write_json("diagnostics/grobid_preflight.json", normalized_payload)
+            self._last_grobid_preflight_artifact_path = artifact_path
+            if normalized_payload.get("startup_attempted"):
+                workspace._merge_execution_warnings(
+                    [
+                        "GROBID service was auto-started during react_reviewed preflight."
+                    ]
+                )
+            return artifact_path
+        except Exception as exc:
+            payload = dict(getattr(self.paper_profile_builder, "last_preflight_payload", {}) or {})
+            payload["status"] = "failure"
+            payload["error"] = _compact_text(str(exc)) or "unknown grobid preflight failure"
+            artifact_path = store.write_json("diagnostics/grobid_preflight.json", payload)
+            self._last_grobid_preflight_artifact_path = artifact_path
+            raise RuntimeError(payload["error"]) from exc
 
     def _evaluate_acceptance(
         self,
@@ -6674,6 +6910,7 @@ class ReactReviewedWorkflow:
         artifact_dir: Optional[str] = None,
     ) -> QAResult:
         started_at = time.perf_counter()
+        self._last_grobid_preflight_artifact_path = None
         store = QAArtifactStore(base_dir=artifact_dir)
         task_spec, router_artifacts = self.router_agent.run(
             question=question,
@@ -6723,7 +6960,12 @@ class ReactReviewedWorkflow:
         latest_statuses: List[ReviewerRunStatus] = []
         workflow_error: Optional[BaseException] = None
         failing_cycle_number = 1
+        grobid_preflight_artifact_path: Optional[str] = None
         try:
+            grobid_preflight_artifact_path = self._run_grobid_preflight(
+                store=store,
+                workspace=workspace,
+            )
             for cycle_number in range(1, max_review_cycles + 1):
                 failing_cycle_number = cycle_number
                 workspace.set_review_context(
@@ -6929,6 +7171,7 @@ class ReactReviewedWorkflow:
                 if workflow_error is not None
                 else None
             ),
+            "grobid_preflight": grobid_preflight_artifact_path or self._last_grobid_preflight_artifact_path,
             "qa_result": str(store.path("qa_result.json")),
         }
         artifact_paths = {key: value for key, value in artifact_paths.items() if value is not None}

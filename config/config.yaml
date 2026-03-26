@@ -81,8 +81,15 @@ qa:
     proposer_repair_attempts: 1
     proposer_evidence_policy: "prefer_fulltext"
     grobid_url: "http://localhost:8070"
-    proposer_candidate_target: 20
+    grobid_preflight_enabled: true
+    grobid_startup_enabled: true
+    grobid_startup_script: "./scripts/grobid-up.sh"
+    grobid_startup_timeout_seconds: 180.0
+    grobid_startup_wait_timeout_seconds: 120.0
+    grobid_startup_poll_interval_seconds: 2.0
+    proposer_candidate_target: 10
     proposer_rerank_top_k: 5
+    expose_candidate_submission_when_rejected: true
 
     stage_watchdog_seconds: 120.0
     max_review_cycles: 3

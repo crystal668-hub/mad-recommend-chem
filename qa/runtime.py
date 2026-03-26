@@ -109,9 +109,16 @@ DEFAULT_QA_CONFIG: Dict[str, Any] = {
         "proposer_repair_attempts": 1,
         "reviewer_repair_attempts": 1,
         "proposer_evidence_policy": "prefer_fulltext",
-        "proposer_candidate_target": 18,
+        "proposer_candidate_target": 10,
         "proposer_rerank_top_k": 5,
+        "expose_candidate_submission_when_rejected": False,
         "grobid_url": "http://localhost:8070",
+        "grobid_preflight_enabled": True,
+        "grobid_startup_enabled": False,
+        "grobid_startup_script": "./scripts/grobid-up.sh",
+        "grobid_startup_timeout_seconds": 180.0,
+        "grobid_startup_wait_timeout_seconds": 120.0,
+        "grobid_startup_poll_interval_seconds": 2.0,
         "stage_watchdog_seconds": 120.0,
         "max_review_cycles": 3,
         "reviewer_max_steps": 3,
@@ -313,8 +320,40 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "proposer_candidate_target": proposer_candidate_target,
         "proposer_rerank_top_k": proposer_rerank_top_k,
+        "expose_candidate_submission_when_rejected": bool(
+            react_reviewed_config.get(
+                "expose_candidate_submission_when_rejected",
+                DEFAULT_QA_CONFIG["react_reviewed"]["expose_candidate_submission_when_rejected"],
+            )
+        ),
         "grobid_url": _resolve_provider_text(react_reviewed_config.get("grobid_url"))
         or str(DEFAULT_QA_CONFIG["react_reviewed"]["grobid_url"]),
+        "grobid_preflight_enabled": bool(
+            react_reviewed_config.get(
+                "grobid_preflight_enabled",
+                DEFAULT_QA_CONFIG["react_reviewed"]["grobid_preflight_enabled"],
+            )
+        ),
+        "grobid_startup_enabled": bool(
+            react_reviewed_config.get(
+                "grobid_startup_enabled",
+                DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_enabled"],
+            )
+        ),
+        "grobid_startup_script": _resolve_provider_text(react_reviewed_config.get("grobid_startup_script"))
+        or str(DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_script"]),
+        "grobid_startup_timeout_seconds": _coerce_positive_float(
+            react_reviewed_config.get("grobid_startup_timeout_seconds"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_timeout_seconds"],
+        ),
+        "grobid_startup_wait_timeout_seconds": _coerce_positive_float(
+            react_reviewed_config.get("grobid_startup_wait_timeout_seconds"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_wait_timeout_seconds"],
+        ),
+        "grobid_startup_poll_interval_seconds": _coerce_positive_float(
+            react_reviewed_config.get("grobid_startup_poll_interval_seconds"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_poll_interval_seconds"],
+        ),
         "stage_watchdog_seconds": _coerce_positive_float(
             react_reviewed_config.get("stage_watchdog_seconds"),
             fallback=DEFAULT_QA_CONFIG["react_reviewed"]["stage_watchdog_seconds"],
@@ -823,6 +862,12 @@ def build_qa_runtime(
             evidence_extractor=retrieval_pipeline.evidence_extractor,
             paper_profile_builder=GrobidPaperProfileBuilder(
                 grobid_url=react_reviewed_config.get("grobid_url"),
+                preflight_enabled=react_reviewed_config.get("grobid_preflight_enabled", True),
+                startup_enabled=react_reviewed_config.get("grobid_startup_enabled", False),
+                startup_script=react_reviewed_config.get("grobid_startup_script"),
+                startup_timeout_seconds=react_reviewed_config.get("grobid_startup_timeout_seconds", 180.0),
+                startup_wait_timeout_seconds=react_reviewed_config.get("grobid_startup_wait_timeout_seconds", 120.0),
+                startup_poll_interval_seconds=react_reviewed_config.get("grobid_startup_poll_interval_seconds", 2.0),
             ),
             proposer_model_config=get_node_model_config("react_proposer"),
             reviewer_model_configs={
@@ -831,7 +876,7 @@ def build_qa_runtime(
                 "reasoning_consistency": get_node_model_config("react_reviewer_reasoning_consistency") or {},
                 "counterevidence": get_node_model_config("react_reviewer_counterevidence") or {},
             },
-            proposer_candidate_target=react_reviewed_config.get("proposer_candidate_target", 18),
+            proposer_candidate_target=react_reviewed_config.get("proposer_candidate_target", 10),
             proposer_rerank_top_k=react_reviewed_config.get("proposer_rerank_top_k", 5),
         )
 

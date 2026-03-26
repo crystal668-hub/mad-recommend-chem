@@ -121,6 +121,24 @@ class DocumentAcquirerNode:
             parse_fulltext=False,
         )
 
+    def download_pdf_only_with_fallback(
+        self,
+        *,
+        candidate: PaperCandidate,
+        artifact_store: Optional[QAArtifactStore] = None,
+    ) -> Tuple[PaperRecord, SectionIndex]:
+        store = artifact_store or QAArtifactStore()
+        self._diagnostic_map = {}
+        self._provider_health_fallback = self._init_provider_health()
+        self.last_execution_warnings = []
+        paper_record, section_index = self._download_one_with_fallback(
+            candidate=candidate,
+            store=store,
+        )
+        self.last_diagnostics = self._finalize_diagnostics()
+        self.last_provider_health = self._collect_provider_health()
+        return paper_record, section_index
+
     def parse_documents(
         self,
         paper_records: Sequence[PaperRecord],
@@ -137,6 +155,288 @@ class DocumentAcquirerNode:
             parsed_records.append(parsed_record)
             section_indices.append(section_index)
         return parsed_records, section_indices
+
+    def _download_one_with_fallback(
+        self,
+        *,
+        candidate: PaperCandidate,
+        store: QAArtifactStore,
+    ) -> Tuple[PaperRecord, SectionIndex]:
+        provider_artifacts = dict(candidate.provider_artifacts)
+        provider_sources = list(candidate.provider_hits)
+        oa_url = None
+        download_source = None
+        fallback_reason: Optional[str] = None
+        acquire_started_at = time.perf_counter()
+
+        self._write_runtime_status(
+            store=store,
+            stage="download_document",
+            status="start",
+            paper_id=candidate.paper_id,
+            provider="document_acquirer",
+            metadata={
+                "doi": candidate.doi,
+                "document_fetch_timeout_seconds": self.document_fetch_timeout_seconds,
+                "document_fetch_total_timeout_seconds": self.document_fetch_total_timeout_seconds,
+            },
+        )
+
+        try:
+            if not str(candidate.doi or "").strip():
+                raise ValueError(f"paper_id={candidate.paper_id} has no DOI for Unpaywall lookup.")
+            if self.unpaywall_client is None:
+                raise RuntimeError("Unpaywall lookup is required for proposer PDF download but the client is not configured.")
+
+            self._check_total_timeout(
+                started_at=acquire_started_at,
+                paper_id=candidate.paper_id,
+                stage="unpaywall_lookup",
+                store=store,
+                provider="unpaywall",
+            )
+            self._write_runtime_status(
+                store=store,
+                stage="unpaywall_lookup",
+                status="start",
+                paper_id=candidate.paper_id,
+                provider="unpaywall",
+                metadata={"doi": candidate.doi},
+                started_at=acquire_started_at,
+            )
+            try:
+                unpaywall_payload = self._run_with_timeout(
+                    lambda: self.unpaywall_client.lookup(candidate.doi),
+                    timeout_seconds=self.document_fetch_timeout_seconds,
+                )
+                self._record_provider_health_success("unpaywall")
+                self._record_diagnostic(provider="unpaywall", stage="lookup", outcome="hit")
+                self._write_runtime_status(
+                    store=store,
+                    stage="unpaywall_lookup",
+                    status="success",
+                    paper_id=candidate.paper_id,
+                    provider="unpaywall",
+                    metadata={"doi": candidate.doi},
+                    started_at=acquire_started_at,
+                )
+            except Exception as exc:
+                self._record_provider_health_failure("unpaywall", exc)
+                self._record_diagnostic(
+                    provider="unpaywall",
+                    stage="lookup",
+                    outcome=self._classify_error(exc),
+                    message=f"paper_id={candidate.paper_id}: {exc}",
+                )
+                self._write_runtime_status(
+                    store=store,
+                    stage="unpaywall_lookup",
+                    status=self._classify_error(exc),
+                    paper_id=candidate.paper_id,
+                    provider="unpaywall",
+                    metadata={"error": str(exc), "doi": candidate.doi},
+                    started_at=acquire_started_at,
+                )
+                raise
+            provider_artifacts["unpaywall"] = store.write_json(
+                f"provider_raw/unpaywall/{candidate.paper_id}.json",
+                unpaywall_payload,
+            )
+            provider_sources = list(dict.fromkeys([*provider_sources, "unpaywall"]))
+            best_location = dict((unpaywall_payload or {}).get("best_oa_location") or {})
+            unpaywall_pdf_url = str(best_location.get("url_for_pdf") or "").strip()
+            fallback_url = str(
+                candidate.open_access_pdf_url or candidate.best_oa_pdf_url or ""
+            ).strip()
+            if not unpaywall_pdf_url:
+                if not fallback_url:
+                    raise RuntimeError(
+                        f"paper_id={candidate.paper_id} did not expose best_oa_location.url_for_pdf from Unpaywall."
+                    )
+                fallback_reason = "missing_unpaywall_url_for_pdf"
+                pdf_artifact_path, resolved_oa_url = self._fetch_pdf_artifact(
+                    candidate=candidate,
+                    url=fallback_url,
+                    store=store,
+                    acquire_started_at=acquire_started_at,
+                    download_source="semantic_scholar_pdf_fallback",
+                )
+                provider_sources = list(dict.fromkeys([*provider_sources, "semantic_scholar_pdf_fallback"]))
+                oa_url = resolved_oa_url
+                download_source = "semantic_scholar_pdf_fallback"
+            else:
+                try:
+                    pdf_artifact_path, resolved_oa_url = self._fetch_pdf_artifact(
+                        candidate=candidate,
+                        url=unpaywall_pdf_url,
+                        store=store,
+                        acquire_started_at=acquire_started_at,
+                        download_source="unpaywall_pdf",
+                    )
+                    provider_sources = list(dict.fromkeys([*provider_sources, "unpaywall_pdf"]))
+                    oa_url = resolved_oa_url
+                    download_source = "unpaywall_pdf"
+                except Exception as first_exc:
+                    if not fallback_url or fallback_url == unpaywall_pdf_url:
+                        raise RuntimeError(
+                            f"paper_id={candidate.paper_id} could not be downloaded from Unpaywall PDF URL: {first_exc}"
+                        ) from first_exc
+                    fallback_reason = "unpaywall_pdf_download_failed"
+                    pdf_artifact_path, resolved_oa_url = self._fetch_pdf_artifact(
+                        candidate=candidate,
+                        url=fallback_url,
+                        store=store,
+                        acquire_started_at=acquire_started_at,
+                        download_source="semantic_scholar_pdf_fallback",
+                    )
+                    provider_sources = list(dict.fromkeys([*provider_sources, "semantic_scholar_pdf_fallback"]))
+                    oa_url = resolved_oa_url
+                    download_source = "semantic_scholar_pdf_fallback"
+
+            section_index = SectionIndex(
+                paper_id=candidate.paper_id,
+                fulltext_status="binary_only",
+                sections=[],
+            )
+            index_artifact_path = store.write_json(
+                f"indices/{candidate.paper_id}.json",
+                section_index.model_dump(exclude_none=True),
+            )
+            paper_record = PaperRecord(
+                paper_id=candidate.paper_id,
+                doi=candidate.doi,
+                title=candidate.title,
+                abstract=candidate.abstract,
+                authors=list(candidate.authors),
+                year=candidate.year,
+                venue=candidate.venue,
+                provider_sources=provider_sources,
+                provider_artifacts=provider_artifacts,
+                oa_url=oa_url,
+                fulltext_available=True,
+                fulltext_status="binary_only",
+                fulltext_format="application/pdf",
+                fulltext_artifact_path=pdf_artifact_path,
+                source_artifact_path=pdf_artifact_path,
+                index_artifact_path=index_artifact_path,
+            )
+            self._write_runtime_status(
+                store=store,
+                stage="download_document",
+                status="success",
+                paper_id=candidate.paper_id,
+                provider="document_acquirer",
+                url=oa_url,
+                metadata={
+                    "download_source": download_source,
+                    "fallback_reason": fallback_reason,
+                    "fulltext_status": "binary_only",
+                    "fulltext_available": True,
+                    "section_count": 0,
+                },
+                started_at=acquire_started_at,
+            )
+            return paper_record, section_index
+        except Exception as exc:
+            self._write_runtime_status(
+                store=store,
+                stage="download_document",
+                status=self._classify_error(exc),
+                paper_id=candidate.paper_id,
+                provider="document_acquirer",
+                url=oa_url,
+                metadata={
+                    "error": str(exc),
+                    "download_source": download_source,
+                    "fallback_reason": fallback_reason,
+                },
+                started_at=acquire_started_at,
+            )
+            raise
+
+    def _fetch_pdf_artifact(
+        self,
+        *,
+        candidate: PaperCandidate,
+        url: str,
+        store: QAArtifactStore,
+        acquire_started_at: float,
+        download_source: str,
+    ) -> Tuple[str, str]:
+        self._check_total_timeout(
+            started_at=acquire_started_at,
+            paper_id=candidate.paper_id,
+            stage="oa_fetch",
+            store=store,
+            provider="oa_fetch",
+            url=url,
+        )
+        self._write_runtime_status(
+            store=store,
+            stage="oa_fetch",
+            status="start",
+            paper_id=candidate.paper_id,
+            provider="oa_fetch",
+            url=url,
+            metadata={"download_source": download_source},
+            started_at=acquire_started_at,
+        )
+        try:
+            fetched = self._run_with_timeout(
+                lambda: self.fetcher.fetch(url),
+                timeout_seconds=self.document_fetch_timeout_seconds,
+            )
+            binary = getattr(fetched, "binary", None)
+            content_type = str(getattr(fetched, "content_type", "") or "").strip().lower()
+            if not binary or not (
+                content_type == "application/pdf" or bytes(binary[:5]) == b"%PDF-"
+            ):
+                raise ValueError(
+                    f"paper_id={candidate.paper_id} did not return a usable PDF from {download_source}."
+                )
+            artifact_path = store.write_bytes(f"fulltext/{candidate.paper_id}.pdf", binary)
+            self._record_provider_health_success("oa_fetch")
+            self._record_diagnostic(provider="oa_fetch", stage="fetch", outcome="hit")
+            resolved_url = str(getattr(fetched, "final_url", None) or getattr(fetched, "url", None) or url)
+            self._write_runtime_status(
+                store=store,
+                stage="oa_fetch",
+                status="success",
+                paper_id=candidate.paper_id,
+                provider="oa_fetch",
+                url=url,
+                metadata={
+                    "download_source": download_source,
+                    "final_url": resolved_url,
+                    "redirect_count": int(getattr(fetched, "redirect_count", 0) or 0),
+                    "content_type": content_type,
+                },
+                started_at=acquire_started_at,
+            )
+            return artifact_path, resolved_url
+        except Exception as exc:
+            self._record_provider_health_failure("oa_fetch", exc)
+            if self._classify_error(exc) == "timeout":
+                self.last_execution_warnings.append(
+                    f"oa_fetch timed out for paper_id={candidate.paper_id} url={url}: {exc}"
+                )
+            self._record_diagnostic(
+                provider="oa_fetch",
+                stage="fetch",
+                outcome=self._classify_error(exc),
+                message=f"paper_id={candidate.paper_id}: {exc}",
+            )
+            self._write_runtime_status(
+                store=store,
+                stage="oa_fetch",
+                status=self._classify_error(exc),
+                paper_id=candidate.paper_id,
+                provider="oa_fetch",
+                url=url,
+                metadata={"error": str(exc), "download_source": download_source},
+                started_at=acquire_started_at,
+            )
+            raise
 
     __call__ = run
 

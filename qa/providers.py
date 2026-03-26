@@ -13,6 +13,15 @@ from qa.retrieval_utils import is_textual_content_type, normalize_doi
 
 
 _RETRYABLE_STATUS_CODES = {408, 429}
+DEFAULT_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+)
+DEFAULT_BROWSER_HEADERS = {
+    "User-Agent": DEFAULT_BROWSER_USER_AGENT,
+    "Accept": "application/pdf,application/xhtml+xml,application/xml;q=0.9,text/html;q=0.8,*/*;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 @dataclass
@@ -429,7 +438,10 @@ class SemanticScholarClient(_HttpTransportMixin):
         params: Dict[str, Any] = {
             "query": query_plan.query_text,
             "limit": limit,
-            "fields": "title,abstract,citationCount,year,venue,authors,externalIds,openAccessPdf,url",
+            "fields": (
+                "title,abstract,tldr,fieldsOfStudy,isOpenAccess,citationCount,"
+                "year,venue,authors,externalIds,openAccessPdf,url"
+            ),
         }
         if query_plan.year_from is not None:
             params["year"] = f"{query_plan.year_from}:{query_plan.year_to or query_plan.year_from}"
@@ -441,7 +453,10 @@ class SemanticScholarClient(_HttpTransportMixin):
         params = {
             "query": candidate.get("title"),
             "limit": 1,
-            "fields": "title,abstract,citationCount,year,venue,authors,externalIds",
+            "fields": (
+                "title,abstract,tldr,fieldsOfStudy,isOpenAccess,citationCount,"
+                "year,venue,authors,externalIds,openAccessPdf,url"
+            ),
         }
         headers = {"x-api-key": self.api_key} if self.api_key else None
         response = self._perform_get(self.base_url, params=params, headers=headers)
@@ -498,7 +513,9 @@ class HttpTextFetcher(_HttpTransportMixin):
         request_get: Optional[Callable[..., Any]] = None,
         sleep_fn: Optional[Callable[[float], None]] = None,
         random_fn: Optional[Callable[[], float]] = None,
+        browser_headers: Optional[Dict[str, str]] = None,
     ) -> None:
+        self.browser_headers = dict(browser_headers or DEFAULT_BROWSER_HEADERS)
         self._init_transport(
             provider_name="oa_fetch",
             timeout=timeout,
@@ -512,10 +529,13 @@ class HttpTextFetcher(_HttpTransportMixin):
             random_fn=random_fn,
         )
 
-    def fetch(self, url: str) -> FetchedDocument:
+    def fetch(self, url: str, headers: Optional[Dict[str, str]] = None) -> FetchedDocument:
+        request_headers = dict(self.browser_headers)
+        if headers:
+            request_headers.update(headers)
         response = self._perform_get(
             url,
-            headers={"User-Agent": "ChemQA/1.0 (+https://github.com/openai/codex-cli)"},
+            headers=request_headers,
         )
         content_type = str(response.headers.get("content-type") or "").split(";")[0].strip().lower()
         final_url = str(getattr(response, "url", "") or url)

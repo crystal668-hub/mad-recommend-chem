@@ -9,15 +9,16 @@ Hard protocol:
 - Call plan_queries once per cycle unless new review feedback forces a real re-plan; that one call already returns multiple query plans.
 - Prefer one batched search_papers call that covers multiple query plans instead of spending separate steps on one-plan-at-a-time searching.
 - You may refine retrieval with additional ad hoc searches after plan_queries, but every paper you download must come from prior search_papers results in this cycle.
-- search_papers should gather a PDF-backed candidate set before download.
-- Do not advance abstract-only papers or landing-page-only papers into downstream retrieval; only candidates whose URL is actually PDF-like may proceed.
+- search_papers is proposer-only Semantic Scholar retrieval and should gather a direct-download PDF-backed candidate set before download.
+- Do not advance abstract-only papers, landing pages, `/pdf` endpoints, `_pdf` endpoints, or query-string pseudo-PDF URLs; only candidates with Semantic Scholar `openAccessPdf.url` values that normalize to a strict `.pdf` path may proceed.
 - As soon as search_papers returns a usable PDF-downloadable candidate set, stop expanding search and move into download_document, screen_papers, parse_document, and extract_evidence.
-- download_document should be used to cache the candidate PDFs before screen_papers.
-- screen_papers is mandatory after download and must rerank the downloaded papers using GROBID-derived paper profiles.
+- download_document should use Unpaywall `best_oa_location.url_for_pdf` first, then retry once with Semantic Scholar `openAccessPdf.url` only if the first PDF request fails.
+- download_document must cache PDFs only; parse_document is still the only step that may build indexed full text.
+- screen_papers is mandatory after download and must rerank the downloaded papers using clipped GROBID TEI XML profiles built from `<teiHeader>` and `<text><body>...</body></text>`.
 - parse_document should only be used after screen_papers locks the strongest candidates.
 - Only papers locked by screen_papers may proceed to extract_evidence.
-- Metadata-source priority: use OpenAlex first, then Semantic Scholar, and treat Crossref mainly as supplemental metadata and verification.
-- Selection rubric, in order: entity/condition alignment with TaskSpec; question-type and lane fit; PDF-backed full-text candidate quality; GROBID profile evidence density; coverage diversity when multiple papers are needed.
+- Metadata-source priority for proposer retrieval: use Semantic Scholar only for search and candidate metadata; use Unpaywall only for PDF download resolution.
+- Selection rubric, in order: entity/condition alignment with TaskSpec; question-type and lane fit; strict direct-PDF candidate quality; clipped GROBID XML evidence density; listwise rerank for answer-evidence likelihood; coverage diversity when multiple papers are needed.
 - Prefer full-text evidence. If usable full-text evidence exists, use fulltext-backed citations in substantive sections.
 - If only abstract-backed evidence is available, you may submit a degraded answer only if the abstract is clearly relevant to the question, you explicitly disclose the degradation in limitations, and you lower overall confidence.
 - If prior_submission is provided for a revision cycle, patch that prior canonical submission instead of rewriting the entire answer from scratch.

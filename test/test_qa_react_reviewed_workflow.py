@@ -21,7 +21,7 @@ from qa.handoff import EvidenceExtractorHandoff
 from qa.nodes.query_planner import QueryPlannerExecutionError
 from qa.nodes.router import RouterExecutionError
 from qa.nodes.retriever import RetrieverNode
-from qa.paper_profiles import GrobidPaperProfileBuilder
+from qa.paper_profiles import GrobidPaperProfileBuilder, extract_profile_xml_segments
 from qa.react_reviewed_state import AnswerSubmission, ReviewItem, ReviewerRunStatus, SubmissionCitation, SubmissionConfidenceRating, SubmissionSection, SubmissionStepRef
 from qa.react_reviewed_workflow import (
     PROPOSER_TOOL_NAMES,
@@ -30,6 +30,7 @@ from qa.react_reviewed_workflow import (
     ReactReviewedReviewerExecutionError,
     ReactReviewedReviewerAgent,
     ReactReviewedStructuredOutputError,
+    SubmissionSynthesizerAgent,
     ReactReviewedWorkflow,
     ReactReviewedWorkspace,
     RouterAgentWrapper,
@@ -233,6 +234,22 @@ def _read_json(path: str) -> object:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _make_clipped_profile_xml(*, title: str, abstract: str = "", body: str = "") -> str:
+    body_text = body or abstract or "Profile body text."
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<TEI xmlns="http://www.tei-c.org/ns/1.0">'
+        "<teiHeader>"
+        f"<fileDesc><titleStmt><title>{title}</title></titleStmt>"
+        f"<sourceDesc><p>{abstract or title}</p></sourceDesc></fileDesc>"
+        "</teiHeader>"
+        "<text><body>"
+        f"<div><p>{body_text}</p></div>"
+        "</body></text>"
+        "</TEI>"
+    )
+
+
 class _StaticRouterNode:
     def run(self, *, question: str, context=None):
         return _task_spec(question)
@@ -392,14 +409,32 @@ class _CountingDocumentAcquirer:
 
 
 class _FakePaperProfileBuilder:
-    def __init__(self, *, failures: Optional[set[str]] = None) -> None:
+    def __init__(
+        self,
+        *,
+        failures: Optional[set[str]] = None,
+        preflight_exception: Optional[Exception] = None,
+        preflight_payload: Optional[dict] = None,
+    ) -> None:
         self.failures = set(failures or set())
         self.calls: list[str] = []
+        self.preflight_calls = 0
+        self.preflight_exception = preflight_exception
+        self.preflight_payload = dict(preflight_payload or {"status": "healthy", "startup_attempted": False})
 
     def build(self, *, paper_record: PaperRecord, artifact_store=None):
+        store = artifact_store or QAArtifactStore()
         self.calls.append(paper_record.paper_id)
         if paper_record.paper_id in self.failures:
             raise RuntimeError(f"profile extraction failed for {paper_record.paper_id}")
+        profile_xml_artifact_path = store.write_text(
+            f"proposer_profiles/{paper_record.paper_id}.profile.xml",
+            _make_clipped_profile_xml(
+                title=paper_record.title,
+                abstract=paper_record.abstract or "",
+                body=paper_record.abstract or f"{paper_record.title} evidence body.",
+            ),
+        )
         return PaperProfile.model_validate(
             {
                 "paper_id": paper_record.paper_id,
@@ -407,23 +442,17 @@ class _FakePaperProfileBuilder:
                 "doi": paper_record.doi,
                 "year": paper_record.year,
                 "venue": paper_record.venue,
-                "oa_source_url": paper_record.oa_url,
                 "source_artifact_path": paper_record.source_artifact_path,
-                "parser_name": "fake_grobid",
                 "profile_status": "ready",
-                "abstract_or_summary": paper_record.abstract or "profile summary",
-                "section_headings": ["Abstract", "Results"],
-                "problem_or_task": "Assess alkaline HER evidence for Pt/C.",
-                "materials_or_entities": ["Pt/C", "HER", "KOH"],
-                "methods_or_experimental_setup": "Electrochemical benchmark testing in alkaline media.",
-                "reported_metrics": ["overpotential", "current density"],
-                "evidence_rich_sections": ["Results"],
-                "citation_readiness_summary": "Profile indicates evidence-rich results content.",
-                "limitations": [],
-                "parser_artifact_path": "proposer_profiles/fake.profile.json",
-                "raw_artifact_path": "proposer_profiles/fake.grobid_raw.json",
+                "profile_xml_artifact_path": profile_xml_artifact_path,
             }
         )
+
+    def ensure_service_available(self):
+        self.preflight_calls += 1
+        if self.preflight_exception is not None:
+            raise self.preflight_exception
+        return dict(self.preflight_payload)
 
 
 class _FakePDFExtractor:
@@ -538,11 +567,19 @@ class _FailingProposer:
 
 
 class _ParallelReviewer:
-    def __init__(self, reviewer_role: str, barrier: threading.Barrier, delay_seconds: float, events: list[tuple[str, str]]) -> None:
+    def __init__(
+        self,
+        reviewer_role: str,
+        barrier: threading.Barrier,
+        delay_seconds: float,
+        events: list[tuple[str, str]],
+        review_items: list[ReviewItem] | None = None,
+    ) -> None:
         self.reviewer_role = reviewer_role
         self.barrier = barrier
         self.delay_seconds = delay_seconds
         self.events = events
+        self.review_items = list(review_items or [])
 
     def run(self, *, workspace, submission, proposer_trajectory, cycle_number, session):
         self.events.append((self.reviewer_role, threading.current_thread().name))
@@ -551,7 +588,7 @@ class _ParallelReviewer:
             time.sleep(self.delay_seconds)
         trajectory = _trajectory(f"{self.reviewer_role} review")
         return (
-            [],
+            list(self.review_items),
             trajectory,
             ReviewerRunStatus(
                 reviewer_role=self.reviewer_role,
@@ -606,9 +643,13 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(1, resolved["react_reviewed"]["proposer_repair_attempts"])
         self.assertEqual(1, resolved["react_reviewed"]["reviewer_repair_attempts"])
         self.assertEqual("prefer_fulltext", resolved["react_reviewed"]["proposer_evidence_policy"])
-        self.assertEqual(18, resolved["react_reviewed"]["proposer_candidate_target"])
+        self.assertEqual(10, resolved["react_reviewed"]["proposer_candidate_target"])
         self.assertEqual(5, resolved["react_reviewed"]["proposer_rerank_top_k"])
+        self.assertFalse(resolved["react_reviewed"]["expose_candidate_submission_when_rejected"])
         self.assertEqual("http://localhost:8070", resolved["react_reviewed"]["grobid_url"])
+        self.assertTrue(resolved["react_reviewed"]["grobid_preflight_enabled"])
+        self.assertFalse(resolved["react_reviewed"]["grobid_startup_enabled"])
+        self.assertEqual("./scripts/grobid-up.sh", resolved["react_reviewed"]["grobid_startup_script"])
         self.assertEqual(3, resolved["react_reviewed"]["max_review_cycles"])
         self.assertEqual(4, resolved["react_reviewed"]["reviewer_max_concurrency"])
         self.assertEqual(
@@ -629,7 +670,9 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
                     "react_reviewed": {
                         "proposer_candidate_target": "12",
                         "proposer_rerank_top_k": "20",
+                        "expose_candidate_submission_when_rejected": True,
                         "grobid_url": "http://grobid.internal:8070",
+                        "grobid_startup_enabled": True,
                     }
                 }
             }
@@ -637,7 +680,9 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(12, resolved["react_reviewed"]["proposer_candidate_target"])
         self.assertEqual(12, resolved["react_reviewed"]["proposer_rerank_top_k"])
+        self.assertTrue(resolved["react_reviewed"]["expose_candidate_submission_when_rejected"])
         self.assertEqual("http://grobid.internal:8070", resolved["react_reviewed"]["grobid_url"])
+        self.assertTrue(resolved["react_reviewed"]["grobid_startup_enabled"])
 
     @patch("qa.runtime.build_chat_model_from_config")
     def test_build_runtime_wires_proposer_screening_config_into_workflow(self, mock_build_model):
@@ -658,7 +703,9 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
                         "proposer_candidate_target": 9,
                         "proposer_rerank_top_k": 4,
                         "reviewer_repair_attempts": 2,
+                        "expose_candidate_submission_when_rejected": True,
                         "grobid_url": "http://grobid.internal:8070",
+                        "grobid_startup_enabled": True,
                     },
                 },
             }
@@ -671,6 +718,8 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(4, workflow.proposer_rerank_top_k)
         self.assertEqual(9, workflow.proposer.proposer_candidate_target)
         self.assertEqual(4, workflow.proposer.proposer_rerank_top_k)
+        self.assertTrue(workflow.synthesizer.expose_candidate_submission_when_rejected)
+        self.assertTrue(workflow.paper_profile_builder.startup_enabled)
         self.assertTrue(all(reviewer.repair_attempts == 2 for reviewer in workflow.reviewers.values()))
         self.assertEqual("http://grobid.internal:8070", workflow.paper_profile_builder.grobid_url)
 
@@ -842,7 +891,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         paper_profile_builder: _FakePaperProfileBuilder | None = None,
         entity_resolution_snapshot: dict | None = None,
         stage_watchdog_seconds: float = 120.0,
-        proposer_candidate_target: int = 18,
+        proposer_candidate_target: int = 10,
         proposer_rerank_top_k: int = 5,
     ) -> ReactReviewedWorkspace:
         artifact_store = QAArtifactStore(base_dir=self.temp_dir / "workspace")
@@ -1427,7 +1476,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 abstract=candidate.abstract,
                 oa_url=candidate.oa_url,
                 fulltext_available=True,
-                fulltext_status="fulltext_indexed",
+                fulltext_status="binary_only",
                 source_artifact_path=str(self.temp_dir / f"{paper_id}.pdf"),
             )
             for paper_id, candidate in workspace.paper_candidates.items()
@@ -1457,7 +1506,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertIn("paper-bad", screened["dropped_paper_ids"])
         self.assertTrue(any(item["paper_id"] == "paper-bad" for item in screened["ranked_candidates"]))
 
-    def test_screen_candidate_papers_expands_to_other_downloaded_candidates_when_requested_subset_all_fail(self):
+    def test_screen_candidate_papers_fails_fast_when_requested_candidates_have_no_usable_xml(self):
         proposer = ReactReviewedProposerAgent(
             model_config={"provider": "openai", "model": "fake", "api_key": "test"},
             max_steps_initial=6,
@@ -1503,29 +1552,14 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 abstract=candidate.abstract,
                 oa_url=candidate.oa_url,
                 fulltext_available=True,
-                fulltext_status="fulltext_indexed",
+                fulltext_status="binary_only",
                 source_artifact_path=str(self.temp_dir / f"{paper_id}.pdf"),
             )
             for paper_id, candidate in workspace.paper_candidates.items()
         }
 
-        def _screen_payload(*, ranked_candidates, **kwargs):
-            self.assertEqual(["paper-good"], [item["paper_id"] for item in ranked_candidates])
-            return {
-                "locked_paper_ids": ["paper-good"],
-                "dropped_paper_ids": [],
-                "ranked_candidates": [
-                    {"paper_id": "paper-good", "decision": "lock", "reason": "best fallback profile alignment"},
-                ],
-                "llm_screening_used": True,
-            }
-
-        with patch.object(
-            proposer,
-            "_llm_screen_candidate_papers",
-            side_effect=_screen_payload,
-        ):
-            screened = proposer._screen_candidate_papers(
+        with self.assertRaises(ReactReviewedProposerExecutionError) as ctx:
+            proposer._screen_candidate_papers(
                 workspace=workspace,
                 cycle_number=1,
                 open_review_items=[],
@@ -1533,10 +1567,10 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 max_candidates=1,
             )
 
-        self.assertEqual(["paper-good"], screened["locked_paper_ids"])
-        self.assertIn("paper-bad-1", screened["dropped_paper_ids"])
-        self.assertIn("paper-bad-2", screened["dropped_paper_ids"])
-        self.assertTrue(any(item["paper_id"] == "paper-good" for item in screened["ranked_candidates"]))
+        self.assertEqual("proposer_screening", ctx.exception.stage)
+        failure_path = self.temp_dir / "workspace" / "diagnostics" / "proposer_cycle_1_failure.json"
+        failure_payload = _read_json(str(failure_path))
+        self.assertEqual("no_profile_ready_candidates", failure_payload["details"]["reason"])
 
     def test_workspace_search_papers_filters_non_pdf_candidates(self):
         class _MixedRetriever:
@@ -1610,6 +1644,103 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         )
 
         self.assertEqual(["paper-oa", "paper-pdf-endpoint"], [item["paper_id"] for item in result])
+
+    def test_workspace_search_papers_proposer_only_semantic_applies_strict_pdf_rules_and_caps_at_ten(self):
+        class _NoopClient:
+            def search(self, query_plan, limit=8):
+                return []
+
+            def enrich(self, candidate):
+                return None
+
+        class _SemanticScholarClient:
+            def search(self, query_plan, limit=8):
+                del query_plan, limit
+                payload = []
+                for index in range(12):
+                    payload.append(
+                        {
+                            "title": f"Pt/C alkaline HER study {index}",
+                            "abstract": "Pt/C improves HER activity in alkaline media.",
+                            "tldr": {"text": "Direct HER relevance."},
+                            "fieldsOfStudy": ["Chemistry"],
+                            "isOpenAccess": True,
+                            "openAccessPdf": {"url": f"https://example.org/paper-{index}.pdf"},
+                            "citationCount": 100 - index,
+                            "year": 2024,
+                            "venue": "Journal",
+                            "authors": [{"name": "Author"}],
+                            "externalIds": {"DOI": f"10.1000/valid-{index}"},
+                        }
+                    )
+                payload.extend(
+                    [
+                        {
+                            "title": "Missing DOI",
+                            "abstract": "No DOI should be rejected.",
+                            "tldr": {"text": "No DOI."},
+                            "fieldsOfStudy": ["Chemistry"],
+                            "isOpenAccess": True,
+                            "openAccessPdf": {"url": "https://example.org/no-doi.pdf"},
+                            "citationCount": 999,
+                            "year": 2024,
+                            "venue": "Journal",
+                            "authors": [{"name": "Author"}],
+                            "externalIds": {},
+                        },
+                        {
+                            "title": "Query PDF pseudo endpoint",
+                            "abstract": "Should be rejected.",
+                            "tldr": {"text": "Bad URL."},
+                            "fieldsOfStudy": ["Chemistry"],
+                            "isOpenAccess": True,
+                            "openAccessPdf": {"url": "https://example.org/paper.pdf?download=1"},
+                            "citationCount": 998,
+                            "year": 2024,
+                            "venue": "Journal",
+                            "authors": [{"name": "Author"}],
+                            "externalIds": {"DOI": "10.1000/bad-query"},
+                        },
+                        {
+                            "title": "Slash pdf endpoint",
+                            "abstract": "Should be rejected.",
+                            "tldr": {"text": "Bad URL."},
+                            "fieldsOfStudy": ["Chemistry"],
+                            "isOpenAccess": True,
+                            "openAccessPdf": {"url": "https://example.org/paper/pdf"},
+                            "citationCount": 997,
+                            "year": 2024,
+                            "venue": "Journal",
+                            "authors": [{"name": "Author"}],
+                            "externalIds": {"DOI": "10.1000/bad-slash"},
+                        },
+                    ]
+                )
+                return payload
+
+            def enrich(self, candidate):
+                return None
+
+        retriever = RetrieverNode(
+            openalex_client=_NoopClient(),
+            crossref_client=_NoopClient(),
+            semantic_scholar_client=_SemanticScholarClient(),
+            per_lane_limit=20,
+            final_top_k=20,
+        )
+        workspace = self._make_workspace(retriever=retriever, proposer_candidate_target=10)
+
+        result = workspace.search_papers(
+            query_text="Pt/C HER alkaline",
+            lane="data",
+            reason="semantic proposer filter",
+            proposer_only_semantic=True,
+            write_snapshot=False,
+        )
+
+        self.assertEqual(10, len(result))
+        self.assertTrue(all(str(item["doi"]).startswith("10.1000/valid-") for item in result))
+        self.assertTrue(all(str(item["open_access_pdf_url"]).endswith(".pdf") for item in result))
 
     def test_retriever_filters_off_topic_candidates_before_enrichment(self):
         class _OpenAlexClient:
@@ -1907,33 +2038,25 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual("10.1000/complete-openalex", candidates[0].doi)
         self.assertEqual(0, crossref.enrich_calls)
 
-    def test_grobid_paper_profile_builder_prefers_grobid_then_supplements_local_fulltext(self):
-        artifact_store = QAArtifactStore(base_dir=self.temp_dir / "paper_profile_local")
+    def test_grobid_paper_profile_builder_writes_clipped_xml_with_header_and_body_only(self):
+        artifact_store = QAArtifactStore(base_dir=self.temp_dir / "paper_profile_xml")
         source_pdf_path = artifact_store.write_bytes("fulltext/paper-1.pdf", b"%PDF-1.4\n%fixture\n")
-        fulltext_path = artifact_store.write_text(
-            "fulltext/paper-1.fulltext.txt",
-            "\n".join(
-                [
-                    "Abstract",
-                    "ICP-MS was used to quantify lead, cadmium, and arsenic in river water at trace levels.",
-                    "Methods",
-                    "Samples were acidified and analyzed by inductively coupled plasma mass spectrometry.",
-                    "Results",
-                    "Trace-level multi-element quantification was achieved with ICP-MS.",
-                ]
-            ),
+        tei_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<TEI xmlns="http://www.tei-c.org/ns/1.0">'
+            "<teiHeader>"
+            "<fileDesc>"
+            "<titleStmt><title>ICP-MS trace metals in river water</title></titleStmt>"
+            "<sourceDesc><p>River-water trace metals measured by ICP-MS.</p></sourceDesc>"
+            "</fileDesc>"
+            "</teiHeader>"
+            "<text><body>"
+            "<div><head>Methods</head><p>Samples were acidified and analyzed by inductively coupled plasma mass spectrometry.</p></div>"
+            "<div><head>Results</head><p>Trace-level multi-element quantification was achieved with ICP-MS in surface water.</p></div>"
+            "</body><back><div><p>References should be removed.</p></div></back></text>"
+            "</TEI>"
         )
-        def _loader_factory(_path):
-            return SimpleNamespace(
-                load=lambda: [
-                    SimpleNamespace(
-                        page_content="ICP-MS quantified lead, cadmium, and arsenic in surface water.",
-                        metadata={"section_title": "Abstract"},
-                    )
-                ]
-            )
-
-        builder = GrobidPaperProfileBuilder(loader_factory=_loader_factory)
+        builder = GrobidPaperProfileBuilder(tei_xml_factory=lambda _path: tei_xml)
         paper_record = PaperRecord.model_validate(
             {
                 "paper_id": "paper-1",
@@ -1943,37 +2066,36 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 "year": 2024,
                 "venue": "Journal",
                 "fulltext_available": True,
-                "fulltext_status": "fulltext_indexed",
+                "fulltext_status": "binary_only",
                 "source_artifact_path": source_pdf_path,
-                "fulltext_artifact_path": fulltext_path,
+                "fulltext_artifact_path": source_pdf_path,
             }
         )
 
         profile = builder.build(paper_record=paper_record, artifact_store=artifact_store)
+        profile_xml_path = Path(profile.profile_xml_artifact_path)
+        profile_xml = profile_xml_path.read_text(encoding="utf-8")
+        segments = extract_profile_xml_segments(str(profile_xml_path))
 
         self.assertEqual("ready", profile.profile_status)
-        self.assertEqual("langchain_community.GenericLoader+GrobidParser+local_fulltext_text", profile.parser_name)
-        self.assertIn("surface water", profile.abstract_or_summary)
-        self.assertIn("Methods", profile.section_headings)
-        self.assertIn("inductively coupled plasma mass spectrometry", profile.methods_or_experimental_setup.lower())
-        self.assertIn("Results", profile.evidence_rich_sections)
+        self.assertTrue(str(profile.profile_xml_artifact_path).endswith(".profile.xml"))
+        self.assertIn("<teiHeader", profile_xml)
+        self.assertIn("<body", profile_xml)
+        self.assertNotIn("<back", profile_xml)
+        self.assertIn("surface water", segments["body_text"].lower())
+        self.assertFalse((self.temp_dir / "paper_profile_xml" / "proposer_profiles" / "paper-1.profile.json").exists())
+        self.assertFalse((self.temp_dir / "paper_profile_xml" / "proposer_profiles" / "paper-1.grobid_raw.json").exists())
 
-    def test_workspace_build_paper_profile_indexes_binary_pdf_before_grobid(self):
-        loader_calls: list[str] = []
+    def test_workspace_build_paper_profile_uses_downloaded_pdf_without_indexing(self):
+        tei_xml = _make_clipped_profile_xml(
+            title="ICP-MS workflow for trace metals in river water",
+            abstract="ICP-MS workflow summary.",
+            body="ICP-MS workflow for trace metals in river water.",
+        )
 
         workspace = self._make_workspace(
             paper_profile_builder=GrobidPaperProfileBuilder(
-                loader_factory=lambda path: (
-                    loader_calls.append(str(path)),
-                    SimpleNamespace(
-                        load=lambda: [
-                            SimpleNamespace(
-                                page_content="ICP-MS workflow for trace metals in river water.",
-                                metadata={"section_title": "Abstract"},
-                            )
-                        ]
-                    ),
-                )[1]
+                tei_xml_factory=lambda _path: tei_xml,
             )
         )
         workspace.paper_candidates = {"paper-1": _paper_candidate("paper-1")}
@@ -1985,49 +2107,18 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         )
 
         self.assertEqual("ready", profile_payload["profile_status"])
-        self.assertEqual(
-            "langchain_community.GenericLoader+GrobidParser+local_fulltext_text",
-            profile_payload["parser_name"],
-        )
-        self.assertEqual("fulltext_indexed", workspace.paper_records["paper-1"].fulltext_status)
-        self.assertTrue(str(workspace.paper_records["paper-1"].fulltext_artifact_path).endswith(".txt"))
-        self.assertEqual(1, len(loader_calls))
+        self.assertIn("profile_xml_artifact_path", profile_payload)
+        self.assertNotIn("parser_name", profile_payload)
+        self.assertNotIn("abstract_or_summary", profile_payload)
+        self.assertEqual("binary_only", workspace.paper_records["paper-1"].fulltext_status)
+        self.assertTrue(str(workspace.paper_records["paper-1"].fulltext_artifact_path).endswith(".pdf"))
 
-    def test_grobid_paper_profile_builder_falls_back_to_local_fulltext_when_server_unavailable(self):
-        artifact_store = QAArtifactStore(base_dir=self.temp_dir / "paper_profile_local_fallback")
-        source_pdf_path = artifact_store.write_bytes("fulltext/paper-local.pdf", b"%PDF-1.4\n%fixture\n")
-        fulltext_path = artifact_store.write_text(
-            "fulltext/paper-local.fulltext.txt",
-            "\n".join(
-                [
-                    "Abstract",
-                    "ICP-MS quantified lead, cadmium, and arsenic in river water.",
-                    "Methods",
-                    "Samples were filtered, acidified, and analyzed by ICP-MS.",
-                ]
-            ),
-        )
-        builder = GrobidPaperProfileBuilder(grobid_url="http://127.0.0.1:9")
-        paper_record = PaperRecord.model_validate(
-            {
-                "paper_id": "paper-local",
-                "doi": "10.1000/paper-local",
-                "title": "River-water ICP-MS workflow",
-                "abstract": "River-water ICP-MS workflow.",
-                "year": 2024,
-                "venue": "Journal",
-                "fulltext_available": True,
-                "fulltext_status": "fulltext_indexed",
-                "source_artifact_path": source_pdf_path,
-                "fulltext_artifact_path": fulltext_path,
-            }
-        )
+    def test_workspace_snapshot_does_not_write_paper_profiles_json(self):
+        workspace = self._make_workspace()
 
-        profile = builder.build(paper_record=paper_record, artifact_store=artifact_store)
+        workspace.write_shared_snapshot()
 
-        self.assertEqual("ready", profile.profile_status)
-        self.assertEqual("local_fulltext_text", profile.parser_name)
-        self.assertIn("filtered, acidified", profile.methods_or_experimental_setup)
+        self.assertFalse((self.temp_dir / "workspace" / "paper_profiles.json").exists())
 
     def test_grobid_paper_profile_builder_fails_fast_when_server_unavailable(self):
         artifact_store = QAArtifactStore(base_dir=self.temp_dir / "paper_profile_grobid_unavailable")
@@ -2055,6 +2146,81 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
 
         self.assertIn("GROBID server unavailable", str(ctx.exception))
         self.assertLess(elapsed_seconds, 5.0)
+
+    def test_grobid_paper_profile_builder_can_start_service_during_preflight(self):
+        health_responses = [
+            RuntimeError("connection refused"),
+            SimpleNamespace(status_code=200, text="true"),
+        ]
+        startup_calls: list[list[str]] = []
+
+        def _request_get(_url: str, timeout: float):
+            response = health_responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        def _command_runner(command, **kwargs):
+            startup_calls.append(list(command))
+            return SimpleNamespace(returncode=0, stdout="started", stderr="")
+
+        builder = GrobidPaperProfileBuilder(
+            grobid_url="http://127.0.0.1:8070",
+            request_get=_request_get,
+            startup_enabled=True,
+            startup_script="./scripts/grobid-up.sh",
+            startup_wait_timeout_seconds=5.0,
+            startup_poll_interval_seconds=0.01,
+            command_runner=_command_runner,
+        )
+
+        payload = builder.ensure_service_available()
+
+        self.assertEqual("healthy", payload["status"])
+        self.assertTrue(payload["startup_attempted"])
+        self.assertEqual([["/bin/bash", str((Path.cwd() / "scripts" / "grobid-up.sh").resolve())]], startup_calls)
+
+    def test_workflow_fails_fast_when_grobid_preflight_fails(self):
+        failing_builder = _FakePaperProfileBuilder(
+            preflight_exception=RuntimeError("GROBID preflight failed before react_reviewed execution."),
+        )
+        workflow = ReactReviewedWorkflow(
+            qa_config={
+                "react_reviewed": {
+                    "reviewer_max_concurrency": 4,
+                    "grobid_preflight_enabled": True,
+                    "expose_candidate_submission_when_rejected": True,
+                    "reviewer_retrieval_budget_by_role": {
+                        "search_coverage": 1,
+                        "evidence_trace": 0,
+                        "reasoning_consistency": 0,
+                        "counterevidence": 2,
+                    },
+                }
+            },
+            router=_StaticRouterNode(),
+            entity_resolver=_StaticEntityResolverNode(),
+            query_planner=_NoopQueryPlanner(),
+            retriever=_CountingRetriever(),
+            document_acquirer=_CountingDocumentAcquirer(),
+            handoff=EvidenceExtractorHandoff(),
+            evidence_extractor=_CountingEvidenceExtractor(),
+            paper_profile_builder=failing_builder,
+        )
+        workflow.proposer = _FakeProposer()
+
+        result = workflow.run(
+            question="How does Pt/C affect HER activity?",
+            artifact_dir=str(self.temp_dir / "artifacts_grobid_preflight_failure"),
+        )
+
+        self.assertEqual(1, failing_builder.preflight_calls)
+        self.assertEqual("rejected", result.acceptance_status)
+        self.assertIn("Workflow failed before a grounded submission could be completed.", result.final_answer)
+        self.assertIn("grobid_preflight", result.artifact_paths)
+        preflight_payload = _read_json(result.artifact_paths["grobid_preflight"])
+        self.assertEqual("failure", preflight_payload["status"])
+        self.assertIn("GROBID preflight failed", preflight_payload["error"])
 
     def test_normalize_submission_citations_does_not_backfill_irrelevant_abstract(self):
         proposer = ReactReviewedProposerAgent(
@@ -4178,6 +4344,86 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             result.data["search_warnings"],
         )
 
+    def test_proposer_tools_force_semantic_search_and_pdf_download_flags(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace()
+        captured_tools = {}
+        search_calls: list[dict] = []
+        download_calls: list[dict] = []
+
+        workspace.plan_queries = lambda focus="initial": [  # type: ignore[assignment]
+            {
+                "query_plan_id": "qp_1",
+                "lane": "data",
+                "query_text": "Pt/C HER alkaline",
+            }
+        ]
+        workspace.search_papers = lambda **kwargs: (  # type: ignore[assignment]
+            search_calls.append(dict(kwargs)) or [{"paper_id": "paper-1", "query_plan_id": "qp_1"}]
+        )
+        workspace.download_document = lambda **kwargs: (  # type: ignore[assignment]
+            download_calls.append(dict(kwargs))
+            or {
+                "paper_id": "paper-1",
+                "fulltext_available": True,
+                "fulltext_status": "binary_only",
+                "section_count": 0,
+                "artifact_path": "fulltext/paper-1.pdf",
+            }
+        )
+
+        class _StubStructuredTool:
+            @staticmethod
+            def from_function(func, name=None, args_schema=None):
+                tool_name = name or getattr(func, "__name__", "tool")
+
+                class _Tool:
+                    def __init__(self, func, name, args_schema):
+                        self.func = func
+                        self.name = name or getattr(func, "__name__", "tool")
+                        self.args_schema = args_schema
+
+                    def invoke(self, payload):
+                        if isinstance(payload, dict):
+                            return self.func(**payload)
+                        return self.func(payload)
+
+                tool = _Tool(func, name, args_schema)
+                captured_tools[tool_name] = tool
+                return tool
+
+        class _RaisingReActAgent:
+            def __init__(self, *args, **kwargs):
+                self.current_trajectory = _trajectory("flag capture")
+
+            def generate_response_with_react(self, *args, **kwargs):
+                raise RuntimeError("stop after tool registration")
+
+        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed_workflow.ReActAgent",
+            _RaisingReActAgent,
+        ):
+            with self.assertRaises(ReactReviewedProposerExecutionError):
+                proposer.run(
+                    workspace=workspace,
+                    cycle_number=1,
+                    open_review_items=[],
+                )
+
+        captured_tools["plan_queries"].invoke({"focus": "initial"})
+        captured_tools["search_papers"].invoke({"query_plan_id": "qp_1", "reason": "flag test"})
+        captured_tools["download_document"].invoke({"paper_id": "paper-1"})
+
+        self.assertTrue(search_calls)
+        self.assertTrue(download_calls)
+        self.assertTrue(search_calls[0]["proposer_only_semantic"])
+        self.assertTrue(download_calls[0]["proposer_pdf_download"])
+
     def test_proposer_uses_configured_screen_top_k_in_tool_schema_default(self):
         proposer = ReactReviewedProposerAgent(
             model_config={"provider": "openai", "model": "fake", "api_key": "test"},
@@ -4708,6 +4954,48 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertIn("evidence_anchor", decision["blocker_codes"])
         self.assertNotIn("final_submission", result.artifact_paths)
 
+    def test_workflow_can_surface_candidate_submission_when_rejected(self):
+        workflow = self._make_workflow()
+        workflow.synthesizer = SubmissionSynthesizerAgent(
+            expose_candidate_submission_when_rejected=True,
+        )
+        workflow.reviewers = {
+            "search_coverage": _ParallelReviewer(
+                "search_coverage",
+                threading.Barrier(1),
+                0.0,
+                [],
+                review_items=[
+                    ReviewItem(
+                        review_id="search_coverage_1",
+                        reviewer_role="search_coverage",
+                        anchor_kind="global",
+                        severity="blocking",
+                        flaw_type="inadequate_search_coverage",
+                        critique="Need broader coverage.",
+                        required_action="Add more papers.",
+                        evidence_refs=[],
+                        status="open",
+                    )
+                ],
+            ),
+            "evidence_trace": _ParallelReviewer("evidence_trace", threading.Barrier(1), 0.0, []),
+            "reasoning_consistency": _ParallelReviewer("reasoning_consistency", threading.Barrier(1), 0.0, []),
+            "counterevidence": _ParallelReviewer("counterevidence", threading.Barrier(1), 0.0, []),
+        }
+
+        result = workflow.run(
+            question="How does Pt/C affect HER activity?",
+            artifact_dir=str(self.temp_dir / "artifacts_surface_rejected"),
+        )
+
+        self.assertEqual("rejected", result.acceptance_status)
+        self.assertIn("Pt/C improves HER activity", result.final_answer)
+        self.assertNotIn("Acceptance Rejected", result.final_answer)
+        self.assertGreater(len(result.citations), 0)
+        self.assertIn("Candidate submission was surfaced despite rejection", result.limitations_summary)
+        self.assertNotIn("final_submission", result.artifact_paths)
+
     def test_reviewers_run_in_parallel_and_merge_in_fixed_role_order(self):
         workflow = self._make_workflow()
         start_events: list[tuple[str, str]] = []
@@ -4943,14 +5231,14 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
 
         self.assertEqual(["paper-good"], payload["locked_paper_ids"])
         self.assertNotIn("indexed_papers", payload)
-        self.assertEqual("fulltext_indexed", workspace.paper_records["paper-good"].fulltext_status)
-        self.assertEqual("fulltext_indexed", workspace.paper_records["paper-drop"].fulltext_status)
+        self.assertEqual("binary_only", workspace.paper_records["paper-good"].fulltext_status)
+        self.assertEqual("binary_only", workspace.paper_records["paper-drop"].fulltext_status)
 
         parsed = workspace.parse_document(paper_id="paper-good", write_snapshot=False)
 
         self.assertEqual("paper-good", parsed["paper_id"])
         self.assertEqual("fulltext_indexed", workspace.paper_records["paper-good"].fulltext_status)
-        self.assertEqual("fulltext_indexed", workspace.paper_records["paper-drop"].fulltext_status)
+        self.assertEqual("binary_only", workspace.paper_records["paper-drop"].fulltext_status)
 
     def test_budget_block_prevents_state_mutation(self):
         retriever = _CountingRetriever()

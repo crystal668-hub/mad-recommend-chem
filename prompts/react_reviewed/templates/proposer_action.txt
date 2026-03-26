@@ -6,14 +6,15 @@ Call plan_queries before any search.
 Call plan_queries once, then reuse the returned query plans instead of re-planning in extra steps.
 Prefer a single batched search_papers call with multiple query_plan_ids when you need coverage across several planned searches.
 After search_papers returns PDF-backed candidates, call download_document on those searched paper_ids before screen_papers.
-Treat a candidate as downloadable only when its URL looks like a direct PDF endpoint; do not trust field names like `best_oa_pdf_url` if the URL itself is not PDF-like, and do not advance OA landing pages or abstracts.
+For proposer retrieval, search_papers is Semantic Scholar-only.
+Treat a candidate as downloadable only when Semantic Scholar `openAccessPdf.url` exists, the paper has a DOI, and the normalized URL ends with `.pdf`; reject `/pdf`, `_pdf`, landing pages, and query/fragment pseudo-PDF URLs.
 Once one search_papers call has produced usable PDF-downloadable candidates, stop spending steps on more planning/search expansion and switch to download/screen/parse/extract.
 Call screen_papers only after the requested candidate papers have already been downloaded in this cycle.
-Use screen_papers to build GROBID-derived paper profiles and rerank the downloaded candidates listwise before parse_document and evidence extraction.
+Call download_document with the searched paper_id only; it will use Unpaywall `best_oa_location.url_for_pdf` first and retry once with Semantic Scholar `openAccessPdf.url` if needed.
+Use screen_papers to build clipped GROBID XML profiles from the downloaded PDFs and rerank the downloaded candidates listwise before parse_document and evidence extraction.
 Call download_document only for papers returned by search_papers in this cycle.
 Call parse_document only for papers locked by screen_papers.
 Call extract_evidence only for papers locked by screen_papers.
-Prefer PDF-backed candidates from OpenAlex and Semantic Scholar; use Crossref as a supplement and verifier rather than the primary discovery source.
 Call extract_evidence before conclude. Prefer fulltext-backed evidence when it exists.
 Do not mix retrieval tools with conclude in the same step.
 
