@@ -10,7 +10,7 @@ from prompts.qa_prompts import (
     build_router_localization_user_prompt,
     build_router_semantic_user_prompt,
 )
-from qa.llm_utils import invoke_llm, parse_json_object
+from qa.llm_utils import coerce_llm_text, invoke_llm, parse_json_object
 from qa.state import AmbiguityFlag, AnswerSection, QueryConstraints, TaskSpec
 
 
@@ -277,6 +277,12 @@ class RouterNode:
         auxiliary_signals: Dict[str, Any],
         semantic_payload: Dict[str, Any],
     ) -> Optional[TaskSpec]:
+        baseline_payload = self._build_llm_baseline_payload(
+            question=question,
+            normalized_question=normalized_question,
+            semantic_payload=semantic_payload,
+            auxiliary_signals=auxiliary_signals,
+        )
         raw_output = self._invoke_localization_llm(
             question=question,
             context=context,
@@ -286,14 +292,20 @@ class RouterNode:
         self.last_run_debug["localization_stage_raw"] = raw_output
         parsed = parse_json_object(raw_output)
         if parsed is None:
+            if self._looks_like_json_attempt(raw_output):
+                self.last_run_debug["fallback_reason"] = {
+                    "stage": "localization",
+                    "reason": "localization_json_parse_failed_using_baseline",
+                }
+                self.last_run_debug["localization_stage"] = baseline_payload
+                if self._should_reject_llm_payload(
+                    semantic_payload=semantic_payload,
+                    repaired_payload=baseline_payload,
+                ):
+                    return None
+                return TaskSpec.model_validate(baseline_payload)
             return None
 
-        baseline_payload = self._build_llm_baseline_payload(
-            question=question,
-            normalized_question=normalized_question,
-            semantic_payload=semantic_payload,
-            auxiliary_signals=auxiliary_signals,
-        )
         repaired = self._repair_llm_payload(parsed, baseline_payload)
         self.last_run_debug["localization_stage"] = repaired
         if self._should_reject_llm_payload(semantic_payload=semantic_payload, repaired_payload=repaired):
@@ -983,6 +995,10 @@ class RouterNode:
 
     def _normalize_question(self, question: str) -> str:
         return re.sub(r"\s+", " ", question or "").strip()
+
+    def _looks_like_json_attempt(self, payload: Any) -> bool:
+        text = coerce_llm_text(payload).lstrip()
+        return text.startswith("{") or text.startswith("```json") or text.startswith("```")
 
     def _safe_int(self, value: Any, fallback: Optional[int]) -> Optional[int]:
         try:

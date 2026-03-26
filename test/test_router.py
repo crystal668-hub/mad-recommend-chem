@@ -273,6 +273,40 @@ class RouterNodeTests(unittest.TestCase):
         self.assertIn("localization stage returned unusable output", ctx.exception.reason)
         self.assertIn("localization stage returned unusable output", router.last_run_debug["failure"]["reason"])
 
+    def test_localization_truncated_json_uses_baseline_payload_and_records_fallback(self):
+        question = "Why can the CO2 experiments extend the range of analysis to narrow microporosity?"
+        llm = _FakeLLM(
+            [
+                _semantic_response(
+                    primary_question_type="mechanism",
+                    mechanistic_intent=True,
+                    causal_intent=True,
+                ),
+                (
+                    "{\n"
+                    '  "version": 1,\n'
+                    '  "question": "Why can the CO2 experiments extend the range of analysis to narrow microporosity?",\n'
+                    '  "normalized_question": "Why can the CO2 experiments'
+                ),
+            ]
+        )
+        router = RouterNode(llm=llm, current_year=2026)
+
+        result = router.run(question)
+
+        self.assertEqual("mechanism", result.question_type)
+        self.assertEqual(question, result.question)
+        self.assertGreaterEqual(len(result.answer_sections), 3)
+        self.assertIn("fallback_reason", router.last_run_debug)
+        self.assertEqual(
+            "localization_json_parse_failed_using_baseline",
+            router.last_run_debug["fallback_reason"]["reason"],
+        )
+        self.assertEqual(
+            result.model_dump(),
+            router.last_run_debug["localization_stage"],
+        )
+
     def test_field_level_repair_keeps_llm_mainline_result(self):
         question = "Why is Pt/C more active for alkaline HER in 1 M KOH?"
         llm = _FakeLLM(

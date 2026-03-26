@@ -25,6 +25,7 @@ import re
 import time
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
 
 from agents.chat_models import build_chat_model_from_config
 from agents.react_reasoning import ReActTrajectory, ReActStep, ActionType, ToolCallRecord
@@ -1621,14 +1622,19 @@ class ReActAgent:
         def _run_last_chance_structured_followup(messages_: List[Any]) -> List[Any]:
             if not structured_conclude_required:
                 return messages_
+            download_tool = tools_by_name.get("download_document") or tools_by_name.get("acquire_document")
+            screen_tool = tools_by_name.get("screen_papers")
+            read_sections_tool = tools_by_name.get("read_sections")
             extract_tool = tools_by_name.get("extract_evidence")
             if extract_tool is None:
                 return messages_
 
             evidence_already_present = False
             parse_tool = tools_by_name.get("parse_document")
+            searched_paper_ids: List[str] = []
             downloaded_paper_ids: List[str] = []
             parsed_paper_ids: List[str] = []
+            seen_searched = set()
             seen_downloaded = set()
             seen_parsed = set()
             for step in list(getattr(trajectory, "steps", []) or []):
@@ -1640,6 +1646,31 @@ class ReActAgent:
                             evidence_already_present = True
                         elif isinstance(payload, list) and payload:
                             evidence_already_present = True
+                    if tool_name == "search_papers":
+                        payload = getattr(call, "observation_data", None)
+                        candidate_ids: List[str] = []
+                        if isinstance(payload, dict):
+                            for item in list(payload.get("papers") or []):
+                                if isinstance(item, dict):
+                                    paper_id = str(item.get("paper_id") or "").strip()
+                                    if paper_id:
+                                        candidate_ids.append(paper_id)
+                            for paper_id in list(payload.get("paper_ids") or []):
+                                normalized_paper_id = str(paper_id or "").strip()
+                                if normalized_paper_id:
+                                    candidate_ids.append(normalized_paper_id)
+                        elif isinstance(payload, list):
+                            for item in payload:
+                                if isinstance(item, dict):
+                                    paper_id = str(item.get("paper_id") or "").strip()
+                                else:
+                                    paper_id = str(item or "").strip()
+                                if paper_id:
+                                    candidate_ids.append(paper_id)
+                        for paper_id in candidate_ids:
+                            if paper_id not in seen_searched:
+                                seen_searched.add(paper_id)
+                                searched_paper_ids.append(paper_id)
                     if tool_name not in {"acquire_document", "download_document", "parse_document"}:
                         continue
                     payload = getattr(call, "observation_data", None)
@@ -1659,13 +1690,64 @@ class ReActAgent:
                         seen_parsed.add(paper_id)
                         parsed_paper_ids.append(paper_id)
 
-            if evidence_already_present or not downloaded_paper_ids:
+            if evidence_already_present:
                 return messages_
 
             synthetic_calls: List[Dict[str, Any]] = []
             synthetic_tool_messages: List[Any] = []
-            candidate_paper_ids = list(parsed_paper_ids or downloaded_paper_ids)
+            candidate_paper_ids = list(parsed_paper_ids or downloaded_paper_ids or searched_paper_ids)
             for paper_id in candidate_paper_ids[:2]:
+                if paper_id not in seen_downloaded and download_tool is not None:
+                    download_tool_name = "download_document" if tools_by_name.get("download_document") is not None else "acquire_document"
+                    download_tool_call_id = f"deadline_download_{len(synthetic_calls) + 1}"
+                    download_args = {"paper_id": paper_id}
+                    download_result = _invoke_tool_with_validation(download_tool, download_tool_name, download_args)
+                    synthetic_calls.append(
+                        {
+                            "id": download_tool_call_id,
+                            "name": download_tool_name,
+                            "args": json.dumps(download_args, ensure_ascii=False),
+                            "type": "tool_call",
+                        }
+                    )
+                    synthetic_tool_messages.append(
+                        ToolMessage(
+                            content=json.dumps(download_result.data, ensure_ascii=False),
+                            tool_call_id=download_tool_call_id,
+                        )
+                    )
+                    seen_downloaded.add(paper_id)
+                    downloaded_paper_ids.append(paper_id)
+
+            locked_paper_ids = list(downloaded_paper_ids or parsed_paper_ids)
+            if screen_tool is not None and locked_paper_ids:
+                screen_tool_call_id = f"deadline_screen_{len(synthetic_calls) + 1}"
+                screen_args = {"paper_ids": locked_paper_ids[:2], "max_candidates": min(len(locked_paper_ids[:2]), 2) or 1}
+                screen_result = _invoke_tool_with_validation(screen_tool, "screen_papers", screen_args)
+                synthetic_calls.append(
+                    {
+                        "id": screen_tool_call_id,
+                        "name": "screen_papers",
+                        "args": json.dumps(screen_args, ensure_ascii=False),
+                        "type": "tool_call",
+                    }
+                )
+                synthetic_tool_messages.append(
+                    ToolMessage(
+                        content=json.dumps(screen_result.data, ensure_ascii=False),
+                        tool_call_id=screen_tool_call_id,
+                    )
+                )
+                screen_payload = screen_result.data if isinstance(screen_result.data, dict) else {}
+                resolved_locked = [
+                    str(item).strip()
+                    for item in list((screen_payload or {}).get("locked_paper_ids") or [])
+                    if str(item).strip()
+                ]
+                if resolved_locked:
+                    locked_paper_ids = resolved_locked
+
+            for paper_id in locked_paper_ids[:2]:
                 if parse_tool is not None and paper_id not in seen_parsed:
                     parse_tool_call_id = f"deadline_parse_{len(synthetic_calls) + 1}"
                     parse_args = {"paper_id": paper_id}
@@ -1684,6 +1766,38 @@ class ReActAgent:
                             tool_call_id=parse_tool_call_id,
                         )
                     )
+                    seen_parsed.add(paper_id)
+                    parsed_paper_ids.append(paper_id)
+                preferred_section_ids: List[str] = []
+                if read_sections_tool is not None:
+                    read_tool_call_id = f"deadline_read_sections_{len(synthetic_calls) + 1}"
+                    read_args = {"paper_id": paper_id, "preferred_sections": True}
+                    read_result = _invoke_tool_with_validation(read_sections_tool, "read_sections", read_args)
+                    synthetic_calls.append(
+                        {
+                            "id": read_tool_call_id,
+                            "name": "read_sections",
+                            "args": json.dumps(read_args, ensure_ascii=False),
+                            "type": "tool_call",
+                        }
+                    )
+                    synthetic_tool_messages.append(
+                        ToolMessage(
+                            content=json.dumps(read_result.data, ensure_ascii=False),
+                            tool_call_id=read_tool_call_id,
+                        )
+                    )
+                    read_payload = read_result.data
+                    section_items = []
+                    if isinstance(read_payload, dict):
+                        section_items = list(read_payload.get("sections") or [])
+                    elif isinstance(read_payload, list):
+                        section_items = list(read_payload)
+                    preferred_section_ids = [
+                        str(item.get("section_id") or "").strip()
+                        for item in section_items
+                        if isinstance(item, dict) and str(item.get("section_id") or "").strip()
+                    ]
                 tool_call_id = f"deadline_extract_{len(synthetic_calls) + 1}"
                 tool_args = {"paper_id": paper_id, "preferred_sections": True}
                 result = _invoke_tool_with_validation(extract_tool, "extract_evidence", tool_args)
@@ -1693,6 +1807,15 @@ class ReActAgent:
                     extracted_items = list(payload.get("evidence") or [])
                 elif isinstance(payload, list):
                     extracted_items = list(payload)
+                if not extracted_items and preferred_section_ids:
+                    tool_call_id = f"deadline_extract_explicit_{len(synthetic_calls) + 1}"
+                    tool_args = {"paper_id": paper_id, "section_ids": preferred_section_ids}
+                    result = _invoke_tool_with_validation(extract_tool, "extract_evidence", tool_args)
+                    payload = result.data
+                    if isinstance(payload, dict):
+                        extracted_items = list(payload.get("evidence") or [])
+                    elif isinstance(payload, list):
+                        extracted_items = list(payload)
                 if not extracted_items:
                     continue
                 synthetic_calls.append(
@@ -2120,7 +2243,62 @@ class ReActAgent:
                 retrieval_budget is not None and retrieval_action_steps_used >= int(retrieval_budget)
             )
             deadline_no_retrieval = bool(deadline_mode and remaining_steps == 2)
-            block_discovery_this_step = bool(retrieval_budget_exhausted or deadline_no_retrieval)
+            prior_search_result_paper_ids = set()
+            prior_search_has_downloadable_candidate = False
+            evidence_already_present = False
+            downloaded_or_parsed_present = False
+
+            def _payload_has_downloadable_pdf_signal(item: Any) -> bool:
+                if not isinstance(item, dict):
+                    return False
+                return _url_has_pdf_signal(item.get("best_oa_pdf_url")) or _url_has_pdf_signal(item.get("oa_url"))
+
+            for step in list(getattr(trajectory, "steps", []) or []):
+                for call in list(getattr(step, "tool_calls", []) or []):
+                    tool_name = str(getattr(call, "tool_name", "") or "").strip()
+                    payload = getattr(call, "observation_data", None)
+                    if tool_name == "extract_evidence":
+                        if isinstance(payload, dict) and list(payload.get("evidence") or []):
+                            evidence_already_present = True
+                        elif isinstance(payload, list) and payload:
+                            evidence_already_present = True
+                    if tool_name in {"download_document", "acquire_document", "parse_document"}:
+                        downloaded_or_parsed_present = True
+                    if tool_name != "search_papers":
+                        continue
+                    if isinstance(payload, dict):
+                        for item in list(payload.get("papers") or []):
+                            if isinstance(item, dict):
+                                paper_id = str(item.get("paper_id") or "").strip()
+                                if paper_id:
+                                    prior_search_result_paper_ids.add(paper_id)
+                                if _payload_has_downloadable_pdf_signal(item):
+                                    prior_search_has_downloadable_candidate = True
+                        for paper_id in list(payload.get("paper_ids") or []):
+                            normalized_paper_id = str(paper_id or "").strip()
+                            if normalized_paper_id:
+                                prior_search_result_paper_ids.add(normalized_paper_id)
+                    elif isinstance(payload, list):
+                        for item in payload:
+                            if isinstance(item, dict):
+                                paper_id = str(item.get("paper_id") or "").strip()
+                                if _payload_has_downloadable_pdf_signal(item):
+                                    prior_search_has_downloadable_candidate = True
+                            else:
+                                paper_id = str(item or "").strip()
+                            if paper_id:
+                                prior_search_result_paper_ids.add(paper_id)
+            phase_budget_requires_followup = bool(
+                structured_conclude_required
+                and not deadline_no_retrieval
+                and prior_search_result_paper_ids
+                and prior_search_has_downloadable_candidate
+                and not evidence_already_present
+                and not downloaded_or_parsed_present
+            )
+            block_discovery_this_step = bool(
+                retrieval_budget_exhausted or deadline_no_retrieval or phase_budget_requires_followup
+            )
 
             has_search = any(name in search_tools for name, _args, _id in normalized_calls)
             has_search_unblocked = bool(
@@ -2159,6 +2337,7 @@ class ReActAgent:
                     if tool_name not in deadline_blocked_discovery_tools:
                         continue
                     deadline_messages.append(ToolMessage(content=blocked_observation, tool_call_id=tool_call_id))
+                deadline_messages = _run_last_chance_structured_followup(deadline_messages)
                 (
                     final_answer,
                     forced_tool_call_id,
@@ -2283,6 +2462,14 @@ class ReActAgent:
                                 f"Do NOT call planning/search expansion tools now; call one of: {analysis_list}."
                             )
                             result = ToolResult(observation=obs, data={"error": "deadline_no_retrieval"})
+                        elif phase_budget_requires_followup:
+                            analysis_list = ", ".join(f"`{name}`" for name in sorted(analysis_tools)) or "`conclude`"
+                            obs = (
+                                "Policy: planning/search expansion is blocked because a structured answer still needs evidence-phase work.\n"
+                                "Use follow-up retrieval now: download, parse, and extract evidence from papers already found.\n"
+                                f"Do NOT call planning/search expansion tools now; after evidence work, call one of: {analysis_list}."
+                            )
+                            result = ToolResult(observation=obs, data={"error": "phase_budget_requires_followup"})
                         else:
                             analysis_list = ", ".join(f"`{name}`" for name in sorted(analysis_tools)) or "`conclude`"
                             obs = (
@@ -2686,6 +2873,29 @@ def _sanitize_thought(text: str) -> str:
         kept.append(line)
     cleaned = "\n".join(kept).strip()
     return cleaned
+
+
+def _url_has_pdf_signal(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    parsed = urlparse(text)
+    path = unquote(parsed.path or "").lower()
+    if path.endswith(".pdf") or path.endswith("/pdf") or path.endswith("_pdf"):
+        return True
+    lowered_text = text.lower()
+    if ".pdf?" in lowered_text or ".pdf#" in lowered_text:
+        return True
+    for key, values in parse_qs(parsed.query, keep_blank_values=True).items():
+        lowered_key = str(key or "").strip().lower()
+        lowered_values = [str(item or "").strip().lower() for item in list(values or [])]
+        if any(".pdf" in item for item in lowered_values):
+            return True
+        if lowered_key in {"format", "type", "mime"} and any(
+            item in {"pdf", "application/pdf"} for item in lowered_values
+        ):
+            return True
+    return False
 
 
 def _has_metric_number(text: str) -> bool:

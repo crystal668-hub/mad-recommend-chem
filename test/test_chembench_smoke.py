@@ -104,9 +104,9 @@ class ChembenchSmokeTests(unittest.TestCase):
         cases = load_smoke_cases(str(REPO_ROOT / "evals" / "chembench_smoke_cases.yaml"))
 
         self.assertEqual(3, len(cases))
-        self.assertEqual("oxidation_states", cases[0].name)
-        self.assertEqual("integer", cases[0].type)
-        self.assertEqual("4e846028-9f8f-44f2-eb3e-59316479df10", cases[1].uuid)
+        self.assertEqual("analytical_chemistry_27", cases[0].name)
+        self.assertEqual("choice_text", cases[0].type)
+        self.assertEqual("01ce9f8b-f8db-a555-b9c6-796928bc3762", cases[1].uuid)
 
     def test_extract_short_answer_prefers_explicit_marker(self):
         answer, extracted_ok, source = extract_short_answer(

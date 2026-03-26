@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from qa.artifacts import QAArtifactStore
@@ -96,6 +97,7 @@ class RetrieverNode:
         final_top_k: int = 12,
         lane_reserve: int = 1,
         title_similarity_threshold: float = 0.94,
+        max_enrichment_candidates: int = 8,
     ) -> None:
         self.openalex_client = openalex_client or OpenAlexClient()
         self.crossref_client = crossref_client or CrossrefClient()
@@ -104,6 +106,7 @@ class RetrieverNode:
         self.final_top_k = final_top_k
         self.lane_reserve = lane_reserve
         self.title_similarity_threshold = title_similarity_threshold
+        self.max_enrichment_candidates = max(1, int(max_enrichment_candidates))
         self.last_diagnostics: List[RetrievalDiagnosticRecord] = []
         self.last_provider_health: Dict[str, Dict[str, Any]] = {}
         self._diagnostic_map: Dict[tuple[str, str, str], Dict[str, Any]] = {}
@@ -115,14 +118,51 @@ class RetrieverNode:
         entity_pack: EntityPack,
         query_plans: Sequence[QueryPlan],
         artifact_store: Optional[QAArtifactStore] = None,
+        max_runtime_seconds: Optional[float] = None,
     ) -> List[PaperCandidate]:
         store = artifact_store or QAArtifactStore()
         candidates: List[PaperCandidate] = []
         self._diagnostic_map = {}
         self._provider_health_fallback = self._init_provider_health()
+        deadline = None
+        if max_runtime_seconds is not None:
+            resolved_runtime_budget = max(0.0, float(max_runtime_seconds))
+            if resolved_runtime_budget > 0:
+                deadline = time.perf_counter() + resolved_runtime_budget
+
+        def _remaining_runtime_seconds() -> Optional[float]:
+            if deadline is None:
+                return None
+            return max(0.0, deadline - time.perf_counter())
+
+        def _runtime_budget_allows(provider_name: str, stage: str, *, minimum_seconds: float = 0.01) -> bool:
+            remaining = _remaining_runtime_seconds()
+            if remaining is None or remaining >= max(0.0, float(minimum_seconds)):
+                return True
+            self._record_diagnostic(
+                provider=provider_name,
+                stage=stage,
+                outcome="skipped",
+                message=(
+                    f"runtime budget exhausted before {stage}; "
+                    f"remaining_seconds={round(remaining, 3)}"
+                ),
+            )
+            return False
 
         for query_plan in query_plans:
             for provider_name in self._search_provider_order(query_plan):
+                search_client = {
+                    "openalex": self.openalex_client,
+                    "semantic_scholar": self.semantic_scholar_client,
+                    "crossref": self.crossref_client,
+                }.get(provider_name)
+                if not _runtime_budget_allows(
+                    provider_name,
+                    "search",
+                    minimum_seconds=0.01,
+                ):
+                    break
                 results = self._run_provider_search(provider_name=provider_name, query_plan=query_plan)
                 if results is None:
                     continue
@@ -141,6 +181,9 @@ class RetrieverNode:
                         candidates.append(normalized)
                     else:
                         self._merge_candidates(existing, normalized)
+            remaining = _remaining_runtime_seconds()
+            if remaining is not None and remaining <= 0:
+                break
 
         shortlist = self._shortlist_candidates_for_enrichment(
             candidates=candidates,
@@ -149,9 +192,23 @@ class RetrieverNode:
             query_plans=query_plans,
         )
 
-        for candidate in shortlist:
-            self._enrich_with_crossref(candidate=candidate, store=store)
-            self._enrich_with_semantic_scholar(candidate=candidate, store=store)
+        for candidate in shortlist[: self.max_enrichment_candidates]:
+            remaining = _remaining_runtime_seconds()
+            if remaining is not None and remaining <= 0:
+                break
+            self._enrich_with_crossref(
+                candidate=candidate,
+                store=store,
+                runtime_remaining_seconds=remaining,
+            )
+            remaining = _remaining_runtime_seconds()
+            if remaining is not None and remaining <= 0:
+                break
+            self._enrich_with_semantic_scholar(
+                candidate=candidate,
+                store=store,
+                runtime_remaining_seconds=remaining,
+            )
             candidate.retrieval_score = self._score_candidate(candidate, task_spec, entity_pack)
 
         self.last_diagnostics = self._finalize_diagnostics()
@@ -435,7 +492,35 @@ class RetrieverNode:
         merged_artifacts.update(incoming.provider_artifacts)
         target.provider_artifacts = merged_artifacts
 
-    def _enrich_with_crossref(self, candidate: PaperCandidate, store: QAArtifactStore) -> None:
+    def _enrich_with_crossref(
+        self,
+        candidate: PaperCandidate,
+        store: QAArtifactStore,
+        *,
+        runtime_remaining_seconds: Optional[float] = None,
+    ) -> None:
+        if not self._candidate_needs_crossref_enrichment(candidate):
+            self._record_diagnostic(
+                provider="crossref",
+                stage="enrichment",
+                outcome="skipped",
+                message=f"paper_id={candidate.paper_id}: skipped because bibliography fields are already present",
+            )
+            return
+        if runtime_remaining_seconds is not None and runtime_remaining_seconds < max(
+            1.0,
+            float(getattr(self.crossref_client, "timeout", 1.0) or 1.0),
+        ):
+            self._record_diagnostic(
+                provider="crossref",
+                stage="enrichment",
+                outcome="skipped",
+                message=(
+                    f"paper_id={candidate.paper_id}: skipped because runtime budget is exhausted "
+                    f"(remaining_seconds={round(runtime_remaining_seconds, 3)})"
+                ),
+            )
+            return
         try:
             raw = self.crossref_client.enrich(candidate.model_dump()) if self.crossref_client else None
             if self.crossref_client:
@@ -497,7 +582,35 @@ class RetrieverNode:
                     continue
         return None
 
-    def _enrich_with_semantic_scholar(self, candidate: PaperCandidate, store: QAArtifactStore) -> None:
+    def _enrich_with_semantic_scholar(
+        self,
+        candidate: PaperCandidate,
+        store: QAArtifactStore,
+        *,
+        runtime_remaining_seconds: Optional[float] = None,
+    ) -> None:
+        if not self._candidate_needs_semantic_scholar_enrichment(candidate):
+            self._record_diagnostic(
+                provider="semantic_scholar",
+                stage="enrichment",
+                outcome="skipped",
+                message=f"paper_id={candidate.paper_id}: skipped because abstract and citation metadata are already present",
+            )
+            return
+        if runtime_remaining_seconds is not None and runtime_remaining_seconds < max(
+            1.0,
+            float(getattr(self.semantic_scholar_client, "timeout", 1.0) or 1.0),
+        ):
+            self._record_diagnostic(
+                provider="semantic_scholar",
+                stage="enrichment",
+                outcome="skipped",
+                message=(
+                    f"paper_id={candidate.paper_id}: skipped because runtime budget is exhausted "
+                    f"(remaining_seconds={round(runtime_remaining_seconds, 3)})"
+                ),
+            )
+            return
         try:
             raw = self.semantic_scholar_client.enrich(candidate.model_dump()) if self.semantic_scholar_client else None
             if self.semantic_scholar_client:
@@ -548,6 +661,17 @@ class RetrieverNode:
             candidate.year = year
         candidate.ranking_features["citation_count"] = int(citation_count or 0)
         self._record_diagnostic(provider="semantic_scholar", stage="enrichment", outcome="hit")
+
+    def _candidate_needs_crossref_enrichment(self, candidate: PaperCandidate) -> bool:
+        return not bool(
+            normalize_doi(candidate.doi)
+            and candidate.year is not None
+            and normalize_text(candidate.venue)
+            and list(candidate.authors or [])
+        )
+
+    def _candidate_needs_semantic_scholar_enrichment(self, candidate: PaperCandidate) -> bool:
+        return not bool(candidate.abstract and candidate.ranking_features.get("citation_count") is not None)
 
     def _score_candidate(self, candidate: PaperCandidate, task_spec: TaskSpec, entity_pack: EntityPack) -> float:
         corpus = normalize_text(f"{candidate.title} {candidate.abstract or ''}").lower()

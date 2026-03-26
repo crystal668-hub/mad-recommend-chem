@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
 
 from agents.chat_models import build_chat_model_from_config, describe_chat_model_config
 from agents import react_tool_schemas as tool_schemas
@@ -26,6 +27,7 @@ from prompts.react_reviewed import (
     build_proposer_user_prompt,
     build_review_prompt_contract,
     build_reviewer_action_prompt,
+    build_reviewer_repair_system_prompt,
     build_reviewer_system_prompt,
     build_reviewer_thought_prompt,
     build_reviewer_user_prompt,
@@ -225,15 +227,43 @@ def _paper_title_fallback(workspace: "ReactReviewedWorkspace", paper_id: str) ->
     return None
 
 
-def _candidate_has_oa_fulltext_signal(candidate: Optional[PaperCandidate]) -> bool:
+def _url_has_pdf_signal(value: Any) -> bool:
+    text = _compact_text(value)
+    if not text:
+        return False
+    parsed = urlparse(text)
+    path = unquote(parsed.path or "").lower()
+    if path.endswith(".pdf") or path.endswith("/pdf") or path.endswith("_pdf"):
+        return True
+    if ".pdf?" in text.lower() or ".pdf#" in text.lower():
+        return True
+    for key, values in parse_qs(parsed.query, keep_blank_values=True).items():
+        lowered_key = str(key or "").strip().lower()
+        lowered_values = [str(item or "").strip().lower() for item in list(values or [])]
+        if any(".pdf" in item for item in lowered_values):
+            return True
+        if lowered_key in {"format", "type", "mime"} and any(
+            item in {"pdf", "application/pdf"} for item in lowered_values
+        ):
+            return True
+    return False
+
+
+def _candidate_has_downloadable_pdf_signal(candidate: Optional[PaperCandidate]) -> bool:
     if candidate is None:
         return False
     return bool(
-        getattr(candidate, "oa_eligible", False)
-        or _compact_text(getattr(candidate, "best_oa_pdf_url", None))
-        or _compact_text(getattr(candidate, "best_oa_landing_page_url", None))
-        or _compact_text(getattr(candidate, "oa_url", None))
+        _url_has_pdf_signal(getattr(candidate, "best_oa_pdf_url", None))
+        or _url_has_pdf_signal(getattr(candidate, "oa_url", None))
     )
+
+
+def _batched_search_stage_timeout(base_timeout_seconds: float, batch_size: int) -> float:
+    normalized_base = max(0.01, float(base_timeout_seconds or 0.01))
+    normalized_batch_size = max(1, int(batch_size or 1))
+    if normalized_batch_size <= 1:
+        return normalized_base
+    return min(240.0, normalized_base + (20.0 * float(normalized_batch_size - 1)))
 
 
 def _primary_screen_entity_terms(entity_pack: EntityPack) -> List[str]:
@@ -1165,6 +1195,7 @@ class RouterAgentWrapper:
             debug_payload = dict(exc.debug_payload or {})
             semantic_stage_path = None
             localization_stage_path = None
+            fallback_reason_path = None
             if isinstance(debug_payload.get("semantic_stage"), dict):
                 semantic_stage_path = artifact_store.write_json(
                     "router/semantic_stage.json",
@@ -1174,6 +1205,11 @@ class RouterAgentWrapper:
                 localization_stage_path = artifact_store.write_json(
                     "router/localization_stage.json",
                     debug_payload["localization_stage"],
+                )
+            if isinstance(debug_payload.get("fallback_reason"), dict):
+                fallback_reason_path = artifact_store.write_json(
+                    "router/fallback_reason.json",
+                    debug_payload["fallback_reason"],
                 )
             failure_path = artifact_store.write_json(
                 "router/failure.json",
@@ -1192,6 +1228,8 @@ class RouterAgentWrapper:
                 debug_payload["semantic_stage_artifact"] = semantic_stage_path
             if localization_stage_path:
                 debug_payload["localization_stage_artifact"] = localization_stage_path
+            if fallback_reason_path:
+                debug_payload["fallback_reason_artifact"] = fallback_reason_path
             debug_payload["failure_artifact"] = failure_path
             raise
 
@@ -1202,6 +1240,7 @@ class RouterAgentWrapper:
         )
         semantic_stage_path = None
         localization_stage_path = None
+        fallback_reason_path = None
         if isinstance(debug_payload.get("semantic_stage"), dict):
             semantic_stage_path = artifact_store.write_json(
                 "router/semantic_stage.json",
@@ -1211,6 +1250,11 @@ class RouterAgentWrapper:
             localization_stage_path = artifact_store.write_json(
                 "router/localization_stage.json",
                 debug_payload["localization_stage"],
+            )
+        if isinstance(debug_payload.get("fallback_reason"), dict):
+            fallback_reason_path = artifact_store.write_json(
+                "router/fallback_reason.json",
+                debug_payload["fallback_reason"],
             )
         audit_path = artifact_store.write_json(
             "router/agent_run.json",
@@ -1229,6 +1273,8 @@ class RouterAgentWrapper:
             artifacts["router_semantic_stage"] = semantic_stage_path
         if localization_stage_path:
             artifacts["router_localization_stage"] = localization_stage_path
+        if fallback_reason_path:
+            artifacts["router_fallback_reason"] = fallback_reason_path
         return task_spec, artifacts
 
 
@@ -1428,9 +1474,11 @@ class ReactReviewedWorkspace:
         stage: str,
         operation: Callable[[], Any],
         details: Optional[Dict[str, Any]] = None,
+        timeout_seconds: Optional[float] = None,
     ) -> Any:
         start_details = copy.deepcopy(details or {})
-        start_details["watchdog_seconds"] = self.stage_watchdog_seconds
+        effective_timeout_seconds = max(0.01, float(timeout_seconds or self.stage_watchdog_seconds))
+        start_details["watchdog_seconds"] = effective_timeout_seconds
         self._record_stage_event(stage=stage, status="start", details=start_details)
         started_at = time.perf_counter()
         result_holder: Dict[str, Any] = {}
@@ -1447,10 +1495,10 @@ class ReactReviewedWorkspace:
 
         thread = threading.Thread(target=_target, daemon=True)
         thread.start()
-        if not done.wait(self.stage_watchdog_seconds):
+        if not done.wait(effective_timeout_seconds):
             elapsed = round(max(0.0, time.perf_counter() - started_at), 3)
             timeout_exc = TimeoutError(
-                f"{stage} exceeded stage_watchdog_seconds={self.stage_watchdog_seconds}s "
+                f"{stage} exceeded stage_watchdog_seconds={effective_timeout_seconds}s "
                 f"(elapsed {elapsed}s)"
             )
             timeout_details = copy.deepcopy(details or {})
@@ -1620,6 +1668,7 @@ class ReactReviewedWorkspace:
                 final_top_k=max(int(self.retriever.final_top_k), self.proposer_candidate_target),
                 lane_reserve=self.retriever.lane_reserve,
                 title_similarity_threshold=self.retriever.title_similarity_threshold,
+                max_enrichment_candidates=self.retriever.max_enrichment_candidates,
             )
         return self.retriever
 
@@ -1911,9 +1960,11 @@ class ReactReviewedWorkspace:
         charge_budget: bool = False,
         requested_via: Optional[str] = None,
         write_snapshot: bool = True,
+        stage_watchdog_seconds: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         store = artifact_store or self.store
         resolved_id, query_plan = self._ensure_query_plan(query_plan_id, query_text, lane)
+        effective_stage_watchdog_seconds = max(0.01, float(stage_watchdog_seconds or self.stage_watchdog_seconds))
         cache_key = ("query_plan", resolved_id)
         state, payload = self._prepare_cached_operation(
             cache=self._search_result_cache,
@@ -1937,6 +1988,17 @@ class ReactReviewedWorkspace:
         else:
             retriever = self._build_retriever_clone()
             try:
+                def _retriever_operation() -> List[Dict[str, Any]]:
+                    retriever_kwargs = {
+                        "task_spec": self.task_spec,
+                        "entity_pack": self.entity_pack,
+                        "query_plans": [query_plan],
+                        "artifact_store": store,
+                    }
+                    if isinstance(retriever, RetrieverNode):
+                        retriever_kwargs["max_runtime_seconds"] = max(1.0, effective_stage_watchdog_seconds - 5.0)
+                    return retriever.run(**retriever_kwargs)
+
                 candidates = self._run_stage(
                     stage="search_papers",
                     details={
@@ -1944,19 +2006,15 @@ class ReactReviewedWorkspace:
                         "lane": query_plan.lane,
                         "requested_via": requested_via,
                     },
-                    operation=lambda: retriever.run(
-                        task_spec=self.task_spec,
-                        entity_pack=self.entity_pack,
-                        query_plans=[query_plan],
-                        artifact_store=store,
-                    ),
+                    operation=_retriever_operation,
+                    timeout_seconds=effective_stage_watchdog_seconds,
                 )
                 self._merge_diagnostics(getattr(retriever, "last_diagnostics", []) or [])
                 self._merge_provider_health(getattr(retriever, "last_provider_health", {}) or {})
                 filtered_candidates = [
                     candidate
                     for candidate in list(candidates or [])
-                    if _candidate_has_oa_fulltext_signal(candidate)
+                    if _candidate_has_downloadable_pdf_signal(candidate)
                 ]
                 with self._state_lock:
                     for candidate in filtered_candidates:
@@ -2935,37 +2993,53 @@ class ReactReviewedProposerAgent:
         profile_payloads: List[Dict[str, Any]] = []
         dropped_candidates: List[Dict[str, Any]] = []
         ranked_candidates: List[Dict[str, Any]] = []
-        for paper_id in ordered_ids:
-            paper_record = workspace.paper_records.get(paper_id)
-            candidate = workspace.paper_candidates.get(paper_id)
-            if candidate is None or paper_record is None:
-                continue
-            profile_payload = workspace.build_paper_profile(
-                paper_id=paper_id,
-                requested_via="screen_papers",
-                write_snapshot=False,
-            )
-            if str(profile_payload.get("profile_status") or "").strip().lower() != "ready":
-                dropped_candidates.append(
-                    {
-                        "paper_id": paper_id,
-                        "title": candidate.title,
-                        "decision": "drop",
-                        "reason": _compact_text(profile_payload.get("error_message"))
-                        or "Paper profile generation failed after download.",
-                        "profile_status": profile_payload.get("profile_status"),
-                    }
+
+        def _collect_screening_inputs(candidate_ids: Sequence[str]) -> None:
+            for paper_id in candidate_ids:
+                paper_record = workspace.paper_records.get(paper_id)
+                candidate = workspace.paper_candidates.get(paper_id)
+                if candidate is None or paper_record is None:
+                    continue
+                profile_payload = workspace.build_paper_profile(
+                    paper_id=paper_id,
+                    requested_via="screen_papers",
+                    write_snapshot=False,
                 )
-                continue
-            profile_payloads.append(copy.deepcopy(profile_payload))
-            ranked_candidates.append(
-                self._score_screen_candidate(
-                    workspace=workspace,
-                    candidate=candidate,
-                    paper_profile=profile_payload,
-                    open_review_items=open_review_items,
+                if str(profile_payload.get("profile_status") or "").strip().lower() != "ready":
+                    dropped_candidates.append(
+                        {
+                            "paper_id": paper_id,
+                            "title": candidate.title,
+                            "decision": "drop",
+                            "reason": _compact_text(profile_payload.get("error_message"))
+                            or "Paper profile generation failed after download.",
+                            "profile_status": profile_payload.get("profile_status"),
+                        }
+                    )
+                    continue
+                profile_payloads.append(copy.deepcopy(profile_payload))
+                ranked_candidates.append(
+                    self._score_screen_candidate(
+                        workspace=workspace,
+                        candidate=candidate,
+                        paper_profile=profile_payload,
+                        open_review_items=open_review_items,
+                    )
                 )
-            )
+
+        _collect_screening_inputs(ordered_ids)
+        if not ranked_candidates:
+            fallback_ids = [
+                paper_id
+                for paper_id, candidate in sorted(
+                    workspace.paper_candidates.items(),
+                    key=lambda item: float(getattr(item[1], "retrieval_score", 0.0) or 0.0),
+                    reverse=True,
+                )
+                if paper_id not in seen and paper_id in workspace.paper_records
+            ]
+            _collect_screening_inputs(fallback_ids)
+
         if not ranked_candidates:
             payload = {
                 "stage": "proposer_screening",
@@ -3176,7 +3250,9 @@ class ReactReviewedProposerAgent:
 
         def search_papers(
             query_plan_id: Optional[str] = None,
+            query_plan_ids: Optional[List[str]] = None,
             query_text: Optional[str] = None,
+            query_texts: Optional[List[str]] = None,
             lane: str = "data",
             reason: str = "",
         ) -> ToolResult:
@@ -3186,21 +3262,106 @@ class ReactReviewedProposerAgent:
                     "plan_queries must be called before search_papers.",
                     code="plan_required_before_search",
                 )
-            payload = workspace.search_papers(
-                query_plan_id=query_plan_id,
-                query_text=query_text,
-                lane=lane,
-                reason=reason,
-            )
+            normalized_plan_ids: List[str] = []
+            for item in list(query_plan_ids or []):
+                normalized_item = str(item or "").strip()
+                if normalized_item and normalized_item not in normalized_plan_ids:
+                    normalized_plan_ids.append(normalized_item)
+            single_plan_id = str(query_plan_id or "").strip()
+            if single_plan_id and single_plan_id not in normalized_plan_ids:
+                normalized_plan_ids.insert(0, single_plan_id)
+
+            normalized_query_texts: List[str] = []
+            single_query_text = str(query_text or "").strip()
+            if single_query_text:
+                normalized_query_texts.append(single_query_text)
+            for item in list(query_texts or []):
+                normalized_item = str(item or "").strip()
+                if normalized_item and normalized_item not in normalized_query_texts:
+                    normalized_query_texts.append(normalized_item)
+
+            search_payloads: List[Dict[str, Any]] = []
+            seen_paper_ids: set[str] = set()
+            search_warnings: List[Dict[str, Any]] = []
+            batch_size = len(normalized_plan_ids) or len(normalized_query_texts) or 1
+            batch_search_timeout = _batched_search_stage_timeout(workspace.stage_watchdog_seconds, batch_size)
+
+            def _append_payloads(items: Sequence[Dict[str, Any]]) -> None:
+                for payload_item in list(items or []):
+                    if not isinstance(payload_item, dict):
+                        continue
+                    paper_id = str(payload_item.get("paper_id") or "").strip()
+                    if paper_id and paper_id in seen_paper_ids:
+                        continue
+                    if paper_id:
+                        seen_paper_ids.add(paper_id)
+                    search_payloads.append(payload_item)
+
+            if normalized_plan_ids:
+                for current_query_plan_id in normalized_plan_ids:
+                    try:
+                        _append_payloads(
+                            workspace.search_papers(
+                                query_plan_id=current_query_plan_id,
+                                lane=lane,
+                                reason=reason,
+                                stage_watchdog_seconds=batch_search_timeout,
+                            )
+                        )
+                    except Exception as exc:
+                        if not search_payloads:
+                            raise
+                        search_warnings.append(
+                            {
+                                "query_plan_id": current_query_plan_id,
+                                "reason": type(exc).__name__,
+                                "message": str(exc),
+                            }
+                        )
+                        break
+            elif normalized_query_texts:
+                for current_query_text in normalized_query_texts:
+                    try:
+                        _append_payloads(
+                            workspace.search_papers(
+                                query_text=current_query_text,
+                                lane=lane,
+                                reason=reason,
+                                stage_watchdog_seconds=batch_search_timeout,
+                            )
+                        )
+                    except Exception as exc:
+                        if not search_payloads:
+                            raise
+                        search_warnings.append(
+                            {
+                                "query_text": current_query_text,
+                                "reason": type(exc).__name__,
+                                "message": str(exc),
+                            }
+                        )
+                        break
+            else:
+                _append_payloads(
+                    workspace.search_papers(
+                        query_plan_id=query_plan_id,
+                        query_text=query_text,
+                        lane=lane,
+                        reason=reason,
+                    )
+                )
+
+            payload = list(search_payloads)
             run_state.record_search_results(payload)
+            observation_payload = {
+                "count": len(payload),
+                "paper_ids": [item.get("paper_id") for item in payload[:5]],
+            }
+            if search_warnings:
+                observation_payload["search_warnings"] = search_warnings
             return ToolResult(
-                observation=_json_preview(
-                    {
-                        "count": len(payload),
-                        "paper_ids": [item.get("paper_id") for item in payload[:5]],
-                    }
-                ),
-                data={"papers": payload},
+                observation=_json_preview(observation_payload),
+                data={"papers": payload, "search_warnings": search_warnings},
             )
 
         def screen_papers(
@@ -3584,6 +3745,13 @@ class ReactReviewedProposerAgent:
                     salvaged_error or exc,
                 )
                 if self.repair_attempts > 0:
+                    if not run_state.has_any_evidence():
+                        self._raise_missing_evidence_repair_failure(
+                            workspace=workspace,
+                            cycle_number=cycle_number,
+                            error=error,
+                            trajectory=partial_trajectory,
+                        )
                     return self._repair_submission_with_llm(
                         workspace=workspace,
                         cycle_number=cycle_number,
@@ -3593,11 +3761,7 @@ class ReactReviewedProposerAgent:
                         run_state=run_state,
                     )
                 raise error
-            if self.repair_attempts > 0 and (
-                workspace.current_submission is not None
-                or run_state.has_any_evidence()
-                or bool(workspace.evidence_items)
-            ):
+            if self.repair_attempts > 0 and run_state.has_any_evidence():
                 repair_error = ReactReviewedStructuredOutputError(
                     stage="proposer",
                     cycle_number=cycle_number,
@@ -3617,6 +3781,21 @@ class ReactReviewedProposerAgent:
                     error=repair_error,
                     trajectory=partial_trajectory or ReActTrajectory(query=workspace.question),
                     run_state=run_state,
+                )
+            if self.repair_attempts > 0 and not run_state.has_any_evidence():
+                repair_error = ReactReviewedStructuredOutputError(
+                    stage="proposer",
+                    cycle_number=cycle_number,
+                    message=f"forced conclude execution failed before a valid payload was emitted: {salvaged_error or exc}",
+                    response_content=getattr(exc, "response_content", None),
+                    structured_output=getattr(exc, "structured_output", None),
+                    trajectory=partial_trajectory,
+                )
+                self._raise_missing_evidence_repair_failure(
+                    workspace=workspace,
+                    cycle_number=cycle_number,
+                    error=repair_error,
+                    trajectory=partial_trajectory,
                 )
             self._raise_execution_failure(
                 workspace=workspace,
@@ -3680,6 +3859,13 @@ class ReactReviewedProposerAgent:
             )
             logger.warning("react_reviewed_proposer_llm_failed cycle=%s error=%s", cycle_number, exc)
             if self.repair_attempts > 0:
+                if not run_state.has_any_evidence():
+                    self._raise_missing_evidence_repair_failure(
+                        workspace=workspace,
+                        cycle_number=cycle_number,
+                        error=error,
+                        trajectory=trajectory,
+                    )
                 return self._repair_submission_with_llm(
                     workspace=workspace,
                     cycle_number=cycle_number,
@@ -4062,6 +4248,13 @@ class ReactReviewedProposerAgent:
         trajectory: ReActTrajectory,
         run_state: _ProposerRunState,
     ) -> Tuple[AnswerSubmission, ReActTrajectory]:
+        if not run_state.has_any_evidence():
+            self._raise_missing_evidence_repair_failure(
+                workspace=workspace,
+                cycle_number=cycle_number,
+                error=error,
+                trajectory=trajectory,
+            )
         last_error: ReactReviewedStructuredOutputError = error
         for attempt_number in range(1, self.repair_attempts + 1):
             try:
@@ -4213,6 +4406,31 @@ class ReactReviewedProposerAgent:
             details={"attempts_used": self.repair_attempts},
             response_content=last_error.response_content,
             structured_output=last_error.structured_output,
+            trajectory=trajectory,
+        )
+
+    def _raise_missing_evidence_repair_failure(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        cycle_number: int,
+        error: ReactReviewedStructuredOutputError,
+        trajectory: Optional[ReActTrajectory],
+    ) -> None:
+        self._raise_execution_failure(
+            workspace=workspace,
+            cycle_number=cycle_number,
+            stage="proposer_repair",
+            message=(
+                "Proposer exhausted retrieval budget before extracting current-cycle evidence anchors; "
+                "repair was not attempted because submission repair requires evidence from this cycle."
+            ),
+            details={
+                "repair_blocked_reason": "current_cycle_evidence_missing",
+                "upstream_error": str(error),
+            },
+            response_content=error.response_content,
+            structured_output=error.structured_output,
             trajectory=trajectory,
         )
 
@@ -5066,6 +5284,7 @@ class ReactReviewedReviewerAgent:
         max_items: int,
         max_retrieval_actions: int,
         llm_timeout_seconds: float,
+        repair_attempts: int = 1,
     ) -> None:
         self.reviewer_role = reviewer_role
         self.model_config = dict(model_config or {})
@@ -5073,6 +5292,7 @@ class ReactReviewedReviewerAgent:
         self.max_items = max(1, int(max_items))
         self.max_retrieval_actions = max(0, int(max_retrieval_actions))
         self.llm_timeout_seconds = float(llm_timeout_seconds)
+        self.repair_attempts = max(0, int(repair_attempts))
 
     def run(
         self,
@@ -5201,24 +5421,105 @@ class ReactReviewedReviewerAgent:
 
         def search_papers(
             query_plan_id: Optional[str] = None,
+            query_plan_ids: Optional[List[str]] = None,
             query_text: Optional[str] = None,
+            query_texts: Optional[List[str]] = None,
             lane: str = "contrarian",
             reason: str = "",
         ) -> ToolResult:
             """Search external literature providers within reviewer role permissions."""
-            return _budget_safe(
-                lambda: workspace.search_papers(
-                    query_plan_id=query_plan_id,
-                    query_text=query_text,
-                    lane=lane,
-                    reason=reason,
-                    artifact_store=session.artifact_store,
-                    session=session,
-                    charge_budget=True,
-                    requested_via="search_papers",
-                    write_snapshot=False,
-                )
-            )
+            normalized_plan_ids: List[str] = []
+            for item in list(query_plan_ids or []):
+                normalized_item = str(item or "").strip()
+                if normalized_item and normalized_item not in normalized_plan_ids:
+                    normalized_plan_ids.append(normalized_item)
+            single_plan_id = str(query_plan_id or "").strip()
+            if single_plan_id and single_plan_id not in normalized_plan_ids:
+                normalized_plan_ids.insert(0, single_plan_id)
+
+            normalized_query_texts: List[str] = []
+            single_query_text = str(query_text or "").strip()
+            if single_query_text:
+                normalized_query_texts.append(single_query_text)
+            for item in list(query_texts or []):
+                normalized_item = str(item or "").strip()
+                if normalized_item and normalized_item not in normalized_query_texts:
+                    normalized_query_texts.append(normalized_item)
+
+            def _run_batch_search() -> List[Dict[str, Any]]:
+                payloads: List[Dict[str, Any]] = []
+                seen_paper_ids: set[str] = set()
+                batch_size = len(normalized_plan_ids) or len(normalized_query_texts) or 1
+                batch_search_timeout = _batched_search_stage_timeout(workspace.stage_watchdog_seconds, batch_size)
+
+                def _append_payloads(items: Sequence[Dict[str, Any]]) -> None:
+                    for payload_item in list(items or []):
+                        if not isinstance(payload_item, dict):
+                            continue
+                        paper_id = str(payload_item.get("paper_id") or "").strip()
+                        if paper_id and paper_id in seen_paper_ids:
+                            continue
+                        if paper_id:
+                            seen_paper_ids.add(paper_id)
+                        payloads.append(payload_item)
+
+                if normalized_plan_ids:
+                    for current_query_plan_id in normalized_plan_ids:
+                        try:
+                            _append_payloads(
+                                workspace.search_papers(
+                                    query_plan_id=current_query_plan_id,
+                                    lane=lane,
+                                    reason=reason,
+                                    artifact_store=session.artifact_store,
+                                    session=session,
+                                    charge_budget=True,
+                                    requested_via="search_papers",
+                                    write_snapshot=False,
+                                    stage_watchdog_seconds=batch_search_timeout,
+                                )
+                            )
+                        except Exception:
+                            if not payloads:
+                                raise
+                            break
+                elif normalized_query_texts:
+                    for current_query_text in normalized_query_texts:
+                        try:
+                            _append_payloads(
+                                workspace.search_papers(
+                                    query_text=current_query_text,
+                                    lane=lane,
+                                    reason=reason,
+                                    artifact_store=session.artifact_store,
+                                    session=session,
+                                    charge_budget=True,
+                                    requested_via="search_papers",
+                                    write_snapshot=False,
+                                    stage_watchdog_seconds=batch_search_timeout,
+                                )
+                            )
+                        except Exception:
+                            if not payloads:
+                                raise
+                            break
+                else:
+                    _append_payloads(
+                        workspace.search_papers(
+                            query_plan_id=query_plan_id,
+                            query_text=query_text,
+                            lane=lane,
+                            reason=reason,
+                            artifact_store=session.artifact_store,
+                            session=session,
+                            charge_budget=True,
+                            requested_via="search_papers",
+                            write_snapshot=False,
+                        )
+                    )
+                return payloads
+
+            return _budget_safe(_run_batch_search)
 
         def download_document(paper_id: str) -> ToolResult:
             """Download a paper artifact within reviewer budget rules."""
@@ -5413,6 +5714,22 @@ class ReactReviewedReviewerAgent:
                 cycle_number,
                 exc,
             )
+            if self.repair_attempts > 0:
+                repaired_items = self._repair_review_items_with_llm(
+                    submission=submission,
+                    proposer_trajectory=proposer_trajectory,
+                    cycle_number=cycle_number,
+                    session=session,
+                    error=error,
+                    trajectory=partial_trajectory,
+                )
+                logger.warning(
+                    "react_reviewed_reviewer_payload_repaired role=%s cycle=%s count=%s",
+                    self.reviewer_role,
+                    cycle_number,
+                    len(repaired_items),
+                )
+                return repaired_items, partial_trajectory, "salvaged"
             raise error
         try:
             raw_items = self._parse_review_items_response(response=response)
@@ -5454,6 +5771,22 @@ class ReactReviewedReviewerAgent:
                 cycle_number,
                 exc,
             )
+            if self.repair_attempts > 0:
+                repaired_items = self._repair_review_items_with_llm(
+                    submission=submission,
+                    proposer_trajectory=proposer_trajectory,
+                    cycle_number=cycle_number,
+                    session=session,
+                    error=error,
+                    trajectory=trajectory,
+                )
+                logger.warning(
+                    "react_reviewed_reviewer_payload_repaired role=%s cycle=%s count=%s",
+                    self.reviewer_role,
+                    cycle_number,
+                    len(repaired_items),
+                )
+                return repaired_items, trajectory, "salvaged"
             raise error
 
     def _parse_review_items_response(self, *, response: Any) -> List[Dict[str, Any]]:
@@ -5615,6 +5948,114 @@ class ReactReviewedReviewerAgent:
             except Exception:
                 return []
         return items
+
+    def _repair_review_items_with_llm(
+        self,
+        *,
+        submission: AnswerSubmission,
+        proposer_trajectory: ReActTrajectory,
+        cycle_number: int,
+        session: ReviewerSession,
+        error: ReactReviewedStructuredOutputError,
+        trajectory: Optional[ReActTrajectory],
+    ) -> List[ReviewItem]:
+        conclude_call_contract = self._build_review_prompt_contract(
+            submission=submission,
+            proposer_trajectory=proposer_trajectory,
+        )
+        last_error: ReactReviewedStructuredOutputError = error
+        for attempt_number in range(1, self.repair_attempts + 1):
+            try:
+                llm = build_chat_model_from_config(self.model_config)
+                raw_response = invoke_llm(
+                    llm,
+                    [
+                        {
+                            "role": "system",
+                            "content": build_reviewer_repair_system_prompt(
+                                conclude_contract=conclude_call_contract,
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": _json_preview(
+                                {
+                                    "cycle_number": cycle_number,
+                                    "repair_attempt": attempt_number,
+                                    "reviewer_role": self.reviewer_role,
+                                    "submission": submission.model_dump(exclude_none=True),
+                                    "proposer_trajectory": proposer_trajectory.to_dict(),
+                                    "conclude_call_contract": conclude_call_contract,
+                                    "validation_error": str(last_error),
+                                    "invalid_review_payload": last_error.structured_output,
+                                    "invalid_response_content": last_error.response_content,
+                                },
+                                limit=12000,
+                            ),
+                        },
+                    ],
+                )
+            except Exception as exc:
+                execution_error = ReactReviewedReviewerExecutionError(
+                    stage="reviewer_repair",
+                    cycle_number=cycle_number,
+                    reviewer_role=self.reviewer_role,
+                    message=f"Reviewer repair attempt failed to execute: {exc}",
+                    details={"attempt": attempt_number},
+                    response_content=getattr(exc, "response_content", None),
+                    structured_output=getattr(exc, "structured_output", None),
+                    trajectory=trajectory,
+                )
+                _store_reviewer_execution_failure(
+                    artifact_store=session.artifact_store,
+                    prefix=f"{self.reviewer_role}_cycle_{cycle_number}_repair_{attempt_number}",
+                    error=execution_error,
+                )
+                raise execution_error
+            try:
+                raw_items = self._parse_review_items_response(response=AgentResponse(content=raw_response))
+                return [ReviewItem.model_validate(item) for item in list(raw_items or [])][: self.max_items]
+            except Exception as exc:
+                salvage_sources = [
+                    SimpleNamespace(content=raw_response, structured_output=None, response_content=raw_response),
+                    SimpleNamespace(
+                        content=raw_response,
+                        structured_output=last_error.structured_output,
+                        response_content=last_error.response_content,
+                    ),
+                ]
+                for salvage_source in salvage_sources:
+                    salvaged_items = self._salvage_review_payload(
+                        response=salvage_source,
+                        trajectory=trajectory,
+                        proposer_trajectory=proposer_trajectory,
+                        submission=submission,
+                        max_items=self.max_items,
+                    )
+                    if salvaged_items:
+                        logger.warning(
+                            "react_reviewed_reviewer_repair_salvaged role=%s cycle=%s attempt=%s count=%s",
+                            self.reviewer_role,
+                            cycle_number,
+                            attempt_number,
+                            len(salvaged_items),
+                        )
+                        return salvaged_items
+                last_error = ReactReviewedStructuredOutputError(
+                    stage="reviewer_repair",
+                    cycle_number=cycle_number,
+                    reviewer_role=self.reviewer_role,
+                    message=f"invalid reviewer repair output: {exc}",
+                    response_content=raw_response,
+                    structured_output=None,
+                    trajectory=trajectory,
+                )
+                _store_invalid_llm_output(
+                    artifact_store=session.artifact_store,
+                    prefix=f"{self.reviewer_role}_cycle_{cycle_number}_repair_{attempt_number}",
+                    error=last_error,
+                )
+        raise last_error
 
     def _build_review_prompt_contract(
         self,
@@ -5909,6 +6350,7 @@ class ReactReviewedWorkflow:
                 max_items=react_config.get("max_review_items_per_reviewer", 3),
                 max_retrieval_actions=self.reviewer_budget_by_role.get(reviewer_role, self.reviewer_global_budget),
                 llm_timeout_seconds=self.qa_config.get("model_timeout_seconds", 45.0),
+                repair_attempts=react_config.get("reviewer_repair_attempts", 1),
             )
             for reviewer_role in self.reviewer_role_order
         }

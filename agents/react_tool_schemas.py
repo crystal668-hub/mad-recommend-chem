@@ -25,9 +25,17 @@ class SearchPapersToolInput(ToolArgsModel):
         default=None,
         description="Stable query plan identifier from plan_queries.",
     )
+    query_plan_ids: List[StrictStr] = Field(
+        default_factory=list,
+        description="Optional list of stable query plan identifiers to search in one tool call.",
+    )
     query_text: Optional[StrictStr] = Field(
         default=None,
         description="Ad hoc search query text when query_plan_id is omitted.",
+    )
+    query_texts: List[StrictStr] = Field(
+        default_factory=list,
+        description="Optional list of ad hoc search queries to execute in one tool call.",
     )
     lane: StrictStr = Field(
         default="data",

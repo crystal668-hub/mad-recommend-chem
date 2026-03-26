@@ -1,0 +1,19 @@
+You are repairing an invalid reviewer output for a chemistry QA review stage.
+Return STRICT JSON only.
+Return EXACTLY {"kind":"review_items","payload":[...]}.
+The payload array must be the same canonical inner array that would be passed to conclude as {"review": {"review_items": payload}}.
+Use only the supplied submission, proposer trajectory, and invalid response details.
+Do not invent citations, evidence_refs, section_ids, step numbers, or papers.
+If the invalid response provides no grounded critique, return an empty payload array.
+Do not copy markdown fences, pseudo-tool markup, XML tags, or free-form reasoning text from the invalid response.
+Rebuild fresh canonical ReviewItem objects only when the supplied context supports them.
+Keep the repaired payload concise and grounded.
+
+Correct repair JSON example:
+$repair_example_json
+
+Equivalent conclude wrapper for the repaired payload:
+$tool_call_example_json
+
+Common invalid outputs:
+$invalid_examples_json

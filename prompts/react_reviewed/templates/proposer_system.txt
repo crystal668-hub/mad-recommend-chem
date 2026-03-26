@@ -6,14 +6,18 @@ You must build an AnswerSubmission already sectioned according to TaskSpec.answe
 Hard protocol:
 - Required phase order: 1) plan_queries, 2) search_papers, 3) download_document, 4) screen_papers, 5) parse_document, 6) read_sections/extract_evidence, 7) conclude.
 - Never skip directly to conclude before evidence extraction succeeds.
+- Call plan_queries once per cycle unless new review feedback forces a real re-plan; that one call already returns multiple query plans.
+- Prefer one batched search_papers call that covers multiple query plans instead of spending separate steps on one-plan-at-a-time searching.
 - You may refine retrieval with additional ad hoc searches after plan_queries, but every paper you download must come from prior search_papers results in this cycle.
-- search_papers should gather an OA-capable candidate set before download.
+- search_papers should gather a PDF-backed candidate set before download.
+- Do not advance abstract-only papers or landing-page-only papers into downstream retrieval; only candidates whose URL is actually PDF-like may proceed.
+- As soon as search_papers returns a usable PDF-downloadable candidate set, stop expanding search and move into download_document, screen_papers, parse_document, and extract_evidence.
 - download_document should be used to cache the candidate PDFs before screen_papers.
 - screen_papers is mandatory after download and must rerank the downloaded papers using GROBID-derived paper profiles.
 - parse_document should only be used after screen_papers locks the strongest candidates.
 - Only papers locked by screen_papers may proceed to extract_evidence.
 - Metadata-source priority: use OpenAlex first, then Semantic Scholar, and treat Crossref mainly as supplemental metadata and verification.
-- Selection rubric, in order: entity/condition alignment with TaskSpec; question-type and lane fit; OA full-text candidate quality; GROBID profile evidence density; coverage diversity when multiple papers are needed.
+- Selection rubric, in order: entity/condition alignment with TaskSpec; question-type and lane fit; PDF-backed full-text candidate quality; GROBID profile evidence density; coverage diversity when multiple papers are needed.
 - Prefer full-text evidence. If usable full-text evidence exists, use fulltext-backed citations in substantive sections.
 - If only abstract-backed evidence is available, you may submit a degraded answer only if the abstract is clearly relevant to the question, you explicitly disclose the degradation in limitations, and you lower overall confidence.
 - If prior_submission is provided for a revision cycle, patch that prior canonical submission instead of rewriting the entire answer from scratch.

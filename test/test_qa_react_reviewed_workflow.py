@@ -600,10 +600,11 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
         resolved = resolve_qa_runtime_config({"qa": {}})
 
         self.assertEqual("react_reviewed", resolved["workflow_mode"])
-        self.assertEqual(7, resolved["react_reviewed"]["max_propose_steps_initial"])
-        self.assertEqual(7, resolved["react_reviewed"]["max_propose_steps_revision"])
+        self.assertEqual(10, resolved["react_reviewed"]["max_propose_steps_initial"])
+        self.assertEqual(10, resolved["react_reviewed"]["max_propose_steps_revision"])
         self.assertEqual("fail_fast_only", resolved["react_reviewed"]["proposer_fallback_mode"])
         self.assertEqual(1, resolved["react_reviewed"]["proposer_repair_attempts"])
+        self.assertEqual(1, resolved["react_reviewed"]["reviewer_repair_attempts"])
         self.assertEqual("prefer_fulltext", resolved["react_reviewed"]["proposer_evidence_policy"])
         self.assertEqual(18, resolved["react_reviewed"]["proposer_candidate_target"])
         self.assertEqual(5, resolved["react_reviewed"]["proposer_rerank_top_k"])
@@ -656,6 +657,7 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
                     "react_reviewed": {
                         "proposer_candidate_target": 9,
                         "proposer_rerank_top_k": 4,
+                        "reviewer_repair_attempts": 2,
                         "grobid_url": "http://grobid.internal:8070",
                     },
                 },
@@ -669,6 +671,7 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(4, workflow.proposer_rerank_top_k)
         self.assertEqual(9, workflow.proposer.proposer_candidate_target)
         self.assertEqual(4, workflow.proposer.proposer_rerank_top_k)
+        self.assertTrue(all(reviewer.repair_attempts == 2 for reviewer in workflow.reviewers.values()))
         self.assertEqual("http://grobid.internal:8070", workflow.paper_profile_builder.grobid_url)
 
     def test_qa_result_accepts_submission_trace_fields(self):
@@ -906,6 +909,40 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual("semantic", failure_payload["stage"])
         self.assertEqual("router_execution_failed", agent_run_payload["error"]["error"])
         self.assertFalse((self.temp_dir / "router_failure" / "router" / "task_spec.json").exists())
+
+    def test_router_wrapper_writes_fallback_reason_artifact_on_success(self):
+        class _FallbackRouterNode:
+            def __init__(self) -> None:
+                self.last_run_debug = {
+                    "semantic_stage": {"primary_question_type": "mechanism"},
+                    "localization_stage": {"question_type": "mechanism", "recency_policy": "none"},
+                    "fallback_reason": {
+                        "stage": "localization",
+                        "reason": "localization_json_parse_failed_using_baseline",
+                    },
+                }
+
+            def run(self, question: str, context: str | None = None) -> TaskSpec:
+                task_spec = _task_spec(question=question)
+                return task_spec.model_copy(update={"question_type": "mechanism"})
+
+        wrapper = RouterAgentWrapper(router=_FallbackRouterNode())
+        store = QAArtifactStore(base_dir=self.temp_dir / "router_fallback")
+
+        task_spec, artifacts = wrapper.run(
+            question="Why is Pt/C more active for alkaline HER in 1 M KOH?",
+            context=None,
+            artifact_store=store,
+        )
+
+        fallback_payload = _read_json(str(self.temp_dir / "router_fallback" / "router" / "fallback_reason.json"))
+        self.assertEqual("mechanism", task_spec.question_type)
+        self.assertIn("router_fallback_reason", artifacts)
+        self.assertEqual("localization", fallback_payload["stage"])
+        self.assertEqual(
+            "localization_json_parse_failed_using_baseline",
+            fallback_payload["reason"],
+        )
 
     def test_workspace_plan_queries_writes_failure_artifacts_and_raises(self):
         workspace = ReactReviewedWorkspace(
@@ -1420,7 +1457,88 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertIn("paper-bad", screened["dropped_paper_ids"])
         self.assertTrue(any(item["paper_id"] == "paper-bad" for item in screened["ranked_candidates"]))
 
-    def test_workspace_search_papers_filters_non_oa_candidates(self):
+    def test_screen_candidate_papers_expands_to_other_downloaded_candidates_when_requested_subset_all_fail(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace(
+            paper_profile_builder=_FakePaperProfileBuilder(failures={"paper-bad-1", "paper-bad-2"})
+        )
+        workspace.paper_candidates = {
+            "paper-good": PaperCandidate(
+                paper_id="paper-good",
+                title="Pt/C improves HER activity in 1 M KOH",
+                abstract="Pt/C improves HER activity in alkaline electrolyte.",
+                provider_hits=["openalex"],
+                lane_sources=["data"],
+                retrieval_score=8.5,
+                oa_url="https://example.org/good.pdf",
+            ),
+            "paper-bad-1": PaperCandidate(
+                paper_id="paper-bad-1",
+                title="Generic catalyst summary one",
+                abstract="Generic catalyst summary.",
+                provider_hits=["openalex"],
+                lane_sources=["data"],
+                retrieval_score=7.9,
+                oa_url="https://example.org/bad-1.pdf",
+            ),
+            "paper-bad-2": PaperCandidate(
+                paper_id="paper-bad-2",
+                title="Generic catalyst summary two",
+                abstract="Generic catalyst summary.",
+                provider_hits=["openalex"],
+                lane_sources=["data"],
+                retrieval_score=7.7,
+                oa_url="https://example.org/bad-2.pdf",
+            ),
+        }
+        workspace.paper_records = {
+            paper_id: PaperRecord(
+                paper_id=paper_id,
+                title=candidate.title,
+                abstract=candidate.abstract,
+                oa_url=candidate.oa_url,
+                fulltext_available=True,
+                fulltext_status="fulltext_indexed",
+                source_artifact_path=str(self.temp_dir / f"{paper_id}.pdf"),
+            )
+            for paper_id, candidate in workspace.paper_candidates.items()
+        }
+
+        def _screen_payload(*, ranked_candidates, **kwargs):
+            self.assertEqual(["paper-good"], [item["paper_id"] for item in ranked_candidates])
+            return {
+                "locked_paper_ids": ["paper-good"],
+                "dropped_paper_ids": [],
+                "ranked_candidates": [
+                    {"paper_id": "paper-good", "decision": "lock", "reason": "best fallback profile alignment"},
+                ],
+                "llm_screening_used": True,
+            }
+
+        with patch.object(
+            proposer,
+            "_llm_screen_candidate_papers",
+            side_effect=_screen_payload,
+        ):
+            screened = proposer._screen_candidate_papers(
+                workspace=workspace,
+                cycle_number=1,
+                open_review_items=[],
+                paper_ids=["paper-bad-1", "paper-bad-2"],
+                max_candidates=1,
+            )
+
+        self.assertEqual(["paper-good"], screened["locked_paper_ids"])
+        self.assertIn("paper-bad-1", screened["dropped_paper_ids"])
+        self.assertIn("paper-bad-2", screened["dropped_paper_ids"])
+        self.assertTrue(any(item["paper_id"] == "paper-good" for item in screened["ranked_candidates"]))
+
+    def test_workspace_search_papers_filters_non_pdf_candidates(self):
         class _MixedRetriever:
             def __init__(self) -> None:
                 self.last_diagnostics = []
@@ -1437,6 +1555,39 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                         retrieval_score=0.9,
                         oa_url="https://example.org/paper-oa.pdf",
                         best_oa_pdf_url="https://example.org/paper-oa.pdf",
+                        oa_eligible=True,
+                    ),
+                    PaperCandidate(
+                        paper_id="paper-pdf-endpoint",
+                        title="PDF endpoint candidate",
+                        abstract="pdf endpoint without .pdf suffix",
+                        provider_hits=["openalex"],
+                        lane_sources=["data"],
+                        retrieval_score=0.88,
+                        oa_url="https://example.org/paper/_pdf",
+                        best_oa_pdf_url="https://example.org/paper/_pdf",
+                        oa_eligible=True,
+                    ),
+                    PaperCandidate(
+                        paper_id="paper-landing-only",
+                        title="Landing-page-only candidate",
+                        abstract="landing page but no direct pdf",
+                        provider_hits=["openalex"],
+                        lane_sources=["data"],
+                        retrieval_score=0.85,
+                        oa_url="https://example.org/paper-landing",
+                        best_oa_landing_page_url="https://example.org/paper-landing",
+                        oa_eligible=True,
+                    ),
+                    PaperCandidate(
+                        paper_id="paper-image-only",
+                        title="Image masquerading as PDF",
+                        abstract="image only candidate",
+                        provider_hits=["openalex"],
+                        lane_sources=["data"],
+                        retrieval_score=0.83,
+                        oa_url="https://example.org/figure.jpg",
+                        best_oa_pdf_url="https://example.org/figure.jpg",
                         oa_eligible=True,
                     ),
                     PaperCandidate(
@@ -1458,7 +1609,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             write_snapshot=False,
         )
 
-        self.assertEqual(["paper-oa"], [item["paper_id"] for item in result])
+        self.assertEqual(["paper-oa", "paper-pdf-endpoint"], [item["paper_id"] for item in result])
 
     def test_retriever_filters_off_topic_candidates_before_enrichment(self):
         class _OpenAlexClient:
@@ -1607,6 +1758,154 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         )
 
         self.assertEqual(["10.1000/asv-method"], [candidate.doi for candidate in candidates])
+
+    def test_retriever_returns_partial_candidates_before_runtime_budget_expires(self):
+        class _OpenAlexClient:
+            timeout = 10.0
+
+            def search(self, query_plan, limit=8):
+                return [
+                    {
+                        "display_name": "CO2 adsorption in ultramicroporous carbons",
+                        "doi": "10.1000/partial-hit",
+                        "publication_year": 2024,
+                        "abstract": "CO2 adsorption probes ultramicropores below 0.7 nm more effectively than N2 at 77 K.",
+                        "authorships": [],
+                        "best_oa_location": {"pdf_url": "https://example.org/partial-hit.pdf"},
+                    }
+                ]
+
+        class _SlowSemanticScholarClient:
+            timeout = 5.0
+
+            def __init__(self) -> None:
+                self.search_calls = 0
+                self.enrich_calls = 0
+
+            def search(self, query_plan, limit=8):
+                self.search_calls += 1
+                return []
+
+            def enrich(self, candidate):
+                self.enrich_calls += 1
+                return None
+
+        class _SlowCrossrefClient:
+            timeout = 5.0
+
+            def __init__(self) -> None:
+                self.search_calls = 0
+                self.enrich_calls = 0
+
+            def search(self, query_plan, limit=8):
+                self.search_calls += 1
+                return []
+
+            def enrich(self, candidate):
+                self.enrich_calls += 1
+                return None
+
+        semantic_scholar = _SlowSemanticScholarClient()
+        crossref = _SlowCrossrefClient()
+        retriever = RetrieverNode(
+            openalex_client=_OpenAlexClient(),
+            semantic_scholar_client=semantic_scholar,
+            crossref_client=crossref,
+            per_lane_limit=8,
+            final_top_k=6,
+            max_enrichment_candidates=4,
+        )
+
+        candidates = retriever.run(
+            task_spec=_task_spec("Why can CO2 adsorption probe narrow micropores better than N2 adsorption?"),
+            entity_pack=_entity_pack(),
+            query_plans=[
+                QueryPlan(
+                    lane="review",
+                    query_text="CO2 adsorption narrow micropores ultramicropores review",
+                    must_terms=["CO2", "adsorption", "micropores"],
+                    exclude_terms=[],
+                    preferred_sources=["openalex", "semantic_scholar", "crossref"],
+                )
+            ],
+            artifact_store=QAArtifactStore(base_dir=self.temp_dir / "retriever_runtime_budget"),
+            max_runtime_seconds=1.1,
+        )
+
+        self.assertEqual(["10.1000/partial-hit"], [candidate.doi for candidate in candidates])
+        self.assertEqual(0, semantic_scholar.enrich_calls)
+        self.assertEqual(0, crossref.enrich_calls)
+
+    def test_retriever_skips_crossref_enrichment_when_openalex_metadata_is_complete(self):
+        class _OpenAlexClient:
+            timeout = 10.0
+
+            def search(self, query_plan, limit=8):
+                return [
+                    {
+                        "display_name": "Use of N2, Ar and CO2 adsorption for the determination of microporosity",
+                        "doi": "10.1000/complete-openalex",
+                        "publication_year": 1993,
+                        "abstract": "CO2 adsorption at higher temperature can access narrow micropores because diffusion limits are reduced.",
+                        "authorships": [
+                            {"author": {"display_name": "F. Ehrburger-Dolle"}},
+                            {"author": {"display_name": "M. Holz"}},
+                        ],
+                        "primary_location": {"source": {"display_name": "Pure and Applied Chemistry"}},
+                        "best_oa_location": {"pdf_url": "https://example.org/complete-openalex.pdf"},
+                    }
+                ]
+
+        class _TrackingCrossrefClient:
+            timeout = 10.0
+
+            def __init__(self) -> None:
+                self.enrich_calls = 0
+
+            def search(self, query_plan, limit=8):
+                return []
+
+            def enrich(self, candidate):
+                self.enrich_calls += 1
+                return None
+
+        class _NoopSemanticScholarClient:
+            timeout = 10.0
+
+            def search(self, query_plan, limit=8):
+                return []
+
+            def enrich(self, candidate):
+                return None
+
+        crossref = _TrackingCrossrefClient()
+        retriever = RetrieverNode(
+            openalex_client=_OpenAlexClient(),
+            semantic_scholar_client=_NoopSemanticScholarClient(),
+            crossref_client=crossref,
+            per_lane_limit=8,
+            final_top_k=6,
+            max_enrichment_candidates=4,
+        )
+
+        candidates = retriever.run(
+            task_spec=_task_spec("Why can CO2 adsorption probe narrow micropores better than N2 adsorption?"),
+            entity_pack=_entity_pack(),
+            query_plans=[
+                QueryPlan(
+                    lane="review",
+                    query_text="CO2 adsorption narrow micropores review",
+                    must_terms=["CO2", "adsorption", "micropores"],
+                    exclude_terms=[],
+                    preferred_sources=["openalex"],
+                )
+            ],
+            artifact_store=QAArtifactStore(base_dir=self.temp_dir / "retriever_skip_crossref_enrich"),
+        )
+
+        self.assertEqual(1, len(candidates))
+        self.assertEqual("10.1000/complete-openalex", candidates[0].doi)
+        self.assertEqual(0, crossref.enrich_calls)
 
     def test_grobid_paper_profile_builder_prefers_grobid_then_supplements_local_fulltext(self):
         artifact_store = QAArtifactStore(base_dir=self.temp_dir / "paper_profile_local")
@@ -2414,6 +2713,162 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertIn("Direct answer is off-topic.", items[0].critique)
         self.assertIn("Supporting evidence does not justify the claim.", items[0].critique)
 
+    def test_reviewer_repair_accepts_valid_review_items_json(self):
+        reviewer = ReactReviewedReviewerAgent(
+            reviewer_role="counterevidence",
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps=3,
+            max_items=3,
+            max_retrieval_actions=2,
+            llm_timeout_seconds=45.0,
+            repair_attempts=1,
+        )
+        submission = _submission("What is the oxidation state of N in N2O?")
+        trajectory = _trajectory("reviewer repair")
+        session = ReviewerSession(
+            reviewer_role="counterevidence",
+            cycle_number=2,
+            artifact_store=QAArtifactStore(base_dir=self.temp_dir / "reviewer_repair"),
+            budget_state=ReviewerBudgetState(role="counterevidence", budget_limit=2),
+        )
+        invalid_error = ReactReviewedStructuredOutputError(
+            stage="reviewer",
+            cycle_number=2,
+            reviewer_role="counterevidence",
+            message="invalid reviewer structured output",
+            response_content="not json",
+            structured_output=None,
+            trajectory=trajectory,
+        )
+
+        with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
+            "qa.react_reviewed_workflow.invoke_llm",
+            return_value=json.dumps(
+                {
+                    "kind": "review_items",
+                    "payload": [
+                        {
+                            "review_id": "counterevidence_1",
+                            "reviewer_role": "counterevidence",
+                            "anchor_kind": "section_only",
+                            "severity": "warning",
+                            "flaw_type": "counterexample_missing",
+                            "critique": "The submission does not address whether the terminal and central nitrogens differ.",
+                            "required_action": "State that +1 is the average oxidation state and distinguish the two nitrogens.",
+                            "evidence_refs": ["CIT-1"],
+                            "status": "open",
+                            "target_section_id": "direct_answer",
+                        }
+                    ],
+                }
+            ),
+        ):
+            items = reviewer._repair_review_items_with_llm(
+                submission=submission,
+                proposer_trajectory=trajectory,
+                cycle_number=2,
+                session=session,
+                error=invalid_error,
+                trajectory=trajectory,
+            )
+
+        self.assertEqual(1, len(items))
+        self.assertEqual("counterevidence_1", items[0].review_id)
+        self.assertEqual("counterexample_missing", items[0].flaw_type)
+        self.assertEqual("direct_answer", items[0].target_section_id)
+
+    def test_reviewer_invalid_output_enters_repair_and_returns_salvaged_status(self):
+        reviewer = ReactReviewedReviewerAgent(
+            reviewer_role="counterevidence",
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps=3,
+            max_items=3,
+            max_retrieval_actions=2,
+            llm_timeout_seconds=45.0,
+            repair_attempts=1,
+        )
+        workspace = self._make_workspace()
+        submission = _submission("What is the oxidation state of N in N2O?")
+        proposer_trajectory = _trajectory("counterevidence proposer")
+        session = self._make_session("counterevidence", 2)
+        repaired_items = [
+            ReviewItem(
+                review_id="counterevidence_1",
+                reviewer_role="counterevidence",
+                anchor_kind="section_only",
+                severity="warning",
+                flaw_type="counterexample_missing",
+                critique="The answer should clarify that +1 is an average oxidation state.",
+                required_action="Clarify the distinction between average and site-specific oxidation states.",
+                evidence_refs=["CIT-1"],
+                status="open",
+                target_section_id="direct_answer",
+            )
+        ]
+
+        class _StubStructuredTool:
+            @staticmethod
+            def from_function(func, name=None, args_schema=None):
+                class _Tool:
+                    def __init__(self, func, name, args_schema):
+                        self.func = func
+                        self.name = name or getattr(func, "__name__", "tool")
+                        self.args_schema = args_schema
+
+                    def invoke(self, payload):
+                        if isinstance(payload, dict):
+                            return self.func(**payload)
+                        return self.func(payload)
+
+                return _Tool(func, name, args_schema)
+
+        class _InvalidReviewerReActAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def generate_response_with_react(self, *args, **kwargs):
+                response = AgentResponse(content="")
+                response.response_content = {
+                    "forced_conclude_structured_json_response": {
+                        "message_type": "AIMessage",
+                        "content": (
+                            "I need to search for counterevidence.\n\n"
+                            "<function_calls>\n"
+                            "<invoke name=\"search\">\n"
+                            "<parameter name=\"query\" string=\"true\">oxidation state nitrogen N2O</parameter>\n"
+                            "</invoke>\n"
+                            "</function_calls>"
+                        ),
+                        "additional_kwargs": {},
+                        "tool_calls": [],
+                        "function_call": None,
+                        "tool_call_id": None,
+                    }
+                }
+                return response, _trajectory("invalid reviewer conclude output")
+
+        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed_workflow.ReActAgent",
+            _InvalidReviewerReActAgent,
+        ), patch.object(
+            reviewer,
+            "_repair_review_items_with_llm",
+            return_value=repaired_items,
+        ) as repair_mock:
+            items, trajectory, status = reviewer.run(
+                workspace=workspace,
+                submission=submission,
+                proposer_trajectory=proposer_trajectory,
+                cycle_number=2,
+                session=session,
+            )
+
+        self.assertEqual(1, len(items))
+        self.assertEqual("salvaged", status.status)
+        self.assertEqual("counterevidence_1", items[0].review_id)
+        self.assertIsNotNone(trajectory)
+        repair_mock.assert_called_once()
+
     def test_proposer_invalid_output_raises_and_restores_workspace_state(self):
         workflow = self._make_workflow()
         workflow.proposer = ReactReviewedProposerAgent(
@@ -2515,7 +2970,10 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
 
         proposer._repair_submission_with_llm = _repair_submission_with_llm
 
-        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+        with patch.object(_ProposerRunState, "has_any_evidence", return_value=True), patch(
+            "qa.react_reviewed_workflow._lazy_structured_tool_import",
+            return_value=_StubStructuredTool,
+        ), patch(
             "qa.react_reviewed_workflow.ReActAgent",
             _RepairableReActAgent,
         ):
@@ -2744,6 +3202,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             trajectory=trajectory,
         )
         run_state = _ProposerRunState(evidence_policy="strict")
+        run_state.evidence_ids = {"ev-1"}
         repaired_submission = _submission(workspace.question, trajectory_id=trajectory.trajectory_id)
 
         with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
@@ -2781,6 +3240,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             trajectory=trajectory,
         )
         run_state = _ProposerRunState(evidence_policy="strict")
+        run_state.evidence_ids = {"ev-1"}
         repaired_submission = _submission(workspace.question, trajectory_id=trajectory.trajectory_id)
 
         def _inspect_invoke(_llm, messages):
@@ -2856,6 +3316,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             trajectory=trajectory,
         )
         run_state = _ProposerRunState(evidence_policy="strict")
+        run_state.evidence_ids = {"ev-1"}
         repaired_submission = _submission(workspace.question, trajectory_id=trajectory.trajectory_id)
 
         def _inspect_invoke(_llm, messages):
@@ -2923,6 +3384,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             trajectory=trajectory,
         )
         run_state = _ProposerRunState(evidence_policy="strict")
+        run_state.evidence_ids = {"ev-1"}
 
         def _validate_submission_payload(*, submission, **kwargs):
             self.assertEqual(
@@ -3121,7 +3583,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             payload["response_content"]["forced_conclude_structured_json_response"]["content"],
         )
 
-    def test_proposer_forced_conclude_exception_with_invalid_salvage_enters_repair(self):
+    def test_proposer_forced_conclude_exception_with_invalid_salvage_fails_fast_without_evidence(self):
         proposer = ReactReviewedProposerAgent(
             model_config={"provider": "openai", "model": "fake", "api_key": "test"},
             max_steps_initial=6,
@@ -3130,8 +3592,6 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             repair_attempts=1,
         )
         workspace = self._make_workspace()
-        repaired_submission = _submission(workspace.question, trajectory_id="traj_repaired")
-        repaired_trajectory = _trajectory("repaired after forced conclude exception")
         invalid_payload = _submission(workspace.question, trajectory_id="traj_bad").model_dump(exclude_none=True)
         invalid_payload["citations"][0]["paper_id"] = "paper_missing"
 
@@ -3173,28 +3633,22 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
             "qa.react_reviewed_workflow.ReActAgent",
             _RaisingReActAgent,
-        ), patch.object(
-            proposer,
-            "_repair_submission_with_llm",
-            return_value=(repaired_submission, repaired_trajectory),
-        ) as repair_mock:
-            submission, trajectory = proposer.run(
-                workspace=workspace,
-                cycle_number=1,
-                open_review_items=[],
-            )
+        ):
+            with self.assertRaises(ReactReviewedProposerExecutionError) as ctx:
+                proposer.run(
+                    workspace=workspace,
+                    cycle_number=1,
+                    open_review_items=[],
+                )
 
-        self.assertEqual(repaired_submission.submission_id, submission.submission_id)
-        self.assertEqual(repaired_trajectory.trajectory_id, trajectory.trajectory_id)
-        repair_error = repair_mock.call_args.kwargs["error"]
-        self.assertIsInstance(repair_error, ReactReviewedStructuredOutputError)
-        self.assertEqual("proposer", repair_error.stage)
-        self.assertIn("Submission has no citation catalog", str(repair_error))
-        self.assertEqual("submission_cycle_1", repair_error.structured_output["payload"]["submission_id"])
+        self.assertIn(
+            "repair was not attempted because submission repair requires evidence from this cycle",
+            str(ctx.exception),
+        )
         invalid_path = self.temp_dir / "workspace" / "diagnostics" / "proposer_cycle_1_invalid_response.json"
         self.assertTrue(invalid_path.exists(), str(invalid_path))
 
-    def test_revision_forced_conclude_exception_without_salvage_enters_repair_from_prior_submission(self):
+    def test_revision_forced_conclude_exception_without_salvage_fails_fast_without_current_cycle_evidence(self):
         proposer = ReactReviewedProposerAgent(
             model_config={"provider": "openai", "model": "fake", "api_key": "test"},
             max_steps_initial=6,
@@ -3210,6 +3664,94 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             proposer_trajectory=prior_trajectory,
             open_review_items=[],
             cycle_number=2,
+        )
+
+        class _StubStructuredTool:
+            @staticmethod
+            def from_function(func, name=None, args_schema=None):
+                class _Tool:
+                    def __init__(self, func, name, args_schema):
+                        self.func = func
+                        self.name = name or getattr(func, "__name__", "tool")
+                        self.args_schema = args_schema
+
+                    def invoke(self, payload):
+                        if isinstance(payload, dict):
+                            return self.func(**payload)
+                        return self.func(payload)
+
+                return _Tool(func, name, args_schema)
+
+        class _RaisingReActAgent:
+            def __init__(self, *args, **kwargs):
+                self.current_trajectory = _trajectory("revision forced conclude exception")
+
+            def generate_response_with_react(self, *args, **kwargs):
+                error = RuntimeError("Forced conclude failed to emit a recognized `conclude` tool call.")
+                error.response_content = {
+                    "forced_conclude_action_response": {
+                        "message_type": "AIMessage",
+                        "content": "",
+                        "additional_kwargs": {},
+                        "tool_calls": [],
+                        "function_call": None,
+                    }
+                }
+                error.structured_output = None
+                error.trajectory = self.current_trajectory
+                raise error
+
+        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed_workflow.ReActAgent",
+            _RaisingReActAgent,
+        ):
+            with self.assertRaises(ReactReviewedProposerExecutionError) as ctx:
+                proposer.run(
+                    workspace=workspace,
+                    cycle_number=2,
+                    open_review_items=[],
+                )
+
+        self.assertIn(
+            "repair was not attempted because submission repair requires evidence from this cycle",
+            str(ctx.exception),
+        )
+
+    def test_revision_forced_conclude_exception_enters_repair_when_current_cycle_evidence_exists(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+            repair_attempts=1,
+        )
+        workspace = self._make_workspace()
+        prior_submission = _submission(workspace.question, cycle_number=1, trajectory_id="traj_prior")
+        prior_trajectory = _trajectory("prior cycle")
+        workspace.set_review_context(
+            submission=prior_submission,
+            proposer_trajectory=prior_trajectory,
+            open_review_items=[],
+            cycle_number=2,
+        )
+        workspace.evidence_items["ev-1"] = EvidenceItem.model_validate(
+            {
+                "evidence_id": "ev-1",
+                "paper_id": "paper-1",
+                "doi": "10.1000/example",
+                "section_id": "sec_results",
+                "section_type": "results",
+                "role": "observation",
+                "snippet": "Pt/C is active for alkaline HER.",
+                "source_span": {"start": 0, "end": 31},
+                "source_layer": "fulltext",
+                "claim_polarity": "support",
+                "conditions": {},
+                "condition_source_refs": [],
+                "metric_mentions": [],
+                "entity_mentions": ["Pt/C"],
+                "extraction_confidence": 0.7,
+            }
         )
         repaired_submission = _submission(workspace.question, cycle_number=2, trajectory_id="traj_repaired")
         repaired_trajectory = _trajectory("repaired revision output")
@@ -3249,7 +3791,10 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 error.trajectory = self.current_trajectory
                 raise error
 
-        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+        with patch.object(_ProposerRunState, "has_any_evidence", return_value=True), patch(
+            "qa.react_reviewed_workflow._lazy_structured_tool_import",
+            return_value=_StubStructuredTool,
+        ), patch(
             "qa.react_reviewed_workflow.ReActAgent",
             _RaisingReActAgent,
         ), patch.object(
@@ -3335,7 +3880,10 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 error.trajectory = self.current_trajectory
                 raise error
 
-        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+        with patch.object(_ProposerRunState, "has_any_evidence", return_value=True), patch(
+            "qa.react_reviewed_workflow._lazy_structured_tool_import",
+            return_value=_StubStructuredTool,
+        ), patch(
             "qa.react_reviewed_workflow.ReActAgent",
             _RaisingReActAgent,
         ), patch.object(
@@ -3395,6 +3943,240 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(3, len(payload))
         self.assertEqual(["paper-0", "paper-1", "paper-2"], [item["paper_id"] for item in payload])
         self.assertEqual(6, len(workspace.paper_candidates))
+
+    def test_proposer_search_papers_batches_multiple_query_plan_ids_and_dedupes_results(self):
+        class _FixedPlanner:
+            def run(self, *, task_spec: TaskSpec, entity_pack: EntityPack):
+                return [
+                    QueryPlan(
+                        lane="review",
+                        query_text="Pt/C HER alkaline review",
+                        must_terms=["Pt/C", "HER"],
+                        exclude_terms=[],
+                        year_from=None,
+                        year_to=None,
+                        preferred_sources=["openalex"],
+                    ),
+                    QueryPlan(
+                        lane="contrarian",
+                        query_text="Pt/C HER alkaline limitations",
+                        must_terms=["Pt/C", "HER"],
+                        exclude_terms=["hydrazine"],
+                        year_from=None,
+                        year_to=None,
+                        preferred_sources=["openalex"],
+                    ),
+                ]
+
+        class _QueryAwareRetriever:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.last_diagnostics = []
+                self.last_provider_health = {}
+
+            def run(self, *, task_spec: TaskSpec, entity_pack: EntityPack, query_plans, artifact_store=None):
+                query_text = query_plans[0].query_text
+                self.calls.append(query_text)
+                if "limitations" in query_text:
+                    return [
+                        _paper_candidate("paper-dup", score=0.91),
+                        _paper_candidate("paper-2", score=0.82),
+                    ]
+                return [
+                    _paper_candidate("paper-1", score=0.93),
+                    _paper_candidate("paper-dup", score=0.89),
+                ]
+
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        retriever = _QueryAwareRetriever()
+        workspace = ReactReviewedWorkspace(
+            question="How does Pt/C affect HER activity?",
+            context=None,
+            task_spec=_task_spec(),
+            entity_pack=_entity_pack(),
+            entity_resolution_snapshot={},
+            artifact_store=QAArtifactStore(base_dir=self.temp_dir / "workspace_batched_search"),
+            query_planner=_FixedPlanner(),
+            retriever=retriever,
+            document_acquirer=_CountingDocumentAcquirer(),
+            handoff=EvidenceExtractorHandoff(),
+            evidence_extractor=_CountingEvidenceExtractor(),
+            paper_profile_builder=_FakePaperProfileBuilder(),
+        )
+        captured_tools = {}
+
+        class _StubStructuredTool:
+            @staticmethod
+            def from_function(func, name=None, args_schema=None):
+                tool_name = name or getattr(func, "__name__", "tool")
+
+                class _Tool:
+                    def __init__(self, func, name, args_schema):
+                        self.func = func
+                        self.name = name or getattr(func, "__name__", "tool")
+                        self.args_schema = args_schema
+
+                    def invoke(self, payload):
+                        if isinstance(payload, dict):
+                            return self.func(**payload)
+                        return self.func(payload)
+
+                tool = _Tool(func, name, args_schema)
+                captured_tools[tool_name] = tool
+                return tool
+
+        class _RaisingReActAgent:
+            def __init__(self, *args, **kwargs):
+                self.current_trajectory = _trajectory("batched search capture")
+
+            def generate_response_with_react(self, *args, **kwargs):
+                raise RuntimeError("stop after tool registration")
+
+        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed_workflow.ReActAgent",
+            _RaisingReActAgent,
+        ):
+            with self.assertRaises(ReactReviewedProposerExecutionError):
+                proposer.run(
+                    workspace=workspace,
+                    cycle_number=1,
+                    open_review_items=[],
+                )
+
+        captured_tools["plan_queries"].invoke({"focus": "initial"})
+        result = captured_tools["search_papers"].invoke(
+            {"query_plan_ids": ["qp_1", "qp_2"], "reason": "batched coverage"}
+        )
+
+        self.assertEqual(
+            ["Pt/C HER alkaline review", "Pt/C HER alkaline limitations"],
+            retriever.calls,
+        )
+        self.assertEqual(
+            ["paper-1", "paper-dup", "paper-2"],
+            [item["paper_id"] for item in result.data["papers"]],
+        )
+        self.assertEqual(
+            ["qp_1", "qp_1", "qp_2"],
+            [item["query_plan_id"] for item in result.data["papers"]],
+        )
+
+    def test_proposer_batched_search_keeps_partial_results_after_late_timeout(self):
+        class _FixedPlanner:
+            def run(self, *, task_spec: TaskSpec, entity_pack: EntityPack):
+                return [
+                    QueryPlan(
+                        lane="review",
+                        query_text="first query",
+                        must_terms=[],
+                        exclude_terms=[],
+                        year_from=None,
+                        year_to=None,
+                        preferred_sources=["openalex"],
+                    ),
+                    QueryPlan(
+                        lane="contrarian",
+                        query_text="second query",
+                        must_terms=[],
+                        exclude_terms=[],
+                        year_from=None,
+                        year_to=None,
+                        preferred_sources=["openalex"],
+                    ),
+                ]
+
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = ReactReviewedWorkspace(
+            question="How does Pt/C affect HER activity?",
+            context=None,
+            task_spec=_task_spec(),
+            entity_pack=_entity_pack(),
+            entity_resolution_snapshot={},
+            artifact_store=QAArtifactStore(base_dir=self.temp_dir / "workspace_batched_search_partial"),
+            query_planner=_FixedPlanner(),
+            retriever=_CountingRetriever(),
+            document_acquirer=_CountingDocumentAcquirer(),
+            handoff=EvidenceExtractorHandoff(),
+            evidence_extractor=_CountingEvidenceExtractor(),
+            paper_profile_builder=_FakePaperProfileBuilder(),
+        )
+        timeout_values: list[float] = []
+
+        def _search_papers(**kwargs):
+            timeout_values.append(float(kwargs["stage_watchdog_seconds"]))
+            query_plan_id = kwargs.get("query_plan_id")
+            if query_plan_id == "qp_1":
+                return [{"paper_id": "paper-1", "query_plan_id": "qp_1"}]
+            raise TimeoutError("synthetic late timeout")
+
+        workspace.search_papers = _search_papers  # type: ignore[assignment]
+        captured_tools = {}
+
+        class _StubStructuredTool:
+            @staticmethod
+            def from_function(func, name=None, args_schema=None):
+                tool_name = name or getattr(func, "__name__", "tool")
+
+                class _Tool:
+                    def __init__(self, func, name, args_schema):
+                        self.func = func
+                        self.name = name or getattr(func, "__name__", "tool")
+                        self.args_schema = args_schema
+
+                    def invoke(self, payload):
+                        if isinstance(payload, dict):
+                            return self.func(**payload)
+                        return self.func(payload)
+
+                tool = _Tool(func, name, args_schema)
+                captured_tools[tool_name] = tool
+                return tool
+
+        class _RaisingReActAgent:
+            def __init__(self, *args, **kwargs):
+                self.current_trajectory = _trajectory("batched search partial capture")
+
+            def generate_response_with_react(self, *args, **kwargs):
+                raise RuntimeError("stop after tool registration")
+
+        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed_workflow.ReActAgent",
+            _RaisingReActAgent,
+        ):
+            with self.assertRaises(ReactReviewedProposerExecutionError):
+                proposer.run(
+                    workspace=workspace,
+                    cycle_number=1,
+                    open_review_items=[],
+                )
+
+        captured_tools["plan_queries"].invoke({"focus": "initial"})
+        result = captured_tools["search_papers"].invoke(
+            {"query_plan_ids": ["qp_1", "qp_2"], "reason": "batched coverage"}
+        )
+
+        self.assertEqual([140.0, 140.0], timeout_values)
+        self.assertEqual(["paper-1"], [item["paper_id"] for item in result.data["papers"]])
+        self.assertEqual(
+            [
+                {
+                    "query_plan_id": "qp_2",
+                    "reason": "TimeoutError",
+                    "message": "synthetic late timeout",
+                }
+            ],
+            result.data["search_warnings"],
+        )
 
     def test_proposer_uses_configured_screen_top_k_in_tool_schema_default(self):
         proposer = ReactReviewedProposerAgent(
@@ -4119,7 +4901,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(0, payload["section_count"])
         self.assertTrue(str(payload["artifact_path"]).endswith(".pdf"))
 
-    def test_screen_candidate_papers_locks_top_k_but_defers_parsing(self):
+    def test_screen_candidate_papers_locks_top_k_after_profile_indexing(self):
         proposer = ReactReviewedProposerAgent(
             model_config={"provider": "openai", "model": "fake", "api_key": "test"},
             max_steps_initial=6,
@@ -4161,14 +4943,14 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
 
         self.assertEqual(["paper-good"], payload["locked_paper_ids"])
         self.assertNotIn("indexed_papers", payload)
-        self.assertEqual("binary_only", workspace.paper_records["paper-good"].fulltext_status)
-        self.assertEqual("binary_only", workspace.paper_records["paper-drop"].fulltext_status)
+        self.assertEqual("fulltext_indexed", workspace.paper_records["paper-good"].fulltext_status)
+        self.assertEqual("fulltext_indexed", workspace.paper_records["paper-drop"].fulltext_status)
 
         parsed = workspace.parse_document(paper_id="paper-good", write_snapshot=False)
 
         self.assertEqual("paper-good", parsed["paper_id"])
         self.assertEqual("fulltext_indexed", workspace.paper_records["paper-good"].fulltext_status)
-        self.assertEqual("binary_only", workspace.paper_records["paper-drop"].fulltext_status)
+        self.assertEqual("fulltext_indexed", workspace.paper_records["paper-drop"].fulltext_status)
 
     def test_budget_block_prevents_state_mutation(self):
         retriever = _CountingRetriever()

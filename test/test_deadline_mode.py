@@ -301,6 +301,41 @@ class _DeadlineLastChanceExtractBackend:
         return _AIMessage(content="Thought.")
 
 
+class _DeadlineSearchOnlyBackend:
+    def __init__(self) -> None:
+        self.action_calls = 0
+
+    def invoke(self, messages, *, tool_choice: str | None = None):
+        history_text = "\n".join(str(getattr(message, "content", "") or "") for message in list(messages or []))
+        last_content = str(getattr(messages[-1], "content", "") or "")
+        if "CURRENT PHASE: THOUGHT" in last_content:
+            return _AIMessage(content="Search first, then keep searching if needed.")
+        if tool_choice == "conclude":
+            return _AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_conclude_structured",
+                        "name": "conclude",
+                        "args": {"submission": {"submission_id": "submission_cycle_1"}},
+                    }
+                ],
+            )
+        if "CURRENT PHASE: ACTION" in history_text:
+            self.action_calls += 1
+            return _AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_search_1",
+                        "name": "search_papers",
+                        "args": {"query": "pt/c her"},
+                    }
+                ],
+            )
+        return _AIMessage(content="Thought.")
+
+
 class _DeadlineParsedPaperBackend:
     def __init__(self) -> None:
         self.action_calls = 0
@@ -790,6 +825,198 @@ class DeadlineModeTests(unittest.TestCase):
         self.assertEqual({"kind": "submission", "payload": {"submission_id": "submission_cycle_1"}}, response.structured_output)
         self.assertEqual("conclude", trajectory.steps[-1].action)
 
+    def test_structured_deadline_last_chance_downloads_after_search_before_forced_conclude(self):
+        from agents.react_agent import ReActAgent, ToolResult
+
+        backend = _DeadlineSearchOnlyBackend()
+        llm = _ReactiveLLM(backend)
+        executed: list[str] = []
+
+        def _search(_payload):
+            executed.append("search_papers")
+            return ToolResult(
+                observation='{"paper_ids":["paper-1"]}',
+                data={"paper_ids": ["paper-1"], "papers": [{"paper_id": "paper-1"}]},
+            )
+
+        def _download(_payload):
+            executed.append("download_document")
+            return ToolResult(observation='{"paper_id":"paper-1"}', data={"paper_id": "paper-1"})
+
+        def _parse(_payload):
+            executed.append("parse_document")
+            return ToolResult(
+                observation='{"paper_id":"paper-1","fulltext_status":"fulltext_indexed"}',
+                data={"paper_id": "paper-1", "fulltext_status": "fulltext_indexed"},
+            )
+
+        def _extract(_payload):
+            executed.append("extract_evidence")
+            return ToolResult(observation='{"evidence":["ev-1"]}', data={"evidence": [{"evidence_id": "ev-1"}]})
+
+        def _conclude(_payload):
+            return ToolResult(
+                observation='{"submission_id":"submission_cycle_1"}',
+                data={"__conclude_valid__": True, "submission": {"submission_id": "submission_cycle_1"}},
+            )
+
+        search_tool = _InvokeTool(_search)
+        download_tool = _InvokeTool(_download)
+        parse_tool = _InvokeTool(_parse)
+        extract_tool = _InvokeTool(_extract)
+        conclude_tool = _InvokeTool(_conclude)
+
+        with patch(
+            "agents.react_agent._lazy_langchain_imports",
+            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
+        ):
+            agent = ReActAgent(
+                agent_id="t10",
+                name="test",
+                model_config={"deadline_mode": True},
+                rag_system=None,
+                experience_store=None,
+                system_prompt="",
+                max_react_steps=10,
+                verbose=False,
+                tools=[search_tool, download_tool, parse_tool, extract_tool, conclude_tool],
+                search_tool_names=["search_papers", "download_document", "parse_document", "extract_evidence"],
+                analysis_tool_names=["conclude"],
+                conclude_argument_name="submission",
+                conclude_output_kind="submission",
+            )
+
+            with patch.object(agent, "_get_llm", return_value=llm), patch.object(
+                agent,
+                "_build_tools",
+                return_value=(
+                    [search_tool, download_tool, parse_tool, extract_tool, conclude_tool],
+                    {
+                        "search_papers": search_tool,
+                        "download_document": download_tool,
+                        "parse_document": parse_tool,
+                        "extract_evidence": extract_tool,
+                        "conclude": conclude_tool,
+                    },
+                ),
+            ):
+                response, trajectory = agent.generate_response_with_react(
+                    query="Return a structured submission.",
+                    max_steps_override=3,
+                )
+
+        self.assertEqual(
+            ["search_papers", "download_document", "parse_document", "extract_evidence"],
+            executed,
+        )
+        self.assertEqual({"kind": "submission", "payload": {"submission_id": "submission_cycle_1"}}, response.structured_output)
+        self.assertEqual("conclude", trajectory.steps[-1].action)
+
+    def test_structured_deadline_blocks_repeat_search_once_downloadable_candidates_exist(self):
+        from agents.react_agent import ReActAgent, ToolResult
+
+        backend = _DeadlineSearchOnlyBackend()
+        llm = _ReactiveLLM(backend)
+        executed: list[str] = []
+
+        def _search(_payload):
+            executed.append("search_papers")
+            return ToolResult(
+                observation='{"paper_ids":["paper-1"]}',
+                data={
+                    "paper_ids": ["paper-1"],
+                    "papers": [
+                        {
+                            "paper_id": "paper-1",
+                            "oa_eligible": True,
+                            "oa_url": "https://example.org/paper-1.pdf",
+                        }
+                    ],
+                },
+            )
+
+        def _download(_payload):
+            executed.append("download_document")
+            return ToolResult(observation='{"paper_id":"paper-1"}', data={"paper_id": "paper-1"})
+
+        def _parse(_payload):
+            executed.append("parse_document")
+            return ToolResult(
+                observation='{"paper_id":"paper-1","fulltext_status":"fulltext_indexed"}',
+                data={"paper_id": "paper-1", "fulltext_status": "fulltext_indexed"},
+            )
+
+        def _extract(_payload):
+            executed.append("extract_evidence")
+            return ToolResult(observation='{"evidence":["ev-1"]}', data={"evidence": [{"evidence_id": "ev-1"}]})
+
+        def _conclude(_payload):
+            return ToolResult(
+                observation='{"submission_id":"submission_cycle_1"}',
+                data={"__conclude_valid__": True, "submission": {"submission_id": "submission_cycle_1"}},
+            )
+
+        search_tool = _InvokeTool(_search)
+        download_tool = _InvokeTool(_download)
+        parse_tool = _InvokeTool(_parse)
+        extract_tool = _InvokeTool(_extract)
+        conclude_tool = _InvokeTool(_conclude)
+
+        with patch(
+            "agents.react_agent._lazy_langchain_imports",
+            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
+        ):
+            agent = ReActAgent(
+                agent_id="t10a",
+                name="test",
+                model_config={"deadline_mode": True},
+                rag_system=None,
+                experience_store=None,
+                system_prompt="",
+                max_react_steps=10,
+                verbose=False,
+                tools=[search_tool, download_tool, parse_tool, extract_tool, conclude_tool],
+                search_tool_names=["search_papers", "download_document", "parse_document", "extract_evidence"],
+                analysis_tool_names=["conclude"],
+                conclude_argument_name="submission",
+                conclude_output_kind="submission",
+            )
+
+            with patch.object(agent, "_get_llm", return_value=llm), patch.object(
+                agent,
+                "_build_tools",
+                return_value=(
+                    [search_tool, download_tool, parse_tool, extract_tool, conclude_tool],
+                    {
+                        "search_papers": search_tool,
+                        "download_document": download_tool,
+                        "parse_document": parse_tool,
+                        "extract_evidence": extract_tool,
+                        "conclude": conclude_tool,
+                    },
+                ),
+            ):
+                response, trajectory = agent.generate_response_with_react(
+                    query="Return a structured submission.",
+                    max_steps_override=4,
+                )
+
+        self.assertEqual(
+            ["search_papers", "download_document", "parse_document", "extract_evidence"],
+            executed,
+        )
+        self.assertTrue(
+            any(
+                any(
+                    getattr(call, "observation_data", None) == {"error": "phase_budget_requires_followup"}
+                    for call in list(getattr(step, "tool_calls", []) or [])
+                )
+                for step in list(getattr(trajectory, "steps", []) or [])
+            )
+        )
+        self.assertEqual({"kind": "submission", "payload": {"submission_id": "submission_cycle_1"}}, response.structured_output)
+        self.assertEqual("conclude", trajectory.steps[-1].action)
+
     def test_structured_deadline_reuses_already_parsed_paper_without_parse_result_error(self):
         from agents.react_agent import ReActAgent, ToolResult
 
@@ -855,7 +1082,106 @@ class DeadlineModeTests(unittest.TestCase):
                     max_steps_override=2,
                 )
 
-        self.assertEqual(["parse_document"], executed)
+        self.assertEqual(["parse_document", "extract_evidence"], executed)
+        self.assertEqual({"kind": "submission", "payload": {"submission_id": "submission_cycle_1"}}, response.structured_output)
+        self.assertEqual("conclude", trajectory.steps[-1].action)
+
+    def test_structured_deadline_last_chance_retries_extract_with_explicit_section_ids(self):
+        from agents.react_agent import ReActAgent, ToolResult
+
+        backend = _DeadlineLastChanceExtractBackend()
+        llm = _ReactiveLLM(backend)
+        executed: list[str] = []
+
+        def _download(_payload):
+            executed.append("download_document")
+            return ToolResult(observation='{"paper_id":"paper-1"}', data={"paper_id": "paper-1"})
+
+        def _parse(_payload):
+            executed.append("parse_document")
+            return ToolResult(
+                observation='{"paper_id":"paper-1","fulltext_status":"fulltext_indexed"}',
+                data={"paper_id": "paper-1", "fulltext_status": "fulltext_indexed"},
+            )
+
+        def _read_sections(_payload):
+            executed.append("read_sections")
+            return ToolResult(
+                observation='{"sections":[{"section_id":"sec-results"}]}',
+                data={"sections": [{"section_id": "sec-results"}]},
+            )
+
+        def _extract(payload):
+            if payload.get("preferred_sections"):
+                executed.append("extract_evidence_preferred")
+                return ToolResult(observation='{"evidence":[]}', data={"evidence": []})
+            executed.append("extract_evidence_explicit")
+            return ToolResult(
+                observation='{"evidence":["ev-1"]}',
+                data={"evidence": [{"evidence_id": "ev-1", "section_id": "sec-results"}]},
+            )
+
+        def _conclude(_payload):
+            return ToolResult(
+                observation='{"submission_id":"submission_cycle_1"}',
+                data={"__conclude_valid__": True, "submission": {"submission_id": "submission_cycle_1"}},
+            )
+
+        download_tool = _InvokeTool(_download)
+        parse_tool = _InvokeTool(_parse)
+        read_sections_tool = _InvokeTool(_read_sections)
+        extract_tool = _InvokeTool(_extract)
+        conclude_tool = _InvokeTool(_conclude)
+
+        with patch(
+            "agents.react_agent._lazy_langchain_imports",
+            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
+        ):
+            agent = ReActAgent(
+                agent_id="t11",
+                name="test",
+                model_config={"deadline_mode": True},
+                rag_system=None,
+                experience_store=None,
+                system_prompt="",
+                max_react_steps=10,
+                verbose=False,
+                tools=[download_tool, parse_tool, read_sections_tool, extract_tool, conclude_tool],
+                search_tool_names=["download_document", "parse_document", "read_sections", "extract_evidence"],
+                analysis_tool_names=["conclude"],
+                conclude_argument_name="submission",
+                conclude_output_kind="submission",
+            )
+
+            with patch.object(agent, "_get_llm", return_value=llm), patch.object(
+                agent,
+                "_build_tools",
+                return_value=(
+                    [download_tool, parse_tool, read_sections_tool, extract_tool, conclude_tool],
+                    {
+                        "download_document": download_tool,
+                        "parse_document": parse_tool,
+                        "read_sections": read_sections_tool,
+                        "extract_evidence": extract_tool,
+                        "conclude": conclude_tool,
+                    },
+                ),
+            ):
+                response, trajectory = agent.generate_response_with_react(
+                    query="Return a structured submission.",
+                    max_steps_override=2,
+                )
+
+        self.assertEqual(
+            [
+                "download_document",
+                "parse_document",
+                "read_sections",
+                "extract_evidence_preferred",
+                "extract_evidence_explicit",
+            ],
+            executed,
+        )
         self.assertEqual({"kind": "submission", "payload": {"submission_id": "submission_cycle_1"}}, response.structured_output)
         self.assertEqual("conclude", trajectory.steps[-1].action)
 

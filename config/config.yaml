@@ -75,8 +75,8 @@ qa:
     fail_open_on_provider_error: true
 
   react_reviewed:
-    max_propose_steps_initial: 6
-    max_propose_steps_revision: 6
+    max_propose_steps_initial: 10
+    max_propose_steps_revision: 10
     proposer_fallback_mode: "fail_fast_only"
     proposer_repair_attempts: 1
     proposer_evidence_policy: "prefer_fulltext"

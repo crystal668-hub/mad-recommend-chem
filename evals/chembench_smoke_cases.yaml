@@ -1,55 +1,68 @@
 cases:
-  - subset: general_chemistry
-    name: oxidation_states
-    uuid: 383d29c4-857b-b326-8d13-08afebb22b61
+  - subset: analytical_chemistry
+    name: analytical_chemistry_27
+    uuid: 4ada53cc-d365-90a2-3a90-890d8c350229
     question: >-
-      What is the oxidation state of N in \ce{N2O}?
-    gold: "1"
-    type: integer
+      Physical adsorption of gases is used to evaluate textural properties and microporosity of
+      solid materials, such as \ce{N2} adsorption isotherms at \pu{-196 deg C} and \ce{CO2}
+      adsorption isotherms at \pu{0 deg C}. \ce{CO2} adsorption isotherms are usually used to
+      evaluate narrow microporosity (pore width < \pu{0.7 nm}). If the critical dimensions of both
+      molecules are similar, why can the \ce{CO2} experiments extend the range of analysis to the
+      narrow microporosity?
+    gold: >-
+      Because the higher temperature of the \ce{CO2} isotherms avoids kinetic restrictions to access
+      to smaller micropores
+    type: choice_text
     keywords:
-      - oxidation states
+      - \ce{CO2} isotherms
+      - narrow microporosity
+      - kinetic restrictions
       - requires-reasoning
-      - general-chemistry
-      - difficulty-basic
-    source_url: https://huggingface.co/datasets/jablonkagroup/ChemBench/viewer/general_chemistry/train
+      - difficulty-advanced
+    source_url: https://huggingface.co/datasets/jablonkagroup/ChemBench/viewer/analytical_chemistry/train
 
-  - subset: inorganic_chemistry
-    name: icho_uk_2023_q2h5
-    uuid: 4e846028-9f8f-44f2-eb3e-59316479df10
+  - subset: analytical_chemistry
+    name: analytical_chemistry_28
+    uuid: 01ce9f8b-f8db-a555-b9c6-796928bc3762
     question: >-
-      Boron nitride has a wurtzite structure (w-BN). The unit cell of w-BN is a right rhombic prism,
-      with cell parameters of d = \pu{2.54 \A} and e = \pu{3.63 \A} and interior angles of
-      \pu{60 deg} and \pu{120 deg}. What is the number of B atoms in the unit cell of w-BN?
-    gold: "2"
-    type: integer
+      A \ce{Ni} 2p XPS spectrum shows two peaks corresponding to \ce{Ni} 2p$_{3/2}$ and
+      \ce{Ni} 2p$_{1/2}$ at \pu{854.6 eV} and \pu{871.1 eV}, respectively, and two peaks
+      corresponding to \ce{Ni} 2p$_{3/2}$ and \ce{Ni} 2p$_{1/2}$ at \pu{856.3 eV} and
+      \pu{873.6 eV}, respectively. These peaks indicate the presence of nickel as \ce{Ni^{2+}} in
+      the analyzed sample. However, two additional peaks are detected at \pu{861.8 eV} and
+      \pu{879.1 eV}, respectively. Which of the following options explains what these two peaks at
+      higher binding energies represent?
+    gold: >-
+      The additional peaks can be shake-up satellite peaks where the photoemitted electron leaves
+      behind an excited state of the atom
+    type: choice_text
     keywords:
-      - crystalline-forms
-      - unit-cell
-      - inorganic-chemistry
-      - cell-parameters
-      - icho
-      - difficulty-basic
-      - requires-calculation
+      - XPS
+      - shake-up satellite peaks
+      - binding energies
       - requires-reasoning
-    source_url: https://huggingface.co/datasets/jablonkagroup/ChemBench/viewer/inorganic_chemistry/train
+      - difficulty-advanced
+    source_url: https://huggingface.co/datasets/jablonkagroup/ChemBench/viewer/analytical_chemistry/train
 
   - subset: materials_science
-    name: polymer_chemistry_13
-    uuid: a038f740-0725-5170-9748-45ad035d6688
+    name: solid_state_chemistry_4
+    uuid: b74b76e4-0a13-c358-b54e-55fe92f21503
     question: >-
-      Given that the average molar mass of the polymer chains in this sample of poly(lactic acid)
-      (PLA) is \pu{595 g mol^{-1}} using end-group analysis, where \pu{0.1619 g} of PLA was
-      dissolved in \pu{25 cm^3} of benzyl alcohol and titrated with \pu{0.0400 mol dm^{-3}}
-      \ce{KOH} solution. The volume of \ce{KOH} solution required to reach the endpoint was
-      \pu{6.81 cm^3}. What is the average number of monomer units in each polymer chain of this
-      sample?
-    gold: "8"
-    type: integer
+      A materials scientist is analyzing an unknown metallic sample using X-ray diffraction (XRD)
+      with a \ce{Cu} $K_{\alpha}$ source ($\lambda$=\pu{1.54 A}). The diffraction pattern shows the
+      following peaks (given as \pu{2 \theta} values): \pu{31.7 deg}, \pu{36.8 deg},
+      \pu{45.5 deg}, \pu{54.7 deg}, \pu{65.9 deg}, \pu{73.7 deg}, \pu{77.2 deg}, \pu{82.3 deg},
+      \pu{85.7 deg}, \pu{94.1 deg}. After careful analysis, the scientist suspects the sample might
+      be a mixture of two phases. Based on this information and the given XRD data, which of the
+      following conclusions is MOST likely correct?
+    gold: >-
+      The sample contains a mixture of FCC and BCC phases, but the data is insufficient to
+      definitively identify the BCC phase.
+    type: choice_text
     keywords:
-      - polymer-chemistry
-      - poly(lactic acid)
-      - monomer units
+      - XRD
+      - mixture of FCC and BCC phases
+      - insufficient to definitively identify the BCC phase
       - requires-reasoning
-      - requires-calculation
-      - stoichiometry
+      - requires-knowledge
     source_url: https://huggingface.co/datasets/jablonkagroup/ChemBench/viewer/materials_science/train

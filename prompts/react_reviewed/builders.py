@@ -150,3 +150,12 @@ def build_proposer_repair_system_prompt(*, conclude_contract: Dict[str, Any]) ->
         tool_call_example_json=json_block(conclude_contract.get("tool_call_example") or {}),
         invalid_examples_json=json_block(conclude_contract.get("invalid_examples") or []),
     )
+
+
+def build_reviewer_repair_system_prompt(*, conclude_contract: Dict[str, Any]) -> str:
+    return render_template(
+        "reviewer_repair_system.txt",
+        repair_example_json=json_block(conclude_contract.get("repair_json_example") or {}),
+        tool_call_example_json=json_block(conclude_contract.get("tool_call_example") or {}),
+        invalid_examples_json=json_block(conclude_contract.get("invalid_examples") or []),
+    )

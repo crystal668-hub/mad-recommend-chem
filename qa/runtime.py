@@ -103,10 +103,11 @@ DEFAULT_QA_CONFIG: Dict[str, Any] = {
     "peer_review": copy.deepcopy(DEFAULT_QA_PEER_REVIEW_CONFIG),
     "entity_resolution": copy.deepcopy(DEFAULT_QA_ENTITY_RESOLUTION_CONFIG),
     "react_reviewed": {
-        "max_propose_steps_initial": 7,
-        "max_propose_steps_revision": 7,
+        "max_propose_steps_initial": 10,
+        "max_propose_steps_revision": 10,
         "proposer_fallback_mode": "fail_fast_only",
         "proposer_repair_attempts": 1,
+        "reviewer_repair_attempts": 1,
         "proposer_evidence_policy": "prefer_fulltext",
         "proposer_candidate_target": 18,
         "proposer_rerank_top_k": 5,
@@ -300,6 +301,10 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "proposer_repair_attempts": _coerce_non_negative_int(
             react_reviewed_config.get("proposer_repair_attempts"),
             fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_repair_attempts"],
+        ),
+        "reviewer_repair_attempts": _coerce_non_negative_int(
+            react_reviewed_config.get("reviewer_repair_attempts"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_repair_attempts"],
         ),
         "proposer_evidence_policy": _coerce_allowed_text(
             react_reviewed_config.get("proposer_evidence_policy"),
