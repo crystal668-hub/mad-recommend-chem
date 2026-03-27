@@ -46,6 +46,7 @@ from qa.nodes.query_planner import QueryPlannerExecutionError, QueryPlannerNode
 from qa.nodes.retriever import RetrieverNode
 from qa.nodes.router import RouterExecutionError, RouterNode
 from qa.providers import PdfUrlProbeClient
+from qa.retrieval_utils import normalize_doi
 from qa.react_reviewed_state import (
     AnswerSubmission,
     ReviewCompletionStatus,
@@ -504,6 +505,22 @@ def _paper_has_useful_abstract_support(
     if metrics["abstract_hits"] >= 1 and metrics["title_hits"] >= 1:
         return True
     return metrics["question_hits"] >= 2
+
+
+def _extract_unpaywall_pdf_url(payload: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    best_location = dict(payload.get("best_oa_location") or {})
+    best_pdf_url = _compact_text(best_location.get("url_for_pdf"))
+    if best_pdf_url:
+        return best_pdf_url
+    for item in list(payload.get("oa_locations") or []):
+        if not isinstance(item, dict):
+            continue
+        pdf_url = _compact_text(item.get("url_for_pdf"))
+        if pdf_url:
+            return pdf_url
+    return None
 
 
 def _review_item_priority_terms(open_review_items: Sequence[ReviewItem]) -> List[str]:
@@ -1496,6 +1513,7 @@ class ReactReviewedWorkspace:
         self._search_result_cache: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
         self._search_warning_cache: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
         self._search_batch_result_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        self._oa_lookup_cache: Dict[str, Dict[str, Any]] = {}
         self._pdf_probe_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._acquire_result_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._acquire_batch_result_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
@@ -1671,6 +1689,7 @@ class ReactReviewedWorkspace:
                 "search_result_cache": copy.deepcopy(self._search_result_cache),
                 "search_warning_cache": copy.deepcopy(self._search_warning_cache),
                 "search_batch_result_cache": copy.deepcopy(self._search_batch_result_cache),
+                "oa_lookup_cache": copy.deepcopy(self._oa_lookup_cache),
                 "pdf_probe_cache": copy.deepcopy(self._pdf_probe_cache),
                 "acquire_result_cache": copy.deepcopy(self._acquire_result_cache),
                 "acquire_batch_result_cache": copy.deepcopy(self._acquire_batch_result_cache),
@@ -1694,6 +1713,7 @@ class ReactReviewedWorkspace:
             self._search_result_cache = copy.deepcopy(snapshot.get("search_result_cache", {}))
             self._search_warning_cache = copy.deepcopy(snapshot.get("search_warning_cache", {}))
             self._search_batch_result_cache = copy.deepcopy(snapshot.get("search_batch_result_cache", {}))
+            self._oa_lookup_cache = copy.deepcopy(snapshot.get("oa_lookup_cache", {}))
             self._pdf_probe_cache = copy.deepcopy(snapshot.get("pdf_probe_cache", {}))
             self._acquire_result_cache = copy.deepcopy(snapshot.get("acquire_result_cache", {}))
             self._acquire_batch_result_cache = copy.deepcopy(snapshot.get("acquire_batch_result_cache", {}))
@@ -1877,11 +1897,12 @@ class ReactReviewedWorkspace:
         *,
         candidate: PaperCandidate,
         probe_client: Optional[Any],
+        url: Optional[str] = None,
     ) -> Dict[str, Any]:
-        url = _compact_text(getattr(candidate, "open_access_pdf_url", None))
-        if not url or probe_client is None:
+        resolved_url = _compact_text(url) or _compact_text(getattr(candidate, "open_access_pdf_url", None))
+        if not resolved_url or probe_client is None:
             raise RuntimeError(f"paper_id={candidate.paper_id} has no configured PDF probe client or URL.")
-        cache_key = ("pdf_probe", self._normalize_cache_text(url))
+        cache_key = ("pdf_probe", self._normalize_cache_text(resolved_url))
         state, payload = self._prepare_cached_operation(
             cache=self._pdf_probe_cache,
             inflight_map=self._pdf_probe_inflight,
@@ -1897,13 +1918,13 @@ class ReactReviewedWorkspace:
             return dict(payload or {})
 
         try:
-            result = probe_client.probe(url)
+            result = probe_client.probe(resolved_url)
             payload = {
                 "paper_id": candidate.paper_id,
-                "url": url,
+                "url": resolved_url,
                 "verdict": str(getattr(result, "verdict", "") or "").strip().lower(),
                 "method": str(getattr(result, "method", "") or "").strip().lower(),
-                "final_url": _compact_text(getattr(result, "final_url", None)) or url,
+                "final_url": _compact_text(getattr(result, "final_url", None)) or resolved_url,
                 "status_code": int(getattr(result, "status_code", 0) or 0),
                 "content_type": _compact_text(getattr(result, "content_type", None)).lower(),
                 "content_disposition": _compact_text(getattr(result, "content_disposition", None)) or None,
@@ -1924,6 +1945,75 @@ class ReactReviewedWorkspace:
                 error=exc,
             )
             raise
+
+    def _lookup_unpaywall_payload(
+        self,
+        *,
+        candidate: PaperCandidate,
+        artifact_store: QAArtifactStore,
+    ) -> Optional[Dict[str, Any]]:
+        doi = _compact_text(getattr(candidate, "doi", None))
+        if not doi:
+            return None
+        unpaywall_client = getattr(self.document_acquirer, "unpaywall_client", None)
+        if unpaywall_client is None:
+            return None
+        cache_key = normalize_doi(doi) or doi.lower()
+        with self._state_lock:
+            cached = copy.deepcopy(self._oa_lookup_cache.get(cache_key))
+        if cached is not None:
+            payload = cached
+        else:
+            try:
+                payload = unpaywall_client.lookup(doi)
+            except Exception:
+                logger.debug("proposer_unpaywall_lookup_failed paper_id=%s doi=%s", candidate.paper_id, doi, exc_info=True)
+                return None
+            if not isinstance(payload, dict):
+                return None
+            with self._state_lock:
+                self._oa_lookup_cache[cache_key] = copy.deepcopy(payload)
+        artifact_path = artifact_store.write_json(f"provider_raw/unpaywall/{candidate.paper_id}.json", payload)
+        candidate.provider_artifacts = {**candidate.provider_artifacts, "unpaywall": artifact_path}
+        candidate.provider_hits = list(dict.fromkeys([*candidate.provider_hits, "unpaywall"]))
+        return payload
+
+    def _resolve_proposer_probe_targets(
+        self,
+        *,
+        candidate: PaperCandidate,
+        artifact_store: QAArtifactStore,
+    ) -> List[Dict[str, str]]:
+        targets: List[Dict[str, str]] = []
+        seen_urls: set[str] = set()
+
+        def _append_target(url: Optional[str], *, source: str) -> None:
+            normalized_url = _compact_text(url)
+            if not normalized_url:
+                return
+            cache_key = self._normalize_cache_text(normalized_url)
+            if cache_key in seen_urls:
+                return
+            seen_urls.add(cache_key)
+            targets.append({"source": source, "url": normalized_url})
+
+        _append_target(
+            _compact_text(getattr(candidate, "open_access_pdf_url", None))
+            or _compact_text(getattr(candidate, "best_oa_pdf_url", None)),
+            source=_compact_text(getattr(candidate, "oa_source", None)) or "semantic_scholar",
+        )
+        unpaywall_payload = self._lookup_unpaywall_payload(candidate=candidate, artifact_store=artifact_store)
+        unpaywall_pdf_url = _extract_unpaywall_pdf_url(unpaywall_payload)
+        if unpaywall_pdf_url:
+            _append_target(unpaywall_pdf_url, source="unpaywall")
+            if not _compact_text(getattr(candidate, "open_access_pdf_url", None)):
+                candidate.open_access_pdf_url = unpaywall_pdf_url
+                candidate.best_oa_pdf_url = unpaywall_pdf_url
+                candidate.oa_url = unpaywall_pdf_url
+                candidate.oa_eligible = True
+                candidate.oa_source = "unpaywall"
+                candidate.oa_signal_reason = "unpaywall_best_oa_pdf"
+        return targets
 
     def _search_papers_with_semantic_scholar_only(
         self,
@@ -1959,18 +2049,18 @@ class ReactReviewedWorkspace:
             else:
                 retriever._merge_candidates(existing, candidate)
 
-        filtered_candidates: List[PaperCandidate] = []
+        scored_candidates: List[PaperCandidate] = []
         for candidate in candidates:
-            if not _candidate_has_proposer_pdf_probe_input(candidate):
+            if not _compact_text(getattr(candidate, "doi", None)):
                 continue
             candidate.retrieval_score = _score_proposer_semantic_scholar_candidate(
                 task_spec=self.task_spec,
                 entity_pack=self.entity_pack,
                 candidate=candidate,
             )
-            filtered_candidates.append(candidate)
+            scored_candidates.append(candidate)
 
-        filtered_candidates.sort(
+        scored_candidates.sort(
             key=lambda item: (
                 -float(item.retrieval_score or 0.0),
                 -int(item.ranking_features.get("citation_count") or 0),
@@ -1981,21 +2071,21 @@ class ReactReviewedWorkspace:
         probe_warnings: List[Dict[str, Any]] = []
         pdf_probe_client = self._build_pdf_probe_clone()
         if self.proposer_pdf_probe_enabled and pdf_probe_client is not None:
-            probe_candidates = list(filtered_candidates[: self.proposer_pdf_probe_max_candidates])
+            probe_candidates = list(scored_candidates[: self.proposer_pdf_probe_max_candidates])
             accepted_candidates: List[PaperCandidate] = []
 
             with ThreadPoolExecutor(max_workers=max(1, min(len(probe_candidates), 4))) as executor:
                 future_map = {
                     executor.submit(
-                        self._probe_proposer_pdf_url,
+                        self._resolve_proposer_probe_targets,
                         candidate=candidate,
-                        probe_client=pdf_probe_client,
+                        artifact_store=artifact_store,
                     ): candidate
                     for candidate in probe_candidates
                 }
                 for future, candidate in list(future_map.items()):
                     try:
-                        probe_payload = dict(future.result() or {})
+                        probe_targets = list(future.result() or [])
                     except Exception as exc:
                         probe_warnings.append(
                             {
@@ -2006,25 +2096,62 @@ class ReactReviewedWorkspace:
                             }
                         )
                         continue
-                    verdict = _compact_text(probe_payload.get("verdict")).lower()
-                    if verdict not in {"strong", "weak"}:
+                    if not probe_targets:
                         probe_warnings.append(
                             {
                                 "paper_id": candidate.paper_id,
-                                "url": probe_payload.get("url") or _compact_text(getattr(candidate, "open_access_pdf_url", None)),
-                                "reason": "non_pdf",
-                                "message": (
-                                    f"response did not validate as PDF "
-                                    f"(content_type={probe_payload.get('content_type') or 'unknown'}, "
-                                    f"status_code={probe_payload.get('status_code') or 'unknown'})"
-                                ),
+                                "url": _compact_text(getattr(candidate, "open_access_pdf_url", None)),
+                                "reason": "missing_pdf_url",
+                                "message": "candidate had no probeable OA PDF URL after Semantic Scholar and Unpaywall resolution",
                             }
                         )
                         continue
-                    candidate.pdf_probe_verdict = verdict
-                    candidate.pdf_probe_method = _compact_text(probe_payload.get("method")).lower() or None
-                    candidate.pdf_probe_final_url = _compact_text(probe_payload.get("final_url")) or None
-                    accepted_candidates.append(candidate)
+                    accepted = False
+                    last_warning: Optional[Dict[str, Any]] = None
+                    for target in probe_targets:
+                        try:
+                            probe_payload = dict(
+                                self._probe_proposer_pdf_url(
+                                    candidate=candidate,
+                                    probe_client=pdf_probe_client,
+                                    url=target.get("url"),
+                                )
+                                or {}
+                            )
+                        except Exception as exc:
+                            last_warning = {
+                                "paper_id": candidate.paper_id,
+                                "url": target.get("url") or _compact_text(getattr(candidate, "open_access_pdf_url", None)),
+                                "reason": type(exc).__name__,
+                                "message": str(exc),
+                            }
+                            continue
+                        verdict = _compact_text(probe_payload.get("verdict")).lower()
+                        if verdict in {"strong", "weak"}:
+                            candidate.pdf_probe_verdict = verdict
+                            candidate.pdf_probe_method = _compact_text(probe_payload.get("method")).lower() or None
+                            candidate.pdf_probe_final_url = _compact_text(probe_payload.get("final_url")) or None
+                            candidate.open_access_pdf_url = _compact_text(target.get("url")) or candidate.open_access_pdf_url
+                            candidate.best_oa_pdf_url = candidate.open_access_pdf_url or candidate.best_oa_pdf_url
+                            if _compact_text(target.get("source")) == "unpaywall":
+                                candidate.oa_source = "unpaywall"
+                                candidate.oa_signal_reason = "unpaywall_best_oa_pdf"
+                                candidate.oa_eligible = True
+                            accepted_candidates.append(candidate)
+                            accepted = True
+                            break
+                        last_warning = {
+                            "paper_id": candidate.paper_id,
+                            "url": probe_payload.get("url") or target.get("url") or _compact_text(getattr(candidate, "open_access_pdf_url", None)),
+                            "reason": "non_pdf",
+                            "message": (
+                                f"response did not validate as PDF "
+                                f"(content_type={probe_payload.get('content_type') or 'unknown'}, "
+                                f"status_code={probe_payload.get('status_code') or 'unknown'})"
+                            ),
+                        }
+                    if not accepted and last_warning is not None:
+                        probe_warnings.append(last_warning)
 
             filtered_candidates = accepted_candidates
             retriever.last_diagnostics = retriever._finalize_diagnostics() + [
@@ -2047,6 +2174,17 @@ class ReactReviewedWorkspace:
                 provider_health["pdf_probe"] = dict(pdf_probe_client.health_snapshot() or {})
             retriever.last_provider_health = provider_health
         else:
+            filtered_candidates = []
+            for candidate in scored_candidates:
+                probe_targets = self._resolve_proposer_probe_targets(
+                    candidate=candidate,
+                    artifact_store=artifact_store,
+                )
+                if not probe_targets:
+                    continue
+                candidate.open_access_pdf_url = _compact_text(probe_targets[0].get("url")) or candidate.open_access_pdf_url
+                candidate.best_oa_pdf_url = candidate.open_access_pdf_url or candidate.best_oa_pdf_url
+                filtered_candidates.append(candidate)
             retriever.last_diagnostics = retriever._finalize_diagnostics()
             retriever.last_provider_health = retriever._collect_provider_health()
 
@@ -3642,13 +3780,19 @@ class ReactReviewedProposerAgent:
                 locked_paper_ids.append(paper_id)
             if decision != "lock" and paper_id not in dropped_paper_ids:
                 dropped_paper_ids.append(paper_id)
-        if not locked_paper_ids:
-            return None, raw_response
         return (
             {
                 "locked_paper_ids": locked_paper_ids,
                 "dropped_paper_ids": dropped_paper_ids,
                 "ranked_candidates": ranked_payload,
+                "screen_status": "ready" if locked_paper_ids else "no_locks",
+                "failure_domain": "" if locked_paper_ids else "topic_mismatch",
+                "retryable": not bool(locked_paper_ids),
+                "message": (
+                    "candidate screening selected at least one candidate"
+                    if locked_paper_ids
+                    else "candidate screening did not lock any candidates"
+                ),
                 "llm_screening_used": True,
             },
             raw_response,

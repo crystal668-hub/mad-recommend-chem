@@ -941,6 +941,15 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             budget_state=ReviewerBudgetState(role=role, budget_limit=budget_limit),
         )
 
+    def _materialize_source_pdfs(self, workspace: ReactReviewedWorkspace) -> None:
+        for paper_record in workspace.paper_records.values():
+            artifact_path_text = str(paper_record.source_artifact_path or "").strip()
+            if not artifact_path_text:
+                continue
+            artifact_path = Path(artifact_path_text).expanduser()
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_bytes(b"%PDF-1.4 fake pdf")
+
     def _make_workflow(self) -> ReactReviewedWorkflow:
         workflow = ReactReviewedWorkflow(
             qa_config={"react_reviewed": {"reviewer_max_concurrency": 4, "reviewer_retrieval_budget_by_role": {
@@ -1229,6 +1238,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             )
             for paper_id, candidate in workspace.paper_candidates.items()
         }
+        self._materialize_source_pdfs(workspace)
 
         with patch.object(
             proposer,
@@ -1330,6 +1340,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             )
             for paper_id, candidate in workspace.paper_candidates.items()
         }
+        self._materialize_source_pdfs(workspace)
 
         with patch.object(
             proposer,
@@ -1440,6 +1451,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 source_artifact_path=str(self.temp_dir / "paper-1.pdf"),
             )
         }
+        self._materialize_source_pdfs(workspace)
         raw_response = json.dumps({"unexpected": "schema"})
 
         with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
@@ -1460,6 +1472,75 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         failure_payload = _read_json(str(failure_path))
         self.assertEqual("invalid_screening_payload", failure_payload["details"]["reason"])
         self.assertEqual(raw_response, failure_payload["response_content"])
+
+    def test_screen_candidate_papers_returns_structured_no_lock_payload_when_all_candidates_are_dropped(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace()
+        workspace.paper_candidates = {
+            "paper-1": PaperCandidate(
+                paper_id="paper-1",
+                title="WC catalyst for alkaline HER",
+                abstract="WC exhibits Pt-like behavior but does not compare Pt/C against NiMo.",
+                provider_hits=["semantic_scholar"],
+                lane_sources=["data"],
+                retrieval_score=8.5,
+                doi="10.1000/wc",
+            ),
+            "paper-2": PaperCandidate(
+                paper_id="paper-2",
+                title="RuCu catalyst compared with Pt/C",
+                abstract="RuCu outperforms Pt/C but does not mention NiMo catalysts.",
+                provider_hits=["semantic_scholar"],
+                lane_sources=["data"],
+                retrieval_score=8.1,
+                doi="10.1000/rucu",
+            ),
+        }
+        workspace.paper_records = {
+            paper_id: PaperRecord(
+                paper_id=paper_id,
+                title=candidate.title,
+                abstract=candidate.abstract,
+                doi=candidate.doi,
+                fulltext_available=True,
+                fulltext_status="fulltext_indexed",
+                source_artifact_path=str(self.temp_dir / f"{paper_id}.pdf"),
+            )
+            for paper_id, candidate in workspace.paper_candidates.items()
+        }
+        self._materialize_source_pdfs(workspace)
+        raw_response = json.dumps(
+            {
+                "decisions": [
+                    {"paper_id": "paper-1", "decision": "drop", "reason": "No NiMo comparison."},
+                    {"paper_id": "paper-2", "decision": "drop", "reason": "No NiMo evidence."},
+                ]
+            }
+        )
+
+        with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
+            "qa.react_reviewed_workflow.invoke_llm",
+            return_value=raw_response,
+        ):
+            screened = proposer._screen_candidate_papers(
+                workspace=workspace,
+                cycle_number=1,
+                open_review_items=[],
+                paper_ids=["paper-1", "paper-2"],
+                max_candidates=1,
+            )
+
+        self.assertEqual([], screened["locked_paper_ids"])
+        self.assertEqual("no_locks", screened["screen_status"])
+        self.assertEqual("topic_mismatch", screened["failure_domain"])
+        self.assertTrue(screened["retryable"])
+        self.assertTrue(screened["llm_screening_used"])
+        self.assertEqual(2, len(screened["ranked_candidates"]))
 
     def test_screen_candidate_papers_drops_profile_generation_failures(self):
         proposer = ReactReviewedProposerAgent(
@@ -1501,6 +1582,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             )
             for paper_id, candidate in workspace.paper_candidates.items()
         }
+        self._materialize_source_pdfs(workspace)
 
         with patch.object(
             proposer,
@@ -1577,6 +1659,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             )
             for paper_id, candidate in workspace.paper_candidates.items()
         }
+        self._materialize_source_pdfs(workspace)
 
         with self.assertRaises(ReactReviewedProposerExecutionError) as ctx:
             proposer._screen_candidate_papers(
@@ -1590,7 +1673,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual("proposer_screening", ctx.exception.stage)
         failure_path = self.temp_dir / "workspace" / "diagnostics" / "proposer_cycle_1_failure.json"
         failure_payload = _read_json(str(failure_path))
-        self.assertEqual("no_profile_ready_candidates", failure_payload["details"]["reason"])
+        self.assertEqual("screening_profile_infra_failure", failure_payload["details"]["reason"])
 
     def test_workspace_search_papers_filters_non_pdf_candidates(self):
         class _MixedRetriever:
@@ -1907,6 +1990,111 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(first[0]["pdf_probe_verdict"], second[0]["pdf_probe_verdict"])
         self.assertEqual(first[0]["pdf_probe_method"], second[0]["pdf_probe_method"])
         self.assertEqual(["https://example.org/view/shared"], probe_client.calls)
+
+    def test_workspace_search_papers_proposer_only_semantic_uses_unpaywall_pdf_when_primary_probe_fails(self):
+        class _SemanticScholarClient:
+            def search(self, query_plan, limit=8):
+                del query_plan, limit
+                return [
+                    {
+                        "title": "NiMo/CuO catalyst rivaling Pt/C in alkaline HER",
+                        "abstract": "NiMo/CuO@C in alkaline media rivals Pt/C at 10 mA cm-2.",
+                        "tldr": {"text": "Direct Pt/C versus NiMo evidence."},
+                        "fieldsOfStudy": ["Chemistry"],
+                        "isOpenAccess": True,
+                        "openAccessPdf": {"url": "https://publisher.example.org/forbidden.pdf"},
+                        "citationCount": 17,
+                        "year": 2024,
+                        "venue": "Journal",
+                        "authors": [{"name": "Author"}],
+                        "externalIds": {"DOI": "10.1000/nimo-fallback"},
+                    }
+                ]
+
+            def enrich(self, candidate):
+                return None
+
+        class _NoopClient:
+            def search(self, query_plan, limit=8):
+                del query_plan, limit
+                return []
+
+            def enrich(self, candidate):
+                return None
+
+        class _UnpaywallClient:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def lookup(self, doi: str):
+                self.calls.append(doi)
+                return {
+                    "best_oa_location": {
+                        "url_for_pdf": "https://pmc.example.org/articles/PMC123456/pdf",
+                        "url": "https://pmc.example.org/articles/PMC123456",
+                    }
+                }
+
+        class _PdfProbeStub:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def probe(self, url: str):
+                self.calls.append(url)
+                if "publisher.example.org" in url:
+                    return SimpleNamespace(
+                        verdict="non_pdf",
+                        method="head",
+                        final_url=url,
+                        status_code=403,
+                        content_type="text/html",
+                        content_disposition=None,
+                        redirect_count=0,
+                    )
+                if "pmc.example.org" in url:
+                    return SimpleNamespace(
+                        verdict="strong",
+                        method="range_get",
+                        final_url=url,
+                        status_code=200,
+                        content_type="application/pdf",
+                        content_disposition=None,
+                        redirect_count=0,
+                    )
+                raise AssertionError(f"unexpected probe url: {url}")
+
+        retriever = RetrieverNode(
+            openalex_client=_NoopClient(),
+            crossref_client=_NoopClient(),
+            semantic_scholar_client=_SemanticScholarClient(),
+            per_lane_limit=5,
+            final_top_k=5,
+        )
+        document_acquirer = _CountingDocumentAcquirer()
+        document_acquirer.unpaywall_client = _UnpaywallClient()
+        probe_client = _PdfProbeStub()
+        workspace = self._make_workspace(
+            retriever=retriever,
+            document_acquirer=document_acquirer,
+            pdf_probe_client=probe_client,
+            proposer_candidate_target=5,
+            proposer_pdf_probe_max_candidates=5,
+        )
+
+        result = workspace.search_papers(
+            query_text="Pt/C NiMo HER alkaline",
+            lane="data",
+            reason="unpaywall fallback",
+            proposer_only_semantic=True,
+            write_snapshot=False,
+        )
+
+        self.assertEqual(1, len(result))
+        self.assertEqual("10.1000/nimo-fallback", result[0]["doi"])
+        self.assertEqual("https://pmc.example.org/articles/PMC123456/pdf", result[0]["open_access_pdf_url"])
+        self.assertEqual("unpaywall", result[0]["oa_source"])
+        self.assertEqual(["https://publisher.example.org/forbidden.pdf", "https://pmc.example.org/articles/PMC123456/pdf"], probe_client.calls)
+        self.assertEqual(["10.1000/nimo-fallback"], document_acquirer.unpaywall_client.calls)
 
     def test_retriever_filters_off_topic_candidates_before_enrichment(self):
         class _OpenAlexClient:

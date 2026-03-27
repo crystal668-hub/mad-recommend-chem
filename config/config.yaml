@@ -54,7 +54,7 @@ qa:
   outputs_dir: "./outputs"
   artifact_subdir: "qa_artifacts"
   enable_peer_review: true
-  model_timeout_seconds: 45
+  model_timeout_seconds: 60
   progress_log_every_claims: 10
 
   peer_review:
@@ -90,8 +90,8 @@ qa:
     proposer_candidate_target: 10
     proposer_rerank_top_k: 5
     proposer_pdf_probe_enabled: true
-    proposer_pdf_probe_max_candidates: 20
-    proposer_pdf_probe_timeout_seconds: 5.0
+    proposer_pdf_probe_max_candidates: 10
+    proposer_pdf_probe_timeout_seconds: 8.0
     expose_candidate_submission_when_rejected: true
 
     stage_watchdog_seconds: 120.0
@@ -120,7 +120,7 @@ qa:
     min_total_chars: 800
     min_chars_per_text_page: 80
     min_text_page_ratio: 0.5
-    min_printable_ratio: 0.95
+    min_printable_ratio: 0.95 
     snippet_target_chars: 1000
     snippet_overlap_chars: 120
     preserve_page_blocks: true
@@ -148,8 +148,9 @@ qa:
     crossref_mailto: "${CROSSREF_MAILTO}"
     semantic_scholar_api_key: "${SEMANTIC_SCHOLAR_API_KEY}"
     unpaywall_email: "${UNPAYWALL_EMAIL}"
-    http_timeout: 10.0
-    fetch_timeout: 15.0
+
+    http_timeout: 15.0 # HTTP timeout in seconds
+    fetch_timeout: 15.0 # Timeout for fetching documents in seconds
     document_fetch_timeout_seconds: 45.0
     document_fetch_total_timeout_seconds: 300.0
     provider_redirect_limit: 8
