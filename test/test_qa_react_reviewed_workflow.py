@@ -646,6 +646,9 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
         self.assertEqual("prefer_fulltext", resolved["react_reviewed"]["proposer_evidence_policy"])
         self.assertEqual(10, resolved["react_reviewed"]["proposer_candidate_target"])
         self.assertEqual(5, resolved["react_reviewed"]["proposer_rerank_top_k"])
+        self.assertTrue(resolved["react_reviewed"]["proposer_pdf_probe_enabled"])
+        self.assertEqual(20, resolved["react_reviewed"]["proposer_pdf_probe_max_candidates"])
+        self.assertEqual(5.0, resolved["react_reviewed"]["proposer_pdf_probe_timeout_seconds"])
         self.assertFalse(resolved["react_reviewed"]["expose_candidate_submission_when_rejected"])
         self.assertEqual("http://localhost:8070", resolved["react_reviewed"]["grobid_url"])
         self.assertTrue(resolved["react_reviewed"]["grobid_preflight_enabled"])
@@ -671,6 +674,9 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
                     "react_reviewed": {
                         "proposer_candidate_target": "12",
                         "proposer_rerank_top_k": "20",
+                        "proposer_pdf_probe_enabled": False,
+                        "proposer_pdf_probe_max_candidates": "9",
+                        "proposer_pdf_probe_timeout_seconds": "3.5",
                         "expose_candidate_submission_when_rejected": True,
                         "grobid_url": "http://grobid.internal:8070",
                         "grobid_startup_enabled": True,
@@ -681,6 +687,9 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(12, resolved["react_reviewed"]["proposer_candidate_target"])
         self.assertEqual(12, resolved["react_reviewed"]["proposer_rerank_top_k"])
+        self.assertFalse(resolved["react_reviewed"]["proposer_pdf_probe_enabled"])
+        self.assertEqual(9, resolved["react_reviewed"]["proposer_pdf_probe_max_candidates"])
+        self.assertEqual(3.5, resolved["react_reviewed"]["proposer_pdf_probe_timeout_seconds"])
         self.assertTrue(resolved["react_reviewed"]["expose_candidate_submission_when_rejected"])
         self.assertEqual("http://grobid.internal:8070", resolved["react_reviewed"]["grobid_url"])
         self.assertTrue(resolved["react_reviewed"]["grobid_startup_enabled"])
@@ -703,6 +712,8 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
                     "react_reviewed": {
                         "proposer_candidate_target": 9,
                         "proposer_rerank_top_k": 4,
+                        "proposer_pdf_probe_enabled": False,
+                        "proposer_pdf_probe_max_candidates": 6,
                         "reviewer_repair_attempts": 2,
                         "expose_candidate_submission_when_rejected": True,
                         "grobid_url": "http://grobid.internal:8070",
@@ -717,6 +728,8 @@ class ReactReviewedRuntimeConfigTests(unittest.TestCase):
         assert workflow is not None
         self.assertEqual(9, workflow.proposer_candidate_target)
         self.assertEqual(4, workflow.proposer_rerank_top_k)
+        self.assertFalse(workflow.proposer_pdf_probe_enabled)
+        self.assertEqual(6, workflow.proposer_pdf_probe_max_candidates)
         self.assertEqual(9, workflow.proposer.proposer_candidate_target)
         self.assertEqual(4, workflow.proposer.proposer_rerank_top_k)
         self.assertTrue(workflow.synthesizer.expose_candidate_submission_when_rejected)
@@ -890,10 +903,13 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         document_acquirer: _CountingDocumentAcquirer | None = None,
         evidence_extractor: _CountingEvidenceExtractor | None = None,
         paper_profile_builder: _FakePaperProfileBuilder | None = None,
+        pdf_probe_client: object | None = None,
         entity_resolution_snapshot: dict | None = None,
         stage_watchdog_seconds: float = 120.0,
         proposer_candidate_target: int = 10,
         proposer_rerank_top_k: int = 5,
+        proposer_pdf_probe_enabled: bool = True,
+        proposer_pdf_probe_max_candidates: int = 20,
     ) -> ReactReviewedWorkspace:
         artifact_store = QAArtifactStore(base_dir=self.temp_dir / "workspace")
         return ReactReviewedWorkspace(
@@ -909,9 +925,12 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             handoff=EvidenceExtractorHandoff(),
             evidence_extractor=evidence_extractor or _CountingEvidenceExtractor(),
             paper_profile_builder=paper_profile_builder or _FakePaperProfileBuilder(),
+            pdf_probe_client=pdf_probe_client,
             stage_watchdog_seconds=stage_watchdog_seconds,
             proposer_candidate_target=proposer_candidate_target,
             proposer_rerank_top_k=proposer_rerank_top_k,
+            proposer_pdf_probe_enabled=proposer_pdf_probe_enabled,
+            proposer_pdf_probe_max_candidates=proposer_pdf_probe_max_candidates,
         )
 
     def _make_session(self, role: str, budget_limit: int) -> ReviewerSession:
@@ -1646,7 +1665,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
 
         self.assertEqual(["paper-oa", "paper-pdf-endpoint"], [item["paper_id"] for item in result])
 
-    def test_workspace_search_papers_proposer_only_semantic_applies_strict_pdf_rules_and_caps_at_ten(self):
+    def test_workspace_search_papers_proposer_only_semantic_uses_pdf_probe_rules_and_top_n_limit(self):
         class _NoopClient:
             def search(self, query_plan, limit=8):
                 return []
@@ -1666,11 +1685,11 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                             "tldr": {"text": "Direct HER relevance."},
                             "fieldsOfStudy": ["Chemistry"],
                             "isOpenAccess": True,
-                            "openAccessPdf": {"url": f"https://example.org/paper-{index}.pdf"},
+                            "openAccessPdf": {"url": f"https://example.org/view/{index}"},
                             "citationCount": 100 - index,
                             "year": 2024,
                             "venue": "Journal",
-                            "authors": [{"name": "Author"}],
+                            "authors": [{"name": f"Author {index}"}],
                             "externalIds": {"DOI": f"10.1000/valid-{index}"},
                         }
                     )
@@ -1682,38 +1701,38 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                             "tldr": {"text": "No DOI."},
                             "fieldsOfStudy": ["Chemistry"],
                             "isOpenAccess": True,
-                            "openAccessPdf": {"url": "https://example.org/no-doi.pdf"},
+                            "openAccessPdf": {"url": "https://example.org/no-doi"},
                             "citationCount": 999,
                             "year": 2024,
                             "venue": "Journal",
-                            "authors": [{"name": "Author"}],
+                            "authors": [{"name": "Author missing doi"}],
                             "externalIds": {},
                         },
                         {
-                            "title": "Query PDF pseudo endpoint",
-                            "abstract": "Should be rejected.",
+                            "title": "Landing page candidate",
+                            "abstract": "Should be rejected by probe.",
                             "tldr": {"text": "Bad URL."},
                             "fieldsOfStudy": ["Chemistry"],
                             "isOpenAccess": True,
-                            "openAccessPdf": {"url": "https://example.org/paper.pdf?download=1"},
-                            "citationCount": 998,
+                            "openAccessPdf": {"url": "https://example.org/landing"},
+                            "citationCount": 91,
                             "year": 2024,
                             "venue": "Journal",
-                            "authors": [{"name": "Author"}],
-                            "externalIds": {"DOI": "10.1000/bad-query"},
+                            "authors": [{"name": "Author landing"}],
+                            "externalIds": {"DOI": "10.1000/bad-landing"},
                         },
                         {
-                            "title": "Slash pdf endpoint",
-                            "abstract": "Should be rejected.",
+                            "title": "Login page candidate",
+                            "abstract": "Should be rejected by probe.",
                             "tldr": {"text": "Bad URL."},
                             "fieldsOfStudy": ["Chemistry"],
                             "isOpenAccess": True,
-                            "openAccessPdf": {"url": "https://example.org/paper/pdf"},
-                            "citationCount": 997,
+                            "openAccessPdf": {"url": "https://example.org/login"},
+                            "citationCount": 90,
                             "year": 2024,
                             "venue": "Journal",
-                            "authors": [{"name": "Author"}],
-                            "externalIds": {"DOI": "10.1000/bad-slash"},
+                            "authors": [{"name": "Author login"}],
+                            "externalIds": {"DOI": "10.1000/bad-login"},
                         },
                     ]
                 )
@@ -1722,6 +1741,56 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             def enrich(self, candidate):
                 return None
 
+        class _PdfProbeStub:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def probe(self, url: str):
+                self.calls.append(url)
+                tail = url.rsplit("/", 1)[-1]
+                if tail == "landing" or tail == "login":
+                    return SimpleNamespace(
+                        verdict="non_pdf",
+                        method="range_get",
+                        final_url=f"{url}/html",
+                        status_code=200,
+                        content_type="text/html",
+                        content_disposition=None,
+                        redirect_count=0,
+                    )
+                index = int(tail)
+                if index in {0, 2, 3, 4, 5, 6, 8}:
+                    return SimpleNamespace(
+                        verdict="strong",
+                        method="head" if index != 8 else "range_get",
+                        final_url=f"{url}/resolved",
+                        status_code=200 if index != 8 else 206,
+                        content_type="application/pdf" if index != 8 else "application/octet-stream",
+                        content_disposition=None,
+                        redirect_count=1 if index == 0 else 0,
+                    )
+                if index == 1:
+                    return SimpleNamespace(
+                        verdict="weak",
+                        method="head",
+                        final_url=f"{url}/weak",
+                        status_code=200,
+                        content_type="application/octet-stream",
+                        content_disposition='attachment; filename="paper-1.pdf"',
+                        redirect_count=0,
+                    )
+                if index in {7, 9}:
+                    return SimpleNamespace(
+                        verdict="non_pdf",
+                        method="range_get",
+                        final_url=f"{url}/html",
+                        status_code=200,
+                        content_type="text/html",
+                        content_disposition=None,
+                        redirect_count=0,
+                    )
+                raise AssertionError(f"unexpected probe url: {url}")
+
         retriever = RetrieverNode(
             openalex_client=_NoopClient(),
             crossref_client=_NoopClient(),
@@ -1729,9 +1798,15 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             per_lane_limit=20,
             final_top_k=20,
         )
-        workspace = self._make_workspace(retriever=retriever, proposer_candidate_target=10)
+        probe_client = _PdfProbeStub()
+        workspace = self._make_workspace(
+            retriever=retriever,
+            pdf_probe_client=probe_client,
+            proposer_candidate_target=10,
+            proposer_pdf_probe_max_candidates=10,
+        )
 
-        result = workspace.search_papers(
+        result = workspace.search_papers_batch(
             query_text="Pt/C HER alkaline",
             lane="data",
             reason="semantic proposer filter",
@@ -1739,9 +1814,99 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             write_snapshot=False,
         )
 
-        self.assertEqual(10, len(result))
-        self.assertTrue(all(str(item["doi"]).startswith("10.1000/valid-") for item in result))
-        self.assertTrue(all(str(item["open_access_pdf_url"]).endswith(".pdf") for item in result))
+        papers = list(result["papers"])
+        self.assertEqual(
+            ["10.1000/valid-0", "10.1000/valid-2", "10.1000/valid-3", "10.1000/valid-4", "10.1000/valid-5", "10.1000/valid-6", "10.1000/valid-8", "10.1000/valid-1"],
+            [str(item["doi"]) for item in papers],
+        )
+        self.assertTrue(all(item["pdf_probe_verdict"] == "strong" for item in papers[:7]))
+        self.assertEqual("weak", papers[-1]["pdf_probe_verdict"])
+        self.assertEqual("range_get", papers[6]["pdf_probe_method"])
+        self.assertEqual("head", papers[-1]["pdf_probe_method"])
+        self.assertIn("pdf_probe_final_url", papers[0])
+        self.assertEqual(10, len(probe_client.calls))
+        self.assertNotIn("https://example.org/view/10", probe_client.calls)
+        self.assertNotIn("https://example.org/view/11", probe_client.calls)
+        self.assertNotIn("https://example.org/landing", probe_client.calls)
+        self.assertNotIn("https://example.org/login", probe_client.calls)
+        self.assertEqual(2, len(result["search_warnings"]))
+        self.assertTrue(all(item["reason"] == "non_pdf" for item in result["search_warnings"]))
+
+    def test_workspace_search_papers_proposer_only_semantic_reuses_pdf_probe_cache(self):
+        class _NoopClient:
+            def search(self, query_plan, limit=8):
+                del query_plan, limit
+                return [
+                    {
+                        "title": "Pt/C alkaline HER study",
+                        "abstract": "Pt/C improves HER activity in alkaline media.",
+                        "tldr": {"text": "Direct HER relevance."},
+                        "fieldsOfStudy": ["Chemistry"],
+                        "isOpenAccess": True,
+                        "openAccessPdf": {"url": "https://example.org/view/shared"},
+                        "citationCount": 100,
+                        "year": 2024,
+                        "venue": "Journal",
+                        "authors": [{"name": "Author"}],
+                        "externalIds": {"DOI": "10.1000/shared"},
+                    }
+                ]
+
+            def enrich(self, candidate):
+                return None
+
+        class _PdfProbeStub:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def probe(self, url: str):
+                self.calls.append(url)
+                return SimpleNamespace(
+                    verdict="strong",
+                    method="head",
+                    final_url=url,
+                    status_code=200,
+                    content_type="application/pdf",
+                    content_disposition=None,
+                    redirect_count=0,
+                )
+
+        retriever = RetrieverNode(
+            openalex_client=_NoopClient(),
+            crossref_client=_NoopClient(),
+            semantic_scholar_client=_NoopClient(),
+            per_lane_limit=5,
+            final_top_k=5,
+        )
+        probe_client = _PdfProbeStub()
+        workspace = self._make_workspace(
+            retriever=retriever,
+            pdf_probe_client=probe_client,
+            proposer_pdf_probe_max_candidates=5,
+        )
+
+        first = workspace.search_papers(
+            query_text="Pt/C HER alkaline",
+            lane="data",
+            reason="first",
+            proposer_only_semantic=True,
+            write_snapshot=False,
+        )
+        second = workspace.search_papers(
+            query_text="Pt/C HER alkaline",
+            lane="data",
+            reason="second",
+            proposer_only_semantic=True,
+            write_snapshot=False,
+        )
+
+        self.assertEqual(1, len(first))
+        self.assertEqual(1, len(second))
+        self.assertEqual("10.1000/shared", first[0]["doi"])
+        self.assertEqual(first[0]["paper_id"], second[0]["paper_id"])
+        self.assertEqual(first[0]["pdf_probe_verdict"], second[0]["pdf_probe_verdict"])
+        self.assertEqual(first[0]["pdf_probe_method"], second[0]["pdf_probe_method"])
+        self.assertEqual(["https://example.org/view/shared"], probe_client.calls)
 
     def test_retriever_filters_off_topic_candidates_before_enrichment(self):
         class _OpenAlexClient:
@@ -4232,6 +4397,33 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             ["qp_1", "qp_1", "qp_2"],
             [item["query_plan_id"] for item in result.data["papers"]],
         )
+
+    def test_proposer_prompt_builders_receive_configured_candidate_target(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+            proposer_candidate_target=7,
+        )
+        conclude_contract = {
+            "tool_call_rule": "Call conclude with exactly {\"submission\": {...}}.",
+            "tool_call_example": {"submission": {"submission_id": "submission_cycle_1"}},
+            "invalid_examples": [{"submission_id": "submission_cycle_1"}],
+        }
+
+        with patch("qa.react_reviewed_workflow.build_proposer_system_prompt", return_value="system prompt") as system_mock:
+            prompt = proposer._build_system_prompt(conclude_call_contract=conclude_contract)
+        self.assertEqual("system prompt", prompt)
+        self.assertEqual(7, system_mock.call_args.kwargs["proposer_candidate_target"])
+
+        with patch("qa.react_reviewed_workflow.build_proposer_action_prompt", return_value="action prompt") as action_mock:
+            prompt = proposer._action_instruction(
+                ["plan_queries", "search_papers", "download_document", "conclude"],
+                conclude_call_contract=conclude_contract,
+            )
+        self.assertEqual("action prompt", prompt)
+        self.assertEqual(7, action_mock.call_args.kwargs["proposer_candidate_target"])
 
     def test_proposer_batched_search_keeps_partial_results_after_late_timeout(self):
         class _FixedPlanner:

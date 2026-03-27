@@ -45,6 +45,7 @@ from qa.nodes.entity_resolver import EntityResolverNode
 from qa.nodes.query_planner import QueryPlannerExecutionError, QueryPlannerNode
 from qa.nodes.retriever import RetrieverNode
 from qa.nodes.router import RouterExecutionError, RouterNode
+from qa.providers import PdfUrlProbeClient
 from qa.react_reviewed_state import (
     AnswerSubmission,
     ReviewCompletionStatus,
@@ -79,6 +80,7 @@ logger = logging.getLogger("MAD.qa.react_reviewed")
 MIN_REACT_REVIEWED_PROPOSER_STEPS = 6
 PROPOSER_CANDIDATE_TARGET = 10
 PROPOSER_RERANK_TOP_K = 5
+PROPOSER_PDF_PROBE_MAX_CANDIDATES = 20
 
 PROPOSER_TOOL_NAMES = (
     "plan_queries",
@@ -275,6 +277,24 @@ def _candidate_has_strict_proposer_pdf_signal(candidate: Optional[PaperCandidate
         _compact_text(getattr(candidate, "doi", None))
         and _url_is_strict_pdf_download(getattr(candidate, "open_access_pdf_url", None))
     )
+
+
+def _candidate_has_proposer_pdf_probe_input(candidate: Optional[PaperCandidate]) -> bool:
+    if candidate is None:
+        return False
+    return bool(
+        _compact_text(getattr(candidate, "doi", None))
+        and _compact_text(getattr(candidate, "open_access_pdf_url", None))
+    )
+
+
+def _pdf_probe_verdict_rank(verdict: Any) -> int:
+    normalized = _compact_text(verdict).lower()
+    if normalized == "strong":
+        return 2
+    if normalized == "weak":
+        return 1
+    return 0
 
 
 def _batched_search_stage_timeout(base_timeout_seconds: float, batch_size: int) -> float:
@@ -1429,9 +1449,12 @@ class ReactReviewedWorkspace:
         handoff: EvidenceExtractorHandoff,
         evidence_extractor: EvidenceExtractor,
         paper_profile_builder: Optional[GrobidPaperProfileBuilder] = None,
+        pdf_probe_client: Optional[Any] = None,
         stage_watchdog_seconds: float = 120.0,
         proposer_candidate_target: int = PROPOSER_CANDIDATE_TARGET,
         proposer_rerank_top_k: int = PROPOSER_RERANK_TOP_K,
+        proposer_pdf_probe_enabled: bool = True,
+        proposer_pdf_probe_max_candidates: int = PROPOSER_PDF_PROBE_MAX_CANDIDATES,
     ) -> None:
         self.question = question
         self.context = context
@@ -1445,12 +1468,15 @@ class ReactReviewedWorkspace:
         self.handoff = handoff
         self.evidence_extractor = evidence_extractor
         self.paper_profile_builder = paper_profile_builder or GrobidPaperProfileBuilder()
+        self.pdf_probe_client = pdf_probe_client
         self.stage_watchdog_seconds = max(0.01, float(stage_watchdog_seconds))
         self.proposer_candidate_target = max(1, int(proposer_candidate_target))
         self.proposer_rerank_top_k = max(
             1,
             min(self.proposer_candidate_target, int(proposer_rerank_top_k)),
         )
+        self.proposer_pdf_probe_enabled = bool(proposer_pdf_probe_enabled)
+        self.proposer_pdf_probe_max_candidates = max(1, int(proposer_pdf_probe_max_candidates))
 
         self._state_lock = threading.RLock()
         self.query_plans: Dict[str, QueryPlan] = {}
@@ -1468,7 +1494,9 @@ class ReactReviewedWorkspace:
         self.current_cycle_number: int = 1
         self._ad_hoc_query_plan_ids: Dict[Tuple[str, str], str] = {}
         self._search_result_cache: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+        self._search_warning_cache: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
         self._search_batch_result_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        self._pdf_probe_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._acquire_result_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._acquire_batch_result_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._index_result_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
@@ -1478,6 +1506,7 @@ class ReactReviewedWorkspace:
         self._citation_context_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._search_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
         self._search_batch_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
+        self._pdf_probe_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
         self._acquire_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
         self._acquire_batch_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
         self._index_inflight: Dict[Tuple[Any, ...], _InflightOperation] = {}
@@ -1640,7 +1669,9 @@ class ReactReviewedWorkspace:
                 "provider_health": copy.deepcopy(self.provider_health),
                 "execution_warnings": list(self.execution_warnings),
                 "search_result_cache": copy.deepcopy(self._search_result_cache),
+                "search_warning_cache": copy.deepcopy(self._search_warning_cache),
                 "search_batch_result_cache": copy.deepcopy(self._search_batch_result_cache),
+                "pdf_probe_cache": copy.deepcopy(self._pdf_probe_cache),
                 "acquire_result_cache": copy.deepcopy(self._acquire_result_cache),
                 "acquire_batch_result_cache": copy.deepcopy(self._acquire_batch_result_cache),
                 "index_result_cache": copy.deepcopy(self._index_result_cache),
@@ -1661,7 +1692,9 @@ class ReactReviewedWorkspace:
             self.provider_health = copy.deepcopy(snapshot.get("provider_health", {}))
             self.execution_warnings = list(snapshot.get("execution_warnings", []))
             self._search_result_cache = copy.deepcopy(snapshot.get("search_result_cache", {}))
+            self._search_warning_cache = copy.deepcopy(snapshot.get("search_warning_cache", {}))
             self._search_batch_result_cache = copy.deepcopy(snapshot.get("search_batch_result_cache", {}))
+            self._pdf_probe_cache = copy.deepcopy(snapshot.get("pdf_probe_cache", {}))
             self._acquire_result_cache = copy.deepcopy(snapshot.get("acquire_result_cache", {}))
             self._acquire_batch_result_cache = copy.deepcopy(snapshot.get("acquire_batch_result_cache", {}))
             self._index_result_cache = copy.deepcopy(snapshot.get("index_result_cache", {}))
@@ -1671,6 +1704,7 @@ class ReactReviewedWorkspace:
             self._citation_context_cache = copy.deepcopy(snapshot.get("citation_context_cache", {}))
             self._search_inflight = {}
             self._search_batch_inflight = {}
+            self._pdf_probe_inflight = {}
             self._acquire_inflight = {}
             self._acquire_batch_inflight = {}
             self._index_inflight = {}
@@ -1825,6 +1859,72 @@ class ReactReviewedWorkspace:
             )
         return self.document_acquirer
 
+    def _build_pdf_probe_clone(self) -> Optional[Any]:
+        if isinstance(self.pdf_probe_client, PdfUrlProbeClient):
+            return PdfUrlProbeClient(
+                timeout=self.pdf_probe_client.timeout,
+                max_redirects=self.pdf_probe_client.max_redirects,
+                retry_attempts=self.pdf_probe_client.retry_attempts,
+                backoff_base_seconds=self.pdf_probe_client.backoff_base_seconds,
+                backoff_max_seconds=self.pdf_probe_client.backoff_max_seconds,
+                browser_headers=self.pdf_probe_client.browser_headers,
+                range_bytes=self.pdf_probe_client.range_bytes,
+            )
+        return self.pdf_probe_client
+
+    def _probe_proposer_pdf_url(
+        self,
+        *,
+        candidate: PaperCandidate,
+        probe_client: Optional[Any],
+    ) -> Dict[str, Any]:
+        url = _compact_text(getattr(candidate, "open_access_pdf_url", None))
+        if not url or probe_client is None:
+            raise RuntimeError(f"paper_id={candidate.paper_id} has no configured PDF probe client or URL.")
+        cache_key = ("pdf_probe", self._normalize_cache_text(url))
+        state, payload = self._prepare_cached_operation(
+            cache=self._pdf_probe_cache,
+            inflight_map=self._pdf_probe_inflight,
+            cache_key=cache_key,
+            session=None,
+            charge_budget=False,
+            tool_name="search_papers",
+            requested_via="proposer_pdf_probe",
+        )
+        if state == "wait":
+            return dict(self._wait_for_cached_operation(payload) or {})
+        if state == "hit":
+            return dict(payload or {})
+
+        try:
+            result = probe_client.probe(url)
+            payload = {
+                "paper_id": candidate.paper_id,
+                "url": url,
+                "verdict": str(getattr(result, "verdict", "") or "").strip().lower(),
+                "method": str(getattr(result, "method", "") or "").strip().lower(),
+                "final_url": _compact_text(getattr(result, "final_url", None)) or url,
+                "status_code": int(getattr(result, "status_code", 0) or 0),
+                "content_type": _compact_text(getattr(result, "content_type", None)).lower(),
+                "content_disposition": _compact_text(getattr(result, "content_disposition", None)) or None,
+                "redirect_count": int(getattr(result, "redirect_count", 0) or 0),
+            }
+            with self._state_lock:
+                self._pdf_probe_cache[cache_key] = copy.deepcopy(payload)
+            self._finalize_cached_operation(
+                inflight_map=self._pdf_probe_inflight,
+                cache_key=cache_key,
+                result=payload,
+            )
+            return payload
+        except Exception as exc:
+            self._finalize_cached_operation(
+                inflight_map=self._pdf_probe_inflight,
+                cache_key=cache_key,
+                error=exc,
+            )
+            raise
+
     def _search_papers_with_semantic_scholar_only(
         self,
         *,
@@ -1834,6 +1934,7 @@ class ReactReviewedWorkspace:
     ) -> List[PaperCandidate]:
         retriever._diagnostic_map = {}
         retriever._provider_health_fallback = retriever._init_provider_health()
+        setattr(retriever, "last_search_warnings", [])
         raw_results = retriever._run_provider_search(
             provider_name="semantic_scholar",
             query_plan=query_plan,
@@ -1860,7 +1961,7 @@ class ReactReviewedWorkspace:
 
         filtered_candidates: List[PaperCandidate] = []
         for candidate in candidates:
-            if not _candidate_has_strict_proposer_pdf_signal(candidate):
+            if not _candidate_has_proposer_pdf_probe_input(candidate):
                 continue
             candidate.retrieval_score = _score_proposer_semantic_scholar_candidate(
                 task_spec=self.task_spec,
@@ -1869,8 +1970,6 @@ class ReactReviewedWorkspace:
             )
             filtered_candidates.append(candidate)
 
-        retriever.last_diagnostics = retriever._finalize_diagnostics()
-        retriever.last_provider_health = retriever._collect_provider_health()
         filtered_candidates.sort(
             key=lambda item: (
                 -float(item.retrieval_score or 0.0),
@@ -1878,6 +1977,88 @@ class ReactReviewedWorkspace:
                 str(item.paper_id),
             )
         )
+
+        probe_warnings: List[Dict[str, Any]] = []
+        pdf_probe_client = self._build_pdf_probe_clone()
+        if self.proposer_pdf_probe_enabled and pdf_probe_client is not None:
+            probe_candidates = list(filtered_candidates[: self.proposer_pdf_probe_max_candidates])
+            accepted_candidates: List[PaperCandidate] = []
+
+            with ThreadPoolExecutor(max_workers=max(1, min(len(probe_candidates), 4))) as executor:
+                future_map = {
+                    executor.submit(
+                        self._probe_proposer_pdf_url,
+                        candidate=candidate,
+                        probe_client=pdf_probe_client,
+                    ): candidate
+                    for candidate in probe_candidates
+                }
+                for future, candidate in list(future_map.items()):
+                    try:
+                        probe_payload = dict(future.result() or {})
+                    except Exception as exc:
+                        probe_warnings.append(
+                            {
+                                "paper_id": candidate.paper_id,
+                                "url": _compact_text(getattr(candidate, "open_access_pdf_url", None)),
+                                "reason": type(exc).__name__,
+                                "message": str(exc),
+                            }
+                        )
+                        continue
+                    verdict = _compact_text(probe_payload.get("verdict")).lower()
+                    if verdict not in {"strong", "weak"}:
+                        probe_warnings.append(
+                            {
+                                "paper_id": candidate.paper_id,
+                                "url": probe_payload.get("url") or _compact_text(getattr(candidate, "open_access_pdf_url", None)),
+                                "reason": "non_pdf",
+                                "message": (
+                                    f"response did not validate as PDF "
+                                    f"(content_type={probe_payload.get('content_type') or 'unknown'}, "
+                                    f"status_code={probe_payload.get('status_code') or 'unknown'})"
+                                ),
+                            }
+                        )
+                        continue
+                    candidate.pdf_probe_verdict = verdict
+                    candidate.pdf_probe_method = _compact_text(probe_payload.get("method")).lower() or None
+                    candidate.pdf_probe_final_url = _compact_text(probe_payload.get("final_url")) or None
+                    accepted_candidates.append(candidate)
+
+            filtered_candidates = accepted_candidates
+            retriever.last_diagnostics = retriever._finalize_diagnostics() + [
+                RetrievalDiagnosticRecord(
+                    provider="pdf_probe",
+                    stage="fetch",
+                    lane=query_plan.lane,
+                    hit_count=sum(1 for item in filtered_candidates if _pdf_probe_verdict_rank(item.pdf_probe_verdict) > 0),
+                    failure_count=sum(1 for item in probe_warnings if str(item.get("reason") or "").strip() != "non_pdf"),
+                    empty_count=sum(1 for item in probe_warnings if str(item.get("reason") or "").strip() == "non_pdf"),
+                    sample_messages=[
+                        str(item.get("message") or "").strip()
+                        for item in probe_warnings[:3]
+                        if str(item.get("message") or "").strip()
+                    ],
+                )
+            ]
+            provider_health = retriever._collect_provider_health()
+            if hasattr(pdf_probe_client, "health_snapshot"):
+                provider_health["pdf_probe"] = dict(pdf_probe_client.health_snapshot() or {})
+            retriever.last_provider_health = provider_health
+        else:
+            retriever.last_diagnostics = retriever._finalize_diagnostics()
+            retriever.last_provider_health = retriever._collect_provider_health()
+
+        filtered_candidates.sort(
+            key=lambda item: (
+                -_pdf_probe_verdict_rank(getattr(item, "pdf_probe_verdict", None)),
+                -float(item.retrieval_score or 0.0),
+                -int(item.ranking_features.get("citation_count") or 0),
+                str(item.paper_id),
+            )
+        )
+        setattr(retriever, "last_search_warnings", probe_warnings)
         return filtered_candidates[: self.proposer_candidate_target]
 
     def _index_downloaded_document(
@@ -2156,7 +2337,7 @@ class ReactReviewedWorkspace:
         store = artifact_store or self.store
         resolved_id, query_plan = self._ensure_query_plan(query_plan_id, query_text, lane)
         effective_stage_watchdog_seconds = max(0.01, float(stage_watchdog_seconds or self.stage_watchdog_seconds))
-        cache_key = ("query_plan", resolved_id)
+        cache_key = ("query_plan", resolved_id, bool(proposer_only_semantic))
         state, payload = self._prepare_cached_operation(
             cache=self._search_result_cache,
             inflight_map=self._search_inflight,
@@ -2170,10 +2351,12 @@ class ReactReviewedWorkspace:
             raise ReviewerBudgetBlocked(payload)
         if state == "wait":
             candidate_payloads = self._wait_for_cached_operation(payload)
+            search_warnings = list(self._search_warning_cache.get(cache_key, []) or [])
             if session is not None:
                 session.record_hit(tool_name="search_papers", cache_key=cache_key, requested_via=requested_via)
         elif state == "hit":
             candidate_payloads = payload
+            search_warnings = list(self._search_warning_cache.get(cache_key, []) or [])
             if session is not None:
                 session.record_hit(tool_name="search_papers", cache_key=cache_key, requested_via=requested_via)
         else:
@@ -2208,6 +2391,7 @@ class ReactReviewedWorkspace:
                 )
                 self._merge_diagnostics(getattr(retriever, "last_diagnostics", []) or [])
                 self._merge_provider_health(getattr(retriever, "last_provider_health", {}) or {})
+                search_warnings = list(getattr(retriever, "last_search_warnings", []) or [])
                 filtered_candidates = list(candidates or [])
                 if not proposer_only_semantic:
                     filtered_candidates = [
@@ -2223,6 +2407,7 @@ class ReactReviewedWorkspace:
                         for candidate in filtered_candidates[: self.proposer_candidate_target]
                     ]
                     self._search_result_cache[cache_key] = copy.deepcopy(candidate_payloads)
+                    self._search_warning_cache[cache_key] = copy.deepcopy(search_warnings)
                 self._finalize_cached_operation(
                     inflight_map=self._search_inflight,
                     cache_key=cache_key,
@@ -2298,23 +2483,28 @@ class ReactReviewedWorkspace:
             if session is not None:
                 session.record_hit(tool_name="search_papers", cache_key=cache_key, requested_via=requested_via)
         else:
-            tasks: List[Tuple[str, str]] = []
+            tasks: List[Tuple[str, str, str]] = []
             if normalized_plan_ids:
-                tasks = [("query_plan_id", item) for item in normalized_plan_ids]
+                tasks = [("query_plan_id", item, str(item or "").strip()) for item in normalized_plan_ids]
             elif normalized_query_texts:
-                tasks = [("query_text", item) for item in normalized_query_texts]
+                tasks = []
+                for item in normalized_query_texts:
+                    resolved_id, _query_plan = self._ensure_query_plan(None, item, lane)
+                    tasks.append(("query_text", item, resolved_id))
             else:
-                tasks = [("query_plan_id", str(query_plan_id or "").strip())]
+                fallback_id, _query_plan = self._ensure_query_plan(query_plan_id, query_text, lane)
+                tasks = [("query_plan_id", str(query_plan_id or "").strip(), fallback_id)]
 
-            papers_by_input: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+            papers_by_input: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
             search_warnings: List[Dict[str, Any]] = []
+            query_failures: List[Dict[str, Any]] = []
 
             with ThreadPoolExecutor(max_workers=max(1, min(len(tasks), 4))) as executor:
                 future_map = {
                     executor.submit(
                         self.search_papers,
-                        query_plan_id=value if kind == "query_plan_id" else None,
-                        query_text=value if kind == "query_text" else None,
+                        query_plan_id=resolved_id,
+                        query_text=None,
                         lane=lane,
                         reason=reason,
                         artifact_store=store,
@@ -2324,13 +2514,22 @@ class ReactReviewedWorkspace:
                         write_snapshot=False,
                         stage_watchdog_seconds=batch_search_timeout,
                         proposer_only_semantic=proposer_only_semantic,
-                    ): (kind, value)
-                    for kind, value in tasks
+                    ): (kind, value, resolved_id)
+                    for kind, value, resolved_id in tasks
                 }
                 for future, task in list(future_map.items()):
-                    kind, value = task
+                    kind, value, resolved_id = task
                     try:
                         papers_by_input[task] = list(future.result() or [])
+                        search_warnings.extend(
+                            copy.deepcopy(
+                                self._search_warning_cache.get(
+                                    ("query_plan", resolved_id, bool(proposer_only_semantic)),
+                                    [],
+                                )
+                                or []
+                            )
+                        )
                     except Exception as exc:
                         warning = {
                             kind: value,
@@ -2338,6 +2537,7 @@ class ReactReviewedWorkspace:
                             "message": str(exc),
                         }
                         search_warnings.append(warning)
+                        query_failures.append(warning)
                         papers_by_input[task] = []
 
             deduped_payloads: List[Dict[str, Any]] = []
@@ -2353,10 +2553,10 @@ class ReactReviewedWorkspace:
                         seen_paper_ids.add(paper_id)
                     deduped_payloads.append(payload_item)
 
-            if not deduped_payloads and search_warnings and len(search_warnings) == len(tasks):
+            if not deduped_payloads and query_failures and len(query_failures) == len(tasks):
                 error = RuntimeError(
                     "batch search failed for all queries: "
-                    + "; ".join(str(item.get("message") or item.get("reason") or "unknown") for item in search_warnings)
+                    + "; ".join(str(item.get("message") or item.get("reason") or "unknown") for item in query_failures)
                 )
                 self._finalize_cached_operation(
                     inflight_map=self._search_batch_inflight,
@@ -2370,8 +2570,8 @@ class ReactReviewedWorkspace:
                 "search_warnings": search_warnings,
                 "batch_summary": {
                     "input_query_count": len(tasks),
-                    "successful_query_count": sum(1 for task in tasks if papers_by_input.get(task)),
-                    "failed_query_count": len(search_warnings),
+                    "successful_query_count": len(tasks) - len(query_failures),
+                    "failed_query_count": len(query_failures),
                     "deduped_paper_count": len(deduped_payloads),
                 },
             }
@@ -5695,7 +5895,10 @@ class ReactReviewedProposerAgent:
         return "Evidence remains insufficient to support a stronger section-level answer."
 
     def _build_system_prompt(self, *, conclude_call_contract: Dict[str, Any]) -> str:
-        return build_proposer_system_prompt(conclude_contract=conclude_call_contract)
+        return build_proposer_system_prompt(
+            conclude_contract=conclude_call_contract,
+            proposer_candidate_target=self.proposer_candidate_target,
+        )
 
     def _build_user_prompt(
         self,
@@ -5762,6 +5965,7 @@ class ReactReviewedProposerAgent:
             tool_names=tool_names,
             retrieval_tools=retrieval_tools,
             conclude_contract=conclude_call_contract,
+            proposer_candidate_target=self.proposer_candidate_target,
         )
 
     def _add_tool_step(
@@ -6846,6 +7050,9 @@ class ReactReviewedWorkflow:
         reviewer_model_configs: Optional[Dict[str, Dict[str, Any]]] = None,
         proposer_candidate_target: int = PROPOSER_CANDIDATE_TARGET,
         proposer_rerank_top_k: int = PROPOSER_RERANK_TOP_K,
+        pdf_probe_client: Optional[Any] = None,
+        proposer_pdf_probe_enabled: bool = True,
+        proposer_pdf_probe_max_candidates: int = PROPOSER_PDF_PROBE_MAX_CANDIDATES,
     ) -> None:
         self.qa_config = copy.deepcopy(qa_config)
         react_config = dict(self.qa_config.get("react_reviewed", {}) or {})
@@ -6857,6 +7064,7 @@ class ReactReviewedWorkflow:
         self.handoff = handoff
         self.evidence_extractor = evidence_extractor
         self.paper_profile_builder = paper_profile_builder or GrobidPaperProfileBuilder()
+        self.pdf_probe_client = pdf_probe_client
         self.grobid_preflight_enabled = bool(react_config.get("grobid_preflight_enabled", True))
         self._last_grobid_preflight_artifact_path: Optional[str] = None
         self.proposer_candidate_target = max(1, int(proposer_candidate_target))
@@ -6864,6 +7072,8 @@ class ReactReviewedWorkflow:
             1,
             min(self.proposer_candidate_target, int(proposer_rerank_top_k)),
         )
+        self.proposer_pdf_probe_enabled = bool(proposer_pdf_probe_enabled)
+        self.proposer_pdf_probe_max_candidates = max(1, int(proposer_pdf_probe_max_candidates))
         self.reviewer_role_order = tuple(role for role in DEFAULT_REVIEWER_ROLES if role in REVIEWER_TOOL_NAMES)
         self.stage_watchdog_seconds = max(0.01, float(react_config.get("stage_watchdog_seconds", 120.0)))
         self.reviewer_max_concurrency = max(1, int(react_config.get("reviewer_max_concurrency", len(self.reviewer_role_order))))
@@ -7284,9 +7494,12 @@ class ReactReviewedWorkflow:
             handoff=self.handoff,
             evidence_extractor=self.evidence_extractor,
             paper_profile_builder=self.paper_profile_builder,
+            pdf_probe_client=self.pdf_probe_client,
             stage_watchdog_seconds=self.stage_watchdog_seconds,
             proposer_candidate_target=self.proposer_candidate_target,
             proposer_rerank_top_k=self.proposer_rerank_top_k,
+            proposer_pdf_probe_enabled=self.proposer_pdf_probe_enabled,
+            proposer_pdf_probe_max_candidates=self.proposer_pdf_probe_max_candidates,
         )
 
         react_config = dict(self.qa_config.get("react_reviewed", {}) or {})

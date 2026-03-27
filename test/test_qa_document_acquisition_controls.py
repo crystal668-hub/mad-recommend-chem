@@ -8,11 +8,12 @@ import uuid
 from pathlib import Path
 
 import pymupdf as fitz
+import requests
 
 from qa.artifacts import QAArtifactStore
 from qa.handoff import EvidenceExtractorHandoff
 from qa.nodes.document_acquirer import DocumentAcquirerNode
-from qa.providers import DEFAULT_BROWSER_USER_AGENT, FetchedDocument, HttpTextFetcher, ProviderRequestError
+from qa.providers import DEFAULT_BROWSER_USER_AGENT, FetchedDocument, HttpTextFetcher, PdfUrlProbeClient, ProviderRequestError
 from qa.retrieval_state import PaperCandidate, PaperRecord, Section, SectionIndex
 from qa.state import QueryConstraints, TaskSpec
 
@@ -152,6 +153,117 @@ class DocumentAcquisitionTests(unittest.TestCase):
         self.assertEqual("image/jpeg", fetched.content_type)
         self.assertEqual(b"\xff\xd8\xff", fetched.binary)
         self.assertIsNone(fetched.text)
+
+    def test_pdf_url_probe_client_accepts_head_pdf_content_type(self):
+        calls: list[str] = []
+
+        class _Response:
+            status_code = 200
+            headers = {"content-type": "application/pdf"}
+            url = "https://example.test/final"
+            history = [object()]
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        def _request(method, url, *, headers=None, timeout=None, **kwargs):
+            del headers, timeout, kwargs
+            calls.append(f"{method}:{url}")
+            return _Response()
+
+        client = PdfUrlProbeClient(request_request=_request)
+        result = client.probe("https://example.test/paper")
+
+        self.assertEqual(["HEAD:https://example.test/paper"], calls)
+        self.assertEqual("strong", result.verdict)
+        self.assertEqual("head", result.method)
+        self.assertEqual("application/pdf", result.content_type)
+        self.assertEqual("https://example.test/final", result.final_url)
+
+    def test_pdf_url_probe_client_falls_back_to_range_get_and_checks_pdf_magic(self):
+        calls: list[str] = []
+
+        class _HeadResponse:
+            status_code = 405
+            headers = {}
+            url = "https://example.test/paper"
+            history = []
+
+            def raise_for_status(self) -> None:
+                raise requests.exceptions.HTTPError("405")
+
+            def close(self) -> None:
+                return None
+
+        class _GetResponse:
+            status_code = 206
+            headers = {"content-type": "application/octet-stream"}
+            url = "https://example.test/final.pdf"
+            history = []
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def iter_content(self, chunk_size=1024):
+                del chunk_size
+                yield b"%PDF-1.7\n"
+
+            def close(self) -> None:
+                return None
+
+        def _request(method, url, *, headers=None, timeout=None, **kwargs):
+            del timeout, kwargs
+            calls.append(f"{method}:{url}:{headers.get('Range') if headers else None}")
+            if method == "HEAD":
+                return _HeadResponse()
+            return _GetResponse()
+
+        client = PdfUrlProbeClient(request_request=_request)
+        result = client.probe("https://example.test/paper")
+
+        self.assertEqual(
+            [
+                "HEAD:https://example.test/paper:None",
+                "GET:https://example.test/paper:bytes=0-1023",
+            ],
+            calls,
+        )
+        self.assertEqual("strong", result.verdict)
+        self.assertEqual("range_get", result.method)
+        self.assertEqual("application/octet-stream", result.content_type)
+
+    def test_pdf_url_probe_client_accepts_weak_content_disposition_hint(self):
+        calls: list[str] = []
+
+        class _Response:
+            status_code = 200
+            headers = {
+                "content-type": "application/octet-stream",
+                "content-disposition": 'attachment; filename="paper.pdf"',
+            }
+            url = "https://example.test/download"
+            history = []
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        def _request(method, url, *, headers=None, timeout=None, **kwargs):
+            del headers, timeout, kwargs
+            calls.append(f"{method}:{url}")
+            return _Response()
+
+        client = PdfUrlProbeClient(request_request=_request)
+        result = client.probe("https://example.test/paper")
+
+        self.assertEqual(["HEAD:https://example.test/paper"], calls)
+        self.assertEqual("weak", result.verdict)
+        self.assertEqual("head", result.method)
 
     def test_http_text_fetcher_rejects_excessive_redirects(self):
         class _Response:

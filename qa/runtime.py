@@ -26,6 +26,7 @@ from qa.providers import (
     CrossrefClient,
     HttpTextFetcher,
     OpenAlexClient,
+    PdfUrlProbeClient,
     SemanticScholarClient,
     UnpaywallClient,
 )
@@ -111,6 +112,9 @@ DEFAULT_QA_CONFIG: Dict[str, Any] = {
         "proposer_evidence_policy": "prefer_fulltext",
         "proposer_candidate_target": 10,
         "proposer_rerank_top_k": 5,
+        "proposer_pdf_probe_enabled": True,
+        "proposer_pdf_probe_max_candidates": 20,
+        "proposer_pdf_probe_timeout_seconds": 5.0,
         "expose_candidate_submission_when_rejected": False,
         "grobid_url": "http://localhost:8070",
         "grobid_preflight_enabled": True,
@@ -320,6 +324,20 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "proposer_candidate_target": proposer_candidate_target,
         "proposer_rerank_top_k": proposer_rerank_top_k,
+        "proposer_pdf_probe_enabled": bool(
+            react_reviewed_config.get(
+                "proposer_pdf_probe_enabled",
+                DEFAULT_QA_CONFIG["react_reviewed"]["proposer_pdf_probe_enabled"],
+            )
+        ),
+        "proposer_pdf_probe_max_candidates": _coerce_positive_int(
+            react_reviewed_config.get("proposer_pdf_probe_max_candidates"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_pdf_probe_max_candidates"],
+        ),
+        "proposer_pdf_probe_timeout_seconds": _coerce_positive_float(
+            react_reviewed_config.get("proposer_pdf_probe_timeout_seconds"),
+            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_pdf_probe_timeout_seconds"],
+        ),
         "expose_candidate_submission_when_rejected": bool(
             react_reviewed_config.get(
                 "expose_candidate_submission_when_rejected",
@@ -878,6 +896,13 @@ def build_qa_runtime(
             },
             proposer_candidate_target=react_reviewed_config.get("proposer_candidate_target", 10),
             proposer_rerank_top_k=react_reviewed_config.get("proposer_rerank_top_k", 5),
+            pdf_probe_client=PdfUrlProbeClient(
+                timeout=react_reviewed_config.get("proposer_pdf_probe_timeout_seconds", 5.0),
+                max_redirects=provider_redirect_limit,
+                **retry_kwargs,
+            ),
+            proposer_pdf_probe_enabled=react_reviewed_config.get("proposer_pdf_probe_enabled", True),
+            proposer_pdf_probe_max_candidates=react_reviewed_config.get("proposer_pdf_probe_max_candidates", 20),
         )
 
     return QARuntime(

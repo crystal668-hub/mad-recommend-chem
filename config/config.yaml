@@ -89,6 +89,9 @@ qa:
     grobid_startup_poll_interval_seconds: 2.0
     proposer_candidate_target: 10
     proposer_rerank_top_k: 5
+    proposer_pdf_probe_enabled: true
+    proposer_pdf_probe_max_candidates: 20
+    proposer_pdf_probe_timeout_seconds: 5.0
     expose_candidate_submission_when_rejected: true
 
     stage_watchdog_seconds: 120.0

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import random
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote
@@ -31,6 +32,17 @@ class FetchedDocument:
     text: Optional[str] = None
     binary: Optional[bytes] = None
     final_url: Optional[str] = None
+    redirect_count: int = 0
+
+
+@dataclass
+class PdfProbeResult:
+    verdict: str
+    method: str
+    final_url: str
+    status_code: int
+    content_type: str
+    content_disposition: Optional[str] = None
     redirect_count: int = 0
 
 
@@ -95,6 +107,7 @@ class _HttpTransportMixin:
         backoff_max_seconds: float = 8.0,
         disable_on_retry_exhausted: bool = True,
         request_get: Optional[Callable[..., Any]] = None,
+        request_request: Optional[Callable[..., Any]] = None,
         sleep_fn: Optional[Callable[[float], None]] = None,
         random_fn: Optional[Callable[[], float]] = None,
     ) -> None:
@@ -106,6 +119,7 @@ class _HttpTransportMixin:
         self.backoff_max_seconds = max(self.backoff_base_seconds, float(backoff_max_seconds))
         self.disable_on_retry_exhausted = bool(disable_on_retry_exhausted)
         self._request_get = request_get or requests.get
+        self._request_request = request_request or requests.request
         self._sleep_fn = sleep_fn or time.sleep
         self._random_fn = random_fn or random.random
         self._health = ProviderHealthRecord()
@@ -116,13 +130,16 @@ class _HttpTransportMixin:
     def is_available(self) -> bool:
         return self._health.status != "unavailable"
 
-    def _perform_get(
+    def _perform_request(
         self,
+        method: str,
         url: str,
         *,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
+        **request_kwargs: Any,
     ) -> Any:
+        method_name = str(method or "GET").strip().upper() or "GET"
         if not self.is_available():
             self._health.skipped_calls += 1
             raise ProviderUnavailableError(
@@ -136,12 +153,22 @@ class _HttpTransportMixin:
 
         for attempt in range(1, total_attempts + 1):
             try:
-                response = self._request_get(
-                    url,
-                    params=params,
-                    headers=headers,
-                    timeout=self.timeout,
-                )
+                if method_name == "GET" and not request_kwargs:
+                    response = self._request_get(
+                        url,
+                        params=params,
+                        headers=headers,
+                        timeout=self.timeout,
+                    )
+                else:
+                    response = self._request_request(
+                        method_name,
+                        url,
+                        params=params,
+                        headers=headers,
+                        timeout=self.timeout,
+                        **request_kwargs,
+                    )
                 status_code = int(getattr(response, "status_code", 200))
                 redirect_count = len(getattr(response, "history", None) or [])
                 if self.max_redirects is not None and redirect_count > self.max_redirects:
@@ -232,6 +259,20 @@ class _HttpTransportMixin:
             failure_kind="failure",
             message=last_error or f"{self.provider_name} request failed",
             attempts=total_attempts,
+        )
+
+    def _perform_get(
+        self,
+        url: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Any:
+        return self._perform_request(
+            "GET",
+            url,
+            params=params,
+            headers=headers,
         )
 
     def _finalize_recoverable_error(
@@ -563,3 +604,127 @@ class HttpTextFetcher(_HttpTransportMixin):
             final_url=final_url,
             redirect_count=redirect_count,
         )
+
+
+class PdfUrlProbeClient(_HttpTransportMixin):
+    def __init__(
+        self,
+        timeout: float = 5.0,
+        max_redirects: Optional[int] = None,
+        retry_attempts: int = 2,
+        backoff_base_seconds: float = 1.0,
+        backoff_max_seconds: float = 8.0,
+        request_request: Optional[Callable[..., Any]] = None,
+        sleep_fn: Optional[Callable[[float], None]] = None,
+        random_fn: Optional[Callable[[], float]] = None,
+        browser_headers: Optional[Dict[str, str]] = None,
+        range_bytes: int = 1024,
+    ) -> None:
+        self.browser_headers = dict(browser_headers or DEFAULT_BROWSER_HEADERS)
+        self.range_bytes = max(64, int(range_bytes))
+        self._init_transport(
+            provider_name="pdf_probe",
+            timeout=timeout,
+            max_redirects=max_redirects,
+            retry_attempts=retry_attempts,
+            backoff_base_seconds=backoff_base_seconds,
+            backoff_max_seconds=backoff_max_seconds,
+            disable_on_retry_exhausted=False,
+            request_request=request_request,
+            sleep_fn=sleep_fn,
+            random_fn=random_fn,
+        )
+
+    def probe(self, url: str) -> PdfProbeResult:
+        request_headers = dict(self.browser_headers)
+        request_headers["Accept"] = "application/pdf,application/octet-stream,text/html;q=0.8,*/*;q=0.5"
+
+        try:
+            head_response = self._perform_request(
+                "HEAD",
+                url,
+                headers=request_headers,
+                allow_redirects=True,
+            )
+            head_result = self._classify_response(
+                response=head_response,
+                url=url,
+                method="head",
+                sample=b"",
+            )
+            if head_result.verdict in {"strong", "weak"}:
+                return head_result
+        except Exception:
+            pass
+
+        range_headers = dict(request_headers)
+        range_headers["Range"] = f"bytes=0-{self.range_bytes - 1}"
+        response = self._perform_request(
+            "GET",
+            url,
+            headers=range_headers,
+            allow_redirects=True,
+            stream=True,
+        )
+        try:
+            sample = self._read_sample(response)
+            return self._classify_response(
+                response=response,
+                url=url,
+                method="range_get",
+                sample=sample,
+            )
+        finally:
+            close_fn = getattr(response, "close", None)
+            if callable(close_fn):
+                close_fn()
+
+    def _read_sample(self, response: Any) -> bytes:
+        sample = b""
+        iter_content = getattr(response, "iter_content", None)
+        if callable(iter_content):
+            for chunk in iter_content(chunk_size=self.range_bytes):
+                if not chunk:
+                    continue
+                sample += bytes(chunk)
+                if len(sample) >= self.range_bytes:
+                    break
+        elif getattr(response, "content", None) is not None:
+            sample = bytes(response.content[: self.range_bytes])
+        return sample[: self.range_bytes]
+
+    def _classify_response(
+        self,
+        *,
+        response: Any,
+        url: str,
+        method: str,
+        sample: bytes,
+    ) -> PdfProbeResult:
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        headers = dict(getattr(response, "headers", {}) or {})
+        content_type = str(headers.get("content-type") or "").split(";")[0].strip().lower()
+        content_disposition = str(headers.get("content-disposition") or "").strip() or None
+        sample_prefix = bytes(sample or b"").lstrip()
+        verdict = "non_pdf"
+        if status_code in {200, 206}:
+            if content_type == "application/pdf" or sample_prefix.startswith(b"%PDF-"):
+                verdict = "strong"
+            elif self._content_disposition_has_pdf_filename(content_disposition):
+                verdict = "weak"
+        return PdfProbeResult(
+            verdict=verdict,
+            method=method,
+            final_url=str(getattr(response, "url", "") or url),
+            status_code=status_code,
+            content_type=content_type or "application/octet-stream",
+            content_disposition=content_disposition,
+            redirect_count=len(getattr(response, "history", None) or []),
+        )
+
+    @staticmethod
+    def _content_disposition_has_pdf_filename(value: Optional[str]) -> bool:
+        text = str(value or "").strip().lower()
+        if ".pdf" not in text:
+            return False
+        return re.search(r"filename\*?=.*?\.pdf(?:[\"';\s]|$)", text) is not None

@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from prompts.react_reviewed import (
     build_proposer_action_prompt,
+    build_proposer_system_prompt,
     build_reviewer_action_prompt,
     build_screening_system_prompt,
 )
@@ -32,6 +33,7 @@ class ReactReviewedPromptTests(unittest.TestCase):
         prompt = build_proposer_action_prompt(
             tool_names=("plan_queries", "search_papers", "conclude"),
             retrieval_tools=("plan_queries", "search_papers"),
+            proposer_candidate_target=10,
             conclude_contract={
                 "tool_call_rule": "Call conclude with exactly {\"submission\": {...}}.",
                 "tool_call_example": {"submission": {"submission_id": "submission_cycle_1"}},
@@ -41,8 +43,25 @@ class ReactReviewedPromptTests(unittest.TestCase):
 
         self.assertIn("Allowed tools: plan_queries, search_papers, conclude.", prompt)
         self.assertIn("Treat these as retrieval/inspection tools: plan_queries, search_papers.", prompt)
+        self.assertIn("Proposer candidate target: 10 cumulative strict-PDF candidates within the current cycle.", prompt)
+        self.assertIn("cycle-level cumulative threshold", prompt)
         self.assertIn('Call conclude with exactly {"submission": {...}}.', prompt)
         self.assertIn('"submission_id": "submission_cycle_1"', prompt)
+        self.assertNotIn("Once one search_papers call has produced usable PDF-downloadable candidates", prompt)
+
+    def test_proposer_system_prompt_renders_candidate_target_threshold(self):
+        prompt = build_proposer_system_prompt(
+            proposer_candidate_target=8,
+            conclude_contract={
+                "tool_call_rule": "Call conclude with exactly {\"submission\": {...}}.",
+                "tool_call_example": {"submission": {"submission_id": "submission_cycle_1"}},
+                "invalid_examples": [{"payload": {"submission_id": "submission_cycle_1"}}],
+            },
+        )
+
+        self.assertIn("Proposer candidate target: 8 cumulative strict-PDF candidates within the current cycle.", prompt)
+        self.assertIn("cycle-level cumulative threshold", prompt)
+        self.assertNotIn("As soon as search_papers returns a usable PDF-downloadable candidate set", prompt)
 
     def test_reviewer_action_prompt_renders_template_placeholders(self):
         prompt = build_reviewer_action_prompt(

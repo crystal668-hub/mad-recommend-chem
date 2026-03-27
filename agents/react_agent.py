@@ -1044,6 +1044,16 @@ class ReActAgent:
         )
         propose_phase = bool(self._current_is_propose_phase)
         retrieval_budget = _parse_retrieval_budget_from_system_prompt(system_prompt or "")
+        action_phase_instruction = self._get_action_phase_instruction()
+        proposer_candidate_target = max(
+            1,
+            int(
+                _parse_proposer_candidate_target_from_prompt(
+                    "\n".join([str(system_prompt or ""), str(action_phase_instruction or "")])
+                )
+                or 1
+            ),
+        )
         retrieval_action_steps_used = 0
 
         # Local guards to reduce "self-looping" thought outputs.
@@ -2053,13 +2063,13 @@ class ReActAgent:
                     + [
                         (
                             HumanMessage(
-                                content=self._get_action_phase_instruction()
+                                content=action_phase_instruction
                                 + retry_hint
                                 + deadline_hint
                             )
                             if use_user_role_for_action
                             else SystemMessage(
-                                content=self._get_action_phase_instruction()
+                                content=action_phase_instruction
                                 + retry_hint
                                 + deadline_hint
                             )
@@ -2244,14 +2254,9 @@ class ReActAgent:
             )
             deadline_no_retrieval = bool(deadline_mode and remaining_steps == 2)
             prior_search_result_paper_ids = set()
-            prior_search_has_downloadable_candidate = False
+            prior_search_strict_candidate_ids = set()
             evidence_already_present = False
             downloaded_or_parsed_present = False
-
-            def _payload_has_downloadable_pdf_signal(item: Any) -> bool:
-                if not isinstance(item, dict):
-                    return False
-                return _url_has_pdf_signal(item.get("best_oa_pdf_url")) or _url_has_pdf_signal(item.get("oa_url"))
 
             for step in list(getattr(trajectory, "steps", []) or []):
                 for call in list(getattr(step, "tool_calls", []) or []):
@@ -2272,8 +2277,8 @@ class ReActAgent:
                                 paper_id = str(item.get("paper_id") or "").strip()
                                 if paper_id:
                                     prior_search_result_paper_ids.add(paper_id)
-                                if _payload_has_downloadable_pdf_signal(item):
-                                    prior_search_has_downloadable_candidate = True
+                                    if _payload_item_has_strict_proposer_pdf_candidate(item):
+                                        prior_search_strict_candidate_ids.add(paper_id)
                         for paper_id in list(payload.get("paper_ids") or []):
                             normalized_paper_id = str(paper_id or "").strip()
                             if normalized_paper_id:
@@ -2282,17 +2287,18 @@ class ReActAgent:
                         for item in payload:
                             if isinstance(item, dict):
                                 paper_id = str(item.get("paper_id") or "").strip()
-                                if _payload_has_downloadable_pdf_signal(item):
-                                    prior_search_has_downloadable_candidate = True
+                                if paper_id and _payload_item_has_strict_proposer_pdf_candidate(item):
+                                    prior_search_strict_candidate_ids.add(paper_id)
                             else:
                                 paper_id = str(item or "").strip()
                             if paper_id:
                                 prior_search_result_paper_ids.add(paper_id)
+            prior_search_strict_candidate_count = len(prior_search_strict_candidate_ids)
             phase_budget_requires_followup = bool(
                 structured_conclude_required
                 and not deadline_no_retrieval
                 and prior_search_result_paper_ids
-                and prior_search_has_downloadable_candidate
+                and prior_search_strict_candidate_count >= proposer_candidate_target
                 and not evidence_already_present
                 and not downloaded_or_parsed_present
             )
@@ -2894,6 +2900,28 @@ def _url_has_pdf_signal(value: Any) -> bool:
         if lowered_key in {"format", "type", "mime"} and any(
             item in {"pdf", "application/pdf"} for item in lowered_values
         ):
+            return True
+    return False
+
+
+def _url_is_strict_pdf_download(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    parsed = urlparse(text)
+    if parsed.query or parsed.fragment:
+        return False
+    return unquote(parsed.path or "").lower().endswith(".pdf")
+
+
+def _payload_item_has_strict_proposer_pdf_candidate(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    doi = str(item.get("doi") or "").strip()
+    if not doi:
+        return False
+    for key in ("open_access_pdf_url", "best_oa_pdf_url", "oa_url"):
+        if _url_is_strict_pdf_download(item.get(key)):
             return True
     return False
 
@@ -3530,6 +3558,31 @@ def _parse_retrieval_budget_from_system_prompt(system_prompt: str) -> Optional[i
         return int(word_map[token])
     try:
         return int(token)
+    except Exception:
+        return None
+
+
+def _parse_proposer_candidate_target_from_prompt(prompt_text: str) -> Optional[int]:
+    """
+    Parse the proposer candidate threshold from prompt text.
+
+    Expected stable marker:
+      - "Proposer candidate target: 10 cumulative strict-PDF candidates within the current cycle."
+    """
+    s = str(prompt_text or "")
+    if not s:
+        return None
+
+    m = re.search(
+        r"Proposer candidate target\s*:\s*(\d+)\b",
+        s,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+
+    try:
+        return int(m.group(1))
     except Exception:
         return None
 

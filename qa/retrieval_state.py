@@ -11,7 +11,7 @@ from qa.state import ConditionAxis, SourceSpan
 
 LaneType = Literal["review", "frontier", "data", "contrarian"]
 ProviderName = Literal["openalex", "crossref", "semantic_scholar", "unpaywall"]
-DiagnosticProviderName = Literal["openalex", "crossref", "semantic_scholar", "unpaywall", "oa_fetch"]
+DiagnosticProviderName = Literal["openalex", "crossref", "semantic_scholar", "unpaywall", "oa_fetch", "pdf_probe"]
 DiagnosticStage = Literal["search", "enrichment", "lookup", "fetch"]
 SectionType = Literal[
     "abstract",
@@ -99,6 +99,9 @@ class PaperCandidate(StrictModel):
     oa_eligible: bool = False
     oa_source: Optional[str] = None
     oa_signal_reason: Optional[str] = None
+    pdf_probe_verdict: Optional[Literal["strong", "weak"]] = None
+    pdf_probe_method: Optional[Literal["head", "range_get"]] = None
+    pdf_probe_final_url: Optional[str] = None
 
     @field_validator("authors", "provider_hits", "lane_sources", "fields_of_study", mode="before")
     @classmethod

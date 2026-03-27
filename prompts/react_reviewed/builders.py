@@ -65,9 +65,10 @@ def build_reviewer_thought_prompt() -> str:
     return "CURRENT PHASE: THOUGHT\nState the next audit target in one short sentence."
 
 
-def build_proposer_system_prompt(*, conclude_contract: Dict[str, Any]) -> str:
+def build_proposer_system_prompt(*, conclude_contract: Dict[str, Any], proposer_candidate_target: int) -> str:
     return render_template(
         "proposer_system.yaml",
+        proposer_candidate_target=str(proposer_candidate_target),
         tool_call_rule=str(conclude_contract.get("tool_call_rule") or ""),
         conclude_contract_json=json_block(conclude_contract),
         tool_call_example_json=json_block(conclude_contract.get("tool_call_example") or {}),
@@ -75,11 +76,18 @@ def build_proposer_system_prompt(*, conclude_contract: Dict[str, Any]) -> str:
     )
 
 
-def build_proposer_action_prompt(*, tool_names: Sequence[str], retrieval_tools: Sequence[str], conclude_contract: Dict[str, Any]) -> str:
+def build_proposer_action_prompt(
+    *,
+    tool_names: Sequence[str],
+    retrieval_tools: Sequence[str],
+    conclude_contract: Dict[str, Any],
+    proposer_candidate_target: int,
+) -> str:
     return render_template(
         "proposer_action.yaml",
         tool_names=", ".join(tool_names),
         retrieval_tools=", ".join(retrieval_tools),
+        proposer_candidate_target=str(proposer_candidate_target),
         tool_call_rule=str(conclude_contract.get("tool_call_rule") or ""),
         tool_call_example_json=json_block(conclude_contract.get("tool_call_example") or {}),
         invalid_examples_json=json_block(conclude_contract.get("invalid_examples") or []),

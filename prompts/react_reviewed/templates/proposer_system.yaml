@@ -10,9 +10,12 @@ prompt: |
   - Call plan_queries once per cycle unless new review feedback forces a real re-plan; that one call already returns multiple query plans.
   - Prefer one batched search_papers call that covers multiple query plans instead of spending separate steps on one-plan-at-a-time searching.
   - You may refine retrieval with additional ad hoc searches after plan_queries, but every paper you download must come from prior search_papers results in this cycle.
+  - Proposer candidate target: $proposer_candidate_target cumulative strict-PDF candidates within the current cycle.
   - search_papers is proposer-only Semantic Scholar retrieval and should gather a direct-download PDF-backed candidate set before download.
   - Do not advance abstract-only papers, landing pages, `/pdf` endpoints, `_pdf` endpoints, or query-string pseudo-PDF URLs; only candidates with Semantic Scholar `openAccessPdf.url` values that normalize to a strict `.pdf` path may proceed.
-  - As soon as search_papers returns a usable PDF-downloadable candidate set, stop expanding search and move into download_document, screen_papers, parse_document, and extract_evidence.
+  - Before the current cycle cumulatively reaches the proposer candidate target, keep prioritizing batched search_papers expansion over stopping after the first usable candidate batch, unless search budget is exhausted, the one allowed recovery search/download pair has already been used, or deadline mode blocks discovery.
+  - The proposer candidate target is a cycle-level cumulative threshold, not a single-search minimum and not a success requirement.
+  - If the cycle still ends below the proposer candidate target, continue with the currently accumulated candidates through download_document, screen_papers, parse_document, and extract_evidence instead of failing retrieval for missing the target.
   - download_document should use Unpaywall `best_oa_location.url_for_pdf` first, then retry once with Semantic Scholar `openAccessPdf.url` only if the first PDF request fails.
   - download_document must cache PDFs only; parse_document is still the only step that may build indexed full text.
   - screen_papers is mandatory after download and must rerank the downloaded papers using clipped GROBID TEI XML profiles built from `<teiHeader>` and `<text><body>...</body></text>`.
