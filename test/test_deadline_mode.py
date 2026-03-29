@@ -459,6 +459,125 @@ class DeadlineModeTests(unittest.TestCase):
             response.structured_output,
         )
 
+    def test_action_phase_instruction_callable_receives_step_context(self):
+        from agents.react_agent import ReActAgent, ToolResult
+
+        seen_calls = []
+
+        def _dynamic_action_instruction(**kwargs):
+            seen_calls.append(
+                {
+                    "step_number": kwargs.get("step_number"),
+                    "remaining_steps": kwargs.get("remaining_steps"),
+                    "max_steps": kwargs.get("max_steps"),
+                    "deadline_mode": kwargs.get("deadline_mode"),
+                }
+            )
+            return "CURRENT PHASE: ACTION\nYou must call tools."
+
+        class _TwoStepBackend:
+            def __init__(self) -> None:
+                self.action_calls = 0
+
+            def invoke(self, messages, *, tool_choice: str | None = None):
+                last_content = str(getattr(messages[-1], "content", "") or "")
+                if "CURRENT PHASE: THOUGHT" in last_content:
+                    return _AIMessage(content="Search once, then conclude.")
+                if tool_choice == "conclude":
+                    return _AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "id": "call_conclude_1",
+                                "name": "conclude",
+                                "args": {"submission": {"submission_id": "submission_cycle_1"}},
+                            }
+                        ],
+                    )
+                if "CURRENT PHASE: ACTION" in last_content:
+                    self.action_calls += 1
+                    if self.action_calls == 1:
+                        return _AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "id": "call_search_1",
+                                    "name": "search_papers",
+                                    "args": {"query": "pt/c her"},
+                                }
+                            ],
+                        )
+                    return _AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "id": "call_conclude_1",
+                                "name": "conclude",
+                                "args": {"submission": {"submission_id": "submission_cycle_1"}},
+                            }
+                        ],
+                    )
+                return _AIMessage(content="Thought.")
+
+        class _TwoStepLLM:
+            def __init__(self, backend: _TwoStepBackend, tool_choice: str | None = None):
+                self._backend = backend
+                self._tool_choice = tool_choice
+
+            def bind_tools(self, tools, tool_choice: str | None = None):
+                return _TwoStepLLM(self._backend, tool_choice=tool_choice)
+
+            def bind(self, tools=None, tool_choice: str | None = None):  # pragma: no cover
+                return self.bind_tools(tools, tool_choice=tool_choice)
+
+            def invoke(self, messages):
+                return self._backend.invoke(messages, tool_choice=self._tool_choice)
+
+        def _search(_payload):
+            return ToolResult(
+                observation='{"papers":[{"paper_id":"paper-1"}]}',
+                data={"papers": [{"paper_id": "paper-1"}]},
+            )
+
+        def _conclude(_payload):
+            return ToolResult(
+                observation='{"submission_id":"submission_cycle_1"}',
+                data={"__conclude_valid__": True, "submission": {"submission_id": "submission_cycle_1"}},
+            )
+
+        backend = _TwoStepBackend()
+        llm = _TwoStepLLM(backend)
+        search_tool = _InvokeTool(_search)
+        conclude_tool = _InvokeTool(_conclude)
+
+        with patch(
+            "agents.react_agent._lazy_langchain_imports",
+            return_value=(object, _SystemMessage, _HumanMessage, _AIMessage, _ToolMessage, object),
+        ):
+            agent = ReActAgent(
+                agent_id="dynamic-action",
+                name="test",
+                model_config={"deadline_mode": False},
+                rag_system=None,
+                experience_store=None,
+                system_prompt="",
+                max_react_steps=3,
+                verbose=False,
+                action_phase_instruction=_dynamic_action_instruction,
+            )
+
+            with patch.object(agent, "_get_llm", return_value=llm), patch.object(
+                agent,
+                "_build_tools",
+                return_value=([search_tool, conclude_tool], {"search_papers": search_tool, "conclude": conclude_tool}),
+            ):
+                agent.generate_response_with_react(query="Dynamic action instruction test.")
+
+        self.assertGreaterEqual(len(seen_calls), 2)
+        self.assertIn(1, [item["step_number"] for item in seen_calls])
+        self.assertIn(2, [item["step_number"] for item in seen_calls])
+        self.assertTrue(all(item["max_steps"] == 3 for item in seen_calls))
+
     def test_forced_conclude_free_text_keeps_structured_output_empty(self):
         from agents.react_agent import ReActAgent
 

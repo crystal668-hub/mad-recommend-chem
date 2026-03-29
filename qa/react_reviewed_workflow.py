@@ -1094,6 +1094,24 @@ class _ProposerRunState:
             if self.evidence_layers_by_id.get(evidence_id) == "fulltext"
         }
 
+    def parsed_paper_ids(self) -> List[str]:
+        return sorted(
+            paper_id
+            for paper_id, status in self.fulltext_status_by_paper.items()
+            if str(status or "").strip().lower() == "fulltext_indexed"
+        )
+
+    def locked_parsed_paper_ids(self) -> List[str]:
+        parsed = set(self.parsed_paper_ids())
+        return [paper_id for paper_id in self.locked_candidate_paper_ids if paper_id in parsed]
+
+    def locked_evidence_paper_ids(self) -> List[str]:
+        return [
+            paper_id
+            for paper_id in self.locked_candidate_paper_ids
+            if bool(self.evidence_ids_by_paper.get(paper_id))
+        ]
+
     def prompt_payload(self) -> Dict[str, Any]:
         return {
             "evidence_policy": self.evidence_policy,
@@ -1107,6 +1125,9 @@ class _ProposerRunState:
             "locked_candidate_paper_ids": list(self.locked_candidate_paper_ids),
             "dropped_candidate_paper_ids": list(self.dropped_candidate_paper_ids),
             "acquired_paper_ids": sorted(self.acquired_paper_ids),
+            "parsed_paper_ids": self.parsed_paper_ids(),
+            "locked_parsed_paper_ids": self.locked_parsed_paper_ids(),
+            "locked_evidence_paper_ids": self.locked_evidence_paper_ids(),
             "evidence_ids": sorted(self.evidence_ids),
             "candidate_screening": copy.deepcopy(self.candidate_screening),
             "candidate_profiles": copy.deepcopy(self.candidate_profiles),
@@ -3005,6 +3026,71 @@ class ReactReviewedWorkspace:
             write_snapshot=write_snapshot,
         )
 
+    def parse_documents(
+        self,
+        *,
+        paper_id: Optional[str] = None,
+        paper_ids: Optional[Sequence[str]] = None,
+        artifact_store: Optional[QAArtifactStore] = None,
+        requested_via: Optional[str] = None,
+        write_snapshot: bool = True,
+    ) -> Dict[str, Any]:
+        normalized_paper_ids = self._canonical_paper_id_batch(paper_id=paper_id, paper_ids=paper_ids)
+        if not normalized_paper_ids:
+            raise ValueError("parse_document requires paper_id or paper_ids.")
+        documents_by_paper: Dict[str, Dict[str, Any]] = {}
+        parse_warnings: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=max(1, min(len(normalized_paper_ids), 4))) as executor:
+            future_map = {
+                executor.submit(
+                    self.parse_document,
+                    paper_id=current_paper_id,
+                    artifact_store=artifact_store,
+                    session=None,
+                    charge_budget=False,
+                    requested_via=requested_via or "parse_document",
+                    write_snapshot=False,
+                ): current_paper_id
+                for current_paper_id in normalized_paper_ids
+            }
+            for future, current_paper_id in list(future_map.items()):
+                try:
+                    documents_by_paper[current_paper_id] = dict(future.result() or {})
+                except Exception as exc:
+                    parse_warnings.append(
+                        {
+                            "paper_id": current_paper_id,
+                            "status": "failure",
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
+                    )
+        documents = [
+            documents_by_paper[current_paper_id]
+            for current_paper_id in normalized_paper_ids
+            if current_paper_id in documents_by_paper
+        ]
+        if not documents and parse_warnings and len(parse_warnings) == len(normalized_paper_ids):
+            raise RuntimeError(
+                "batch parse failed for all papers: "
+                + "; ".join(
+                    f"{item.get('paper_id')}: {item.get('error') or item.get('error_type') or 'unknown'}"
+                    for item in parse_warnings
+                )
+            )
+        result = {
+            "documents": documents,
+            "parse_warnings": parse_warnings,
+            "batch_summary": {
+                "requested_count": len(normalized_paper_ids),
+                "successful_count": len(documents),
+                "failed_count": len(parse_warnings),
+            },
+        }
+        if write_snapshot:
+            self._write_retrieval_snapshot()
+        return result
+
     def _ensure_document(
         self,
         paper_id: str,
@@ -3224,6 +3310,75 @@ class ReactReviewedWorkspace:
             self._section_read_cache[cache_key] = copy.deepcopy(payloads)
         return payloads
 
+    def read_sections_batch(
+        self,
+        *,
+        paper_id: Optional[str] = None,
+        paper_ids: Optional[Sequence[str]] = None,
+        section_ids: Optional[Sequence[str]] = None,
+        preferred_sections: bool = False,
+        artifact_store: Optional[QAArtifactStore] = None,
+        requested_via: Optional[str] = None,
+        write_snapshot: bool = True,
+    ) -> Dict[str, Any]:
+        normalized_paper_ids = self._canonical_paper_id_batch(paper_id=paper_id, paper_ids=paper_ids)
+        if not normalized_paper_ids:
+            raise ValueError("read_sections requires paper_id or paper_ids.")
+        if len(normalized_paper_ids) > 1 and list(section_ids or []):
+            raise ValueError("Batch read_sections does not support section_ids; omit them when using paper_ids.")
+        sections_by_paper: Dict[str, List[Dict[str, Any]]] = {}
+        section_warnings: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=max(1, min(len(normalized_paper_ids), 4))) as executor:
+            future_map = {
+                executor.submit(
+                    self.read_sections,
+                    paper_id=current_paper_id,
+                    section_ids=section_ids,
+                    preferred_sections=preferred_sections,
+                    artifact_store=artifact_store,
+                    session=None,
+                    charge_budget=False,
+                    requested_via=requested_via or "read_sections",
+                    write_snapshot=False,
+                ): current_paper_id
+                for current_paper_id in normalized_paper_ids
+            }
+            for future, current_paper_id in list(future_map.items()):
+                try:
+                    sections_by_paper[current_paper_id] = list(future.result() or [])
+                except Exception as exc:
+                    section_warnings.append(
+                        {
+                            "paper_id": current_paper_id,
+                            "status": "failure",
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
+                    )
+        sections: List[Dict[str, Any]] = []
+        for current_paper_id in normalized_paper_ids:
+            sections.extend(sections_by_paper.get(current_paper_id, []))
+        if not sections and section_warnings and len(section_warnings) == len(normalized_paper_ids):
+            raise RuntimeError(
+                "batch read_sections failed for all papers: "
+                + "; ".join(
+                    f"{item.get('paper_id')}: {item.get('error') or item.get('error_type') or 'unknown'}"
+                    for item in section_warnings
+                )
+            )
+        result = {
+            "sections": sections,
+            "section_warnings": section_warnings,
+            "batch_summary": {
+                "requested_count": len(normalized_paper_ids),
+                "successful_count": len(sections_by_paper),
+                "failed_count": len(section_warnings),
+            },
+        }
+        if write_snapshot:
+            self._write_retrieval_snapshot()
+        return result
+
     def extract_evidence(
         self,
         *,
@@ -3345,6 +3500,75 @@ class ReactReviewedWorkspace:
                     error=exc,
                 )
                 raise
+        if write_snapshot:
+            self._write_retrieval_snapshot()
+        return result
+
+    def extract_evidence_batch(
+        self,
+        *,
+        paper_id: Optional[str] = None,
+        paper_ids: Optional[Sequence[str]] = None,
+        section_ids: Optional[Sequence[str]] = None,
+        preferred_sections: bool = False,
+        artifact_store: Optional[QAArtifactStore] = None,
+        requested_via: Optional[str] = None,
+        write_snapshot: bool = True,
+    ) -> Dict[str, Any]:
+        normalized_paper_ids = self._canonical_paper_id_batch(paper_id=paper_id, paper_ids=paper_ids)
+        if not normalized_paper_ids:
+            raise ValueError("extract_evidence requires paper_id or paper_ids.")
+        if len(normalized_paper_ids) > 1 and list(section_ids or []):
+            raise ValueError("Batch extract_evidence does not support section_ids; omit them when using paper_ids.")
+        evidence_by_paper: Dict[str, List[Dict[str, Any]]] = {}
+        evidence_warnings: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=max(1, min(len(normalized_paper_ids), 4))) as executor:
+            future_map = {
+                executor.submit(
+                    self.extract_evidence,
+                    paper_id=current_paper_id,
+                    section_ids=section_ids,
+                    preferred_sections=preferred_sections,
+                    artifact_store=artifact_store,
+                    session=None,
+                    charge_budget=False,
+                    requested_via=requested_via or "extract_evidence",
+                    write_snapshot=False,
+                ): current_paper_id
+                for current_paper_id in normalized_paper_ids
+            }
+            for future, current_paper_id in list(future_map.items()):
+                try:
+                    evidence_by_paper[current_paper_id] = list(future.result() or [])
+                except Exception as exc:
+                    evidence_warnings.append(
+                        {
+                            "paper_id": current_paper_id,
+                            "status": "failure",
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
+                    )
+        evidence: List[Dict[str, Any]] = []
+        for current_paper_id in normalized_paper_ids:
+            evidence.extend(evidence_by_paper.get(current_paper_id, []))
+        if not evidence and evidence_warnings and len(evidence_warnings) == len(normalized_paper_ids):
+            raise RuntimeError(
+                "batch extract_evidence failed for all papers: "
+                + "; ".join(
+                    f"{item.get('paper_id')}: {item.get('error') or item.get('error_type') or 'unknown'}"
+                    for item in evidence_warnings
+                )
+            )
+        result = {
+            "evidence": evidence,
+            "evidence_warnings": evidence_warnings,
+            "batch_summary": {
+                "requested_count": len(normalized_paper_ids),
+                "successful_count": len(evidence_by_paper),
+                "failed_count": len(evidence_warnings),
+            },
+        }
         if write_snapshot:
             self._write_retrieval_snapshot()
         return result
@@ -4282,88 +4506,179 @@ class ReactReviewedProposerAgent:
             run_state.record_acquisition(payload)
             return ToolResult(observation=_json_preview(payload), data=payload)
 
-        def parse_document(paper_id: str) -> ToolResult:
+        def _validate_requested_papers(
+            *,
+            tool_name: str,
+            paper_id: Optional[str] = None,
+            paper_ids: Optional[List[str]] = None,
+            require_locked: bool = False,
+            require_parsed: bool = False,
+        ) -> Tuple[Optional[ToolResult], List[str]]:
+            requested_paper_ids = workspace._canonical_paper_id_batch(paper_id=paper_id, paper_ids=paper_ids)
+            if not requested_paper_ids:
+                return (
+                    _policy_block(
+                        f"{tool_name} requires paper_id or paper_ids.",
+                        code="paper_id_required",
+                    ),
+                    [],
+                )
+            missing_downloads = [
+                current_paper_id
+                for current_paper_id in requested_paper_ids
+                if current_paper_id not in run_state.acquired_paper_ids
+            ]
+            if missing_downloads:
+                return (
+                    _policy_block(
+                        f"{tool_name} requires download_document first for paper_ids={missing_downloads}.",
+                        code="paper_not_downloaded",
+                    ),
+                    [],
+                )
+            if require_parsed:
+                not_parsed = [
+                    current_paper_id
+                    for current_paper_id in requested_paper_ids
+                    if str(run_state.fulltext_status_by_paper.get(current_paper_id) or "").strip().lower() != "fulltext_indexed"
+                ]
+                if not_parsed:
+                    return (
+                        _policy_block(
+                            f"{tool_name} requires parse_document first for paper_ids={not_parsed}.",
+                            code="paper_not_parsed",
+                        ),
+                        [],
+                    )
+            if require_locked and run_state.locked_candidate_paper_ids:
+                locked_set = set(run_state.locked_candidate_paper_ids)
+                not_locked = [
+                    current_paper_id
+                    for current_paper_id in requested_paper_ids
+                    if current_paper_id not in locked_set
+                ]
+                if not_locked:
+                    return (
+                        _policy_block(
+                            f"{tool_name} requires papers locked by screen_papers; paper_ids={not_locked} were not locked.",
+                            code="paper_not_screen_locked",
+                        ),
+                        [],
+                    )
+            return None, requested_paper_ids
+
+        def parse_document(
+            paper_id: Optional[str] = None,
+            paper_ids: Optional[List[str]] = None,
+        ) -> ToolResult:
             """Parse a downloaded paper into indexed sections after reranking selects it."""
-            normalized_paper_id = str(paper_id or "").strip()
-            if normalized_paper_id not in run_state.acquired_paper_ids:
-                return _policy_block(
-                    f"parse_document requires download_document first for paper_id={normalized_paper_id}.",
-                    code="paper_not_downloaded",
-                )
-            if run_state.locked_candidate_paper_ids and normalized_paper_id not in set(run_state.locked_candidate_paper_ids):
-                return _policy_block(
-                    f"parse_document requires a paper locked by screen_papers; paper_id={normalized_paper_id} was not locked.",
-                    code="paper_not_screen_locked",
-                )
-            payload = workspace.parse_document(paper_id=paper_id)
+            policy_result, requested_paper_ids = _validate_requested_papers(
+                tool_name="parse_document",
+                paper_id=paper_id,
+                paper_ids=paper_ids,
+                require_locked=True,
+            )
+            if policy_result is not None:
+                return policy_result
+            payload = (
+                workspace.parse_documents(paper_ids=requested_paper_ids)
+                if len(requested_paper_ids) > 1
+                else workspace.parse_document(paper_id=requested_paper_ids[0])
+            )
             run_state.record_acquisition(payload)
             return ToolResult(observation=_json_preview(payload), data=payload)
 
         def read_sections(
-            paper_id: str,
+            paper_id: Optional[str] = None,
+            paper_ids: Optional[List[str]] = None,
             section_ids: Optional[List[str]] = None,
             preferred_sections: bool = False,
         ) -> ToolResult:
             """Read indexed sections from a parsed paper."""
-            normalized_paper_id = str(paper_id or "").strip()
-            if normalized_paper_id not in run_state.acquired_paper_ids:
+            if paper_ids and section_ids:
                 return _policy_block(
-                    f"read_sections requires download_document first for paper_id={normalized_paper_id}.",
-                    code="paper_not_downloaded",
+                    "read_sections does not support section_ids when batching with paper_ids.",
+                    code="batch_section_ids_not_supported",
                 )
-            if str(run_state.fulltext_status_by_paper.get(normalized_paper_id) or "").strip().lower() != "fulltext_indexed":
-                return _policy_block(
-                    f"read_sections requires parse_document first for paper_id={normalized_paper_id}.",
-                    code="paper_not_parsed",
-                )
-            payload = workspace.read_sections(
+            policy_result, requested_paper_ids = _validate_requested_papers(
+                tool_name="read_sections",
                 paper_id=paper_id,
-                section_ids=section_ids,
-                preferred_sections=preferred_sections,
+                paper_ids=paper_ids,
+                require_parsed=True,
             )
-            run_state.record_sections(normalized_paper_id, payload)
+            if policy_result is not None:
+                return policy_result
+            if len(requested_paper_ids) > 1:
+                batch_payload = workspace.read_sections_batch(
+                    paper_ids=requested_paper_ids,
+                    preferred_sections=preferred_sections,
+                )
+                payload = list(batch_payload.get("sections") or [])
+            else:
+                payload = workspace.read_sections(
+                    paper_id=requested_paper_ids[0],
+                    section_ids=section_ids,
+                    preferred_sections=preferred_sections,
+                )
+            for current_paper_id in requested_paper_ids:
+                run_state.record_sections(
+                    current_paper_id,
+                    [item for item in payload if str(item.get("paper_id") or "").strip() == current_paper_id],
+                )
             return ToolResult(
                 observation=_json_preview(
                     {
                         "count": len(payload),
-                        "section_ids": [item.get("section_id") for item in payload],
+                        "paper_ids": requested_paper_ids,
+                        "section_ids": [item.get("section_id") for item in payload[:10]],
                     }
                 ),
                 data={"sections": payload},
             )
 
         def extract_evidence(
-            paper_id: str,
+            paper_id: Optional[str] = None,
+            paper_ids: Optional[List[str]] = None,
             section_ids: Optional[List[str]] = None,
             preferred_sections: bool = False,
         ) -> ToolResult:
             """Extract stable evidence items from selected paper sections."""
-            normalized_paper_id = str(paper_id or "").strip()
-            if normalized_paper_id not in run_state.acquired_paper_ids:
+            if paper_ids and section_ids:
                 return _policy_block(
-                    f"extract_evidence requires download_document first for paper_id={normalized_paper_id}.",
-                    code="paper_not_downloaded",
+                    "extract_evidence does not support section_ids when batching with paper_ids.",
+                    code="batch_section_ids_not_supported",
                 )
-            if str(run_state.fulltext_status_by_paper.get(normalized_paper_id) or "").strip().lower() != "fulltext_indexed":
-                return _policy_block(
-                    f"extract_evidence requires parse_document first for paper_id={normalized_paper_id}.",
-                    code="paper_not_parsed",
-                )
-            if run_state.locked_candidate_paper_ids and normalized_paper_id not in set(run_state.locked_candidate_paper_ids):
-                return _policy_block(
-                    f"extract_evidence requires a paper locked by screen_papers; paper_id={normalized_paper_id} was not locked.",
-                    code="paper_not_screen_locked",
-                )
-            payload = workspace.extract_evidence(
+            policy_result, requested_paper_ids = _validate_requested_papers(
+                tool_name="extract_evidence",
                 paper_id=paper_id,
-                section_ids=section_ids,
-                preferred_sections=preferred_sections,
+                paper_ids=paper_ids,
+                require_locked=True,
+                require_parsed=True,
             )
-            run_state.record_evidence(normalized_paper_id, payload)
+            if policy_result is not None:
+                return policy_result
+            if len(requested_paper_ids) > 1:
+                batch_payload = workspace.extract_evidence_batch(
+                    paper_ids=requested_paper_ids,
+                    preferred_sections=preferred_sections,
+                )
+                payload = list(batch_payload.get("evidence") or [])
+            else:
+                payload = workspace.extract_evidence(
+                    paper_id=requested_paper_ids[0],
+                    section_ids=section_ids,
+                    preferred_sections=preferred_sections,
+                )
+            for current_paper_id in requested_paper_ids:
+                run_state.record_evidence(
+                    current_paper_id,
+                    [item for item in payload if str(item.get("paper_id") or "").strip() == current_paper_id],
+                )
             return ToolResult(
                 observation=_json_preview(
                     {
                         "count": len(payload),
+                        "paper_ids": requested_paper_ids,
                         "evidence_ids": [item.get("evidence_id") for item in payload[:5]],
                     }
                 ),
@@ -4459,9 +4774,9 @@ class ReactReviewedProposerAgent:
             StructuredTool.from_function(search_papers, name="search_papers", args_schema=tool_schemas.SearchPapersToolInput),
             StructuredTool.from_function(download_document, name="download_document", args_schema=tool_schemas.DownloadDocumentToolInput),
             StructuredTool.from_function(screen_papers, name="screen_papers", args_schema=configured_screen_tool_schema),
-            StructuredTool.from_function(parse_document, name="parse_document", args_schema=tool_schemas.ParseDocumentToolInput),
-            StructuredTool.from_function(read_sections, name="read_sections", args_schema=tool_schemas.SectionAccessToolInput),
-            StructuredTool.from_function(extract_evidence, name="extract_evidence", args_schema=tool_schemas.SectionAccessToolInput),
+            StructuredTool.from_function(parse_document, name="parse_document", args_schema=tool_schemas.ProposerParseDocumentToolInput),
+            StructuredTool.from_function(read_sections, name="read_sections", args_schema=tool_schemas.ProposerSectionAccessToolInput),
+            StructuredTool.from_function(extract_evidence, name="extract_evidence", args_schema=tool_schemas.ProposerSectionAccessToolInput),
             StructuredTool.from_function(
                 fetch_citation_context,
                 name="fetch_citation_context",
@@ -4490,6 +4805,19 @@ class ReactReviewedProposerAgent:
             open_review_items=open_review_items,
         )
         system_prompt = self._build_system_prompt(conclude_call_contract=conclude_call_contract)
+        def _dynamic_action_instruction(**kwargs: Any) -> str:
+            runtime_guidance = self._runtime_action_guidance(
+                run_state=run_state,
+                step_number=int(kwargs.get("step_number") or 1),
+                remaining_steps=int(kwargs.get("remaining_steps") or 0),
+                max_steps=int(kwargs.get("max_steps") or self.max_steps_initial),
+                deadline_mode=bool(kwargs.get("deadline_mode", True)),
+            )
+            return self._action_instruction(
+                PROPOSER_TOOL_NAMES,
+                conclude_call_contract=conclude_call_contract,
+                runtime_guidance=runtime_guidance,
+            )
         try:
             agent = ReActAgent(
                 agent_id="qa_react_proposer",
@@ -4500,10 +4828,7 @@ class ReactReviewedProposerAgent:
                 verbose=False,
                 tools=tools,
                 thought_phase_instruction=self._thought_instruction(),
-                action_phase_instruction=self._action_instruction(
-                    PROPOSER_TOOL_NAMES,
-                    conclude_call_contract=conclude_call_contract,
-                ),
+                action_phase_instruction=_dynamic_action_instruction,
                 search_tool_names=[
                     "plan_queries",
                     "search_papers",
@@ -6103,13 +6428,109 @@ class ReactReviewedProposerAgent:
     def _thought_instruction(self) -> str:
         return build_proposer_thought_prompt()
 
-    def _action_instruction(self, tool_names: Sequence[str], *, conclude_call_contract: Dict[str, Any]) -> str:
+    def _runtime_action_guidance(
+        self,
+        *,
+        run_state: _ProposerRunState,
+        step_number: int,
+        remaining_steps: int,
+        max_steps: int,
+        deadline_mode: bool,
+    ) -> Dict[str, Any]:
+        locked_paper_ids = list(run_state.locked_candidate_paper_ids)
+        parsed_locked_paper_ids = run_state.locked_parsed_paper_ids()
+        locked_evidence_paper_ids = run_state.locked_evidence_paper_ids()
+        recovery_available = bool(
+            run_state.latest_screen_status == "input_exhausted"
+            and run_state.latest_screen_failure_domain == "pdf_input"
+            and run_state.screening_input_exhaustions <= 1
+            and not run_state.has_any_evidence()
+            and not locked_paper_ids
+        )
+
+        if not run_state.query_plan_ids:
+            current_stage = "planning"
+            exit_criteria = "Leave planning immediately after one plan_queries call returns reusable query_plan_ids."
+            recommended_next_tools = ["plan_queries"]
+            avoid_actions = ["Do not call search_papers before plan_queries."]
+        elif run_state.has_any_evidence() or remaining_steps <= 3:
+            current_stage = "closeout"
+            exit_criteria = "Stay in closeout once at least one evidence anchor exists or only a few steps remain."
+            recommended_next_tools = ["conclude"]
+            if locked_paper_ids and not locked_evidence_paper_ids:
+                recommended_next_tools.insert(0, "extract_evidence")
+            elif parsed_locked_paper_ids and not locked_evidence_paper_ids:
+                recommended_next_tools.insert(0, "extract_evidence")
+            elif parsed_locked_paper_ids and len(parsed_locked_paper_ids) < len(locked_paper_ids):
+                recommended_next_tools.insert(0, "parse_document")
+            avoid_actions = ["Do not restart broad discovery unless screen_papers explicitly returned input_exhausted/pdf_input."]
+        elif locked_paper_ids and not parsed_locked_paper_ids:
+            current_stage = "parsing"
+            exit_criteria = "Exit parsing after every currently locked paper is indexed or a parse failure is observed."
+            recommended_next_tools = ["parse_document"]
+            avoid_actions = ["Do not spend this step on new search/download while locked papers remain unparsed."]
+        elif parsed_locked_paper_ids and not locked_evidence_paper_ids:
+            current_stage = "evidence_extraction"
+            exit_criteria = "Exit evidence extraction after at least one stable evidence anchor is recorded."
+            recommended_next_tools = ["extract_evidence", "read_sections"]
+            avoid_actions = ["Do not expand search/download until locked parsed papers have been mined for evidence."]
+        else:
+            current_stage = "acquisition_or_screening"
+            exit_criteria = "Leave acquisition/screening only after one search, one download, and one screen pass have either locked papers or explicitly exhausted PDF input."
+            if not run_state.searched_paper_ids:
+                recommended_next_tools = ["search_papers"]
+                avoid_actions = ["Do not spend extra steps on replanning; reuse the current query plans."]
+            elif not run_state.acquired_paper_ids:
+                recommended_next_tools = ["download_document"]
+                avoid_actions = ["Do not run another search before downloading the current cycle's searched papers."]
+            elif run_state.screening_required():
+                recommended_next_tools = ["screen_papers"]
+                avoid_actions = ["Do not parse or extract before screen_papers locks candidates."]
+            elif recovery_available:
+                recommended_next_tools = ["search_papers", "download_document", "screen_papers"]
+                avoid_actions = ["Only use one recovery search/download pair, then stop expanding."]
+            else:
+                recommended_next_tools = ["screen_papers"]
+                avoid_actions = ["Do not keep broad discovery open once the current cycle can be screened."]
+
+        if deadline_mode and remaining_steps <= 2:
+            avoid_actions.append("Deadline mode is active; do not call broad discovery tools when only 2 steps remain.")
+
+        return {
+            "current_stage": current_stage,
+            "exit_criteria": exit_criteria,
+            "recommended_next_tools": recommended_next_tools,
+            "avoid_actions": avoid_actions,
+            "budget_snapshot": {
+                "step_number": int(step_number),
+                "remaining_steps": int(remaining_steps),
+                "max_steps": int(max_steps),
+                "query_planned": bool(run_state.query_plan_ids),
+                "search_rounds_used": int(run_state.search_generation),
+                "download_rounds_used": int(run_state.acquisition_generation),
+                "screen_rounds_used": int(run_state.screening_generation),
+                "locked_paper_ids": list(locked_paper_ids),
+                "parsed_locked_paper_ids": list(parsed_locked_paper_ids),
+                "evidence_anchor_count": len(run_state.evidence_ids),
+                "screening_required": bool(run_state.screening_required()),
+                "recovery_search_download_available": recovery_available,
+            },
+        }
+
+    def _action_instruction(
+        self,
+        tool_names: Sequence[str],
+        *,
+        conclude_call_contract: Dict[str, Any],
+        runtime_guidance: Optional[Dict[str, Any]] = None,
+    ) -> str:
         retrieval_tools = [name for name in tool_names if name not in {"analyze_submission_gap", "conclude"}]
         return build_proposer_action_prompt(
             tool_names=tool_names,
             retrieval_tools=retrieval_tools,
             conclude_contract=conclude_call_contract,
             proposer_candidate_target=self.proposer_candidate_target,
+            runtime_guidance=runtime_guidance,
         )
 
     def _add_tool_step(

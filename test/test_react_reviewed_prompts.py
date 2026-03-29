@@ -49,6 +49,43 @@ class ReactReviewedPromptTests(unittest.TestCase):
         self.assertIn('"submission_id": "submission_cycle_1"', prompt)
         self.assertNotIn("Once one search_papers call has produced usable PDF-downloadable candidates", prompt)
 
+    def test_proposer_action_prompt_renders_runtime_guidance_block(self):
+        prompt = build_proposer_action_prompt(
+            tool_names=("parse_document", "extract_evidence", "conclude"),
+            retrieval_tools=("parse_document", "extract_evidence"),
+            proposer_candidate_target=10,
+            runtime_guidance={
+                "current_stage": "evidence_extraction",
+                "exit_criteria": "Leave only after at least one evidence anchor is recorded.",
+                "recommended_next_tools": ["extract_evidence", "conclude"],
+                "avoid_actions": ["Do not restart search/download."],
+                "budget_snapshot": {
+                    "step_number": 6,
+                    "remaining_steps": 4,
+                    "max_steps": 10,
+                    "query_planned": True,
+                    "search_rounds_used": 1,
+                    "download_rounds_used": 1,
+                    "screen_rounds_used": 1,
+                    "locked_paper_ids": ["paper-1", "paper-2"],
+                    "parsed_locked_paper_ids": ["paper-1", "paper-2"],
+                    "evidence_anchor_count": 0,
+                    "screening_required": False,
+                    "recovery_search_download_available": False,
+                },
+            },
+            conclude_contract={
+                "tool_call_rule": "Call conclude with exactly {\"submission\": {...}}.",
+                "tool_call_example": {"submission": {"submission_id": "submission_cycle_1"}},
+                "invalid_examples": [{"payload": {"submission_id": "submission_cycle_1"}}],
+            },
+        )
+
+        self.assertIn("Runtime budget snapshot:", prompt)
+        self.assertIn("Current stage: evidence_extraction.", prompt)
+        self.assertIn("Recommended next tools: extract_evidence, conclude.", prompt)
+        self.assertIn("Avoid this step: Do not restart search/download.", prompt)
+
     def test_proposer_system_prompt_renders_candidate_target_threshold(self):
         prompt = build_proposer_system_prompt(
             proposer_candidate_target=8,

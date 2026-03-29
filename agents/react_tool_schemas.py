@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Literal, Optional, Type
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, StrictStr, model_validator
 
 
 class ToolArgsModel(BaseModel):
@@ -78,8 +78,31 @@ class DownloadDocumentToolInput(ToolArgsModel):
     )
 
 
+class _ProposerPaperSelectionToolInput(ToolArgsModel):
+    paper_id: Optional[StrictStr] = Field(
+        default=None,
+        description="Optional stable paper identifier from search_papers.",
+    )
+    paper_ids: List[StrictStr] = Field(
+        default_factory=list,
+        description="Optional stable paper identifiers to process in one batch call.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_paper_selection(self) -> "_ProposerPaperSelectionToolInput":
+        has_single = bool(str(self.paper_id or "").strip())
+        has_batch = bool(list(self.paper_ids or []))
+        if has_single == has_batch:
+            raise ValueError("Provide exactly one of `paper_id` or `paper_ids`.")
+        return self
+
+
 class ParseDocumentToolInput(ToolArgsModel):
-    paper_id: StrictStr = Field(description="Stable paper identifier from search_papers.")
+    paper_id: StrictStr = Field(description="Stable paper identifier from parse_document.")
+
+
+class ProposerParseDocumentToolInput(_ProposerPaperSelectionToolInput):
+    pass
 
 
 class SectionAccessToolInput(ToolArgsModel):
@@ -92,6 +115,23 @@ class SectionAccessToolInput(ToolArgsModel):
         default=False,
         description="Whether to prefer the system's recommended sections.",
     )
+
+
+class ProposerSectionAccessToolInput(_ProposerPaperSelectionToolInput):
+    section_ids: List[StrictStr] = Field(
+        default_factory=list,
+        description="Optional stable section identifiers to target. Batch access requires this to be empty.",
+    )
+    preferred_sections: StrictBool = Field(
+        default=False,
+        description="Whether to prefer the system's recommended sections.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_batch_section_access(self) -> "ProposerSectionAccessToolInput":
+        if list(self.paper_ids or []) and list(self.section_ids or []):
+            raise ValueError("Batch section access does not support `section_ids`; omit them when using `paper_ids`.")
+        return self
 
 
 class FetchCitationContextToolInput(ToolArgsModel):

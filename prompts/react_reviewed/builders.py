@@ -5,6 +5,62 @@ from typing import Any, Dict, Optional, Sequence
 from prompts.react_reviewed.render import json_block, json_preview, render_template
 
 
+def _render_proposer_runtime_guidance_block(runtime_guidance: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(runtime_guidance, dict) or not runtime_guidance:
+        return ""
+
+    def _ensure_sentence(text: str) -> str:
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return cleaned
+        if cleaned.endswith((".", "!", "?")):
+            return cleaned
+        return cleaned + "."
+
+    budget_snapshot = dict(runtime_guidance.get("budget_snapshot") or {})
+    recommended_next_tools = [
+        str(item).strip()
+        for item in list(runtime_guidance.get("recommended_next_tools") or [])
+        if str(item).strip()
+    ]
+    avoid_actions = [
+        str(item).strip()
+        for item in list(runtime_guidance.get("avoid_actions") or [])
+        if str(item).strip()
+    ]
+
+    lines = [
+        "",
+        "Runtime budget snapshot:",
+        (
+            f"- Action step {budget_snapshot.get('step_number', '?')} of {budget_snapshot.get('max_steps', '?')}; "
+            f"remaining steps: {budget_snapshot.get('remaining_steps', '?')}."
+        ),
+        (
+            f"- Query planned: {budget_snapshot.get('query_planned', False)}; "
+            f"search rounds: {budget_snapshot.get('search_rounds_used', 0)}; "
+            f"download rounds: {budget_snapshot.get('download_rounds_used', 0)}; "
+            f"screenings: {budget_snapshot.get('screen_rounds_used', 0)}."
+        ),
+        (
+            f"- Locked papers: {budget_snapshot.get('locked_paper_ids', [])}; "
+            f"parsed locked papers: {budget_snapshot.get('parsed_locked_paper_ids', [])}; "
+            f"evidence anchors: {budget_snapshot.get('evidence_anchor_count', 0)}."
+        ),
+        (
+            f"- Screening required now: {budget_snapshot.get('screening_required', False)}; "
+            f"recovery search/download available: {budget_snapshot.get('recovery_search_download_available', False)}."
+        ),
+        f"Current stage: {runtime_guidance.get('current_stage', 'unknown')}.",
+        "Exit criteria: " + _ensure_sentence(str(runtime_guidance.get("exit_criteria") or "")),
+    ]
+    if recommended_next_tools:
+        lines.append("Recommended next tools: " + ", ".join(recommended_next_tools) + ".")
+    if avoid_actions:
+        lines.append("Avoid this step: " + " ".join(_ensure_sentence(item) for item in avoid_actions))
+    return "\n".join(lines).rstrip()
+
+
 def build_proposer_user_prompt(
     *,
     cycle_number: int,
@@ -82,12 +138,14 @@ def build_proposer_action_prompt(
     retrieval_tools: Sequence[str],
     conclude_contract: Dict[str, Any],
     proposer_candidate_target: int,
+    runtime_guidance: Optional[Dict[str, Any]] = None,
 ) -> str:
     return render_template(
         "proposer_action.yaml",
         tool_names=", ".join(tool_names),
         retrieval_tools=", ".join(retrieval_tools),
         proposer_candidate_target=str(proposer_candidate_target),
+        runtime_guidance_block=_render_proposer_runtime_guidance_block(runtime_guidance),
         tool_call_rule=str(conclude_contract.get("tool_call_rule") or ""),
         tool_call_example_json=json_block(conclude_contract.get("tool_call_example") or {}),
         invalid_examples_json=json_block(conclude_contract.get("invalid_examples") or []),

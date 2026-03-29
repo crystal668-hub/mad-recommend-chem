@@ -13,12 +13,13 @@ prompt: |
   - Proposer candidate target: $proposer_candidate_target cumulative strict-PDF candidates within the current cycle.
   - search_papers is proposer-only Semantic Scholar retrieval and should gather a direct-download PDF-backed candidate set before download.
   - Do not advance abstract-only papers, landing pages, `/pdf` endpoints, `_pdf` endpoints, or query-string pseudo-PDF URLs; only candidates with Semantic Scholar `openAccessPdf.url` values that normalize to a strict `.pdf` path may proceed.
-  - Before the current cycle cumulatively reaches the proposer candidate target, keep prioritizing batched search_papers expansion over stopping after the first usable candidate batch, unless search budget is exhausted, the one allowed recovery search/download pair has already been used, or deadline mode blocks discovery.
+  - Default proposer budget: use one batched search_papers call and one batched download_document call before screen_papers; do not keep broad discovery open by default.
   - The proposer candidate target is a cycle-level cumulative threshold, not a single-search minimum and not a success requirement.
   - If the cycle still ends below the proposer candidate target, continue with the currently accumulated candidates through download_document, screen_papers, parse_document, and extract_evidence instead of failing retrieval for missing the target.
   - download_document should use Unpaywall `best_oa_location.url_for_pdf` first, then retry once with Semantic Scholar `openAccessPdf.url` only if the first PDF request fails.
   - download_document must cache PDFs only; parse_document is still the only step that may build indexed full text.
   - screen_papers is mandatory after download and must rerank the downloaded papers using clipped GROBID TEI XML profiles built from `<teiHeader>` and `<text><body>...</body></text>`.
+  - A second search/download pair is allowed only when screen_papers explicitly returns `screen_status=input_exhausted` with `failure_domain=pdf_input`.
   - parse_document should only be used after screen_papers locks the strongest candidates.
   - Only papers locked by screen_papers may proceed to extract_evidence.
   - Metadata-source priority for proposer retrieval: use Semantic Scholar only for search and candidate metadata; use Unpaywall only for PDF download resolution.

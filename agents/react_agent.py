@@ -24,7 +24,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 from agents.chat_models import build_chat_model_from_config
@@ -409,7 +409,7 @@ class ReActAgent:
         verbose: bool = True,
         tools: Optional[Sequence[Any]] = None,
         thought_phase_instruction: Optional[str] = None,
-        action_phase_instruction: Optional[str] = None,
+        action_phase_instruction: Optional[Any] = None,
         search_tool_names: Optional[Sequence[str]] = None,
         analysis_tool_names: Optional[Sequence[str]] = None,
         conclude_argument_name: Optional[str] = None,
@@ -425,7 +425,12 @@ class ReActAgent:
         self.verbose = bool(verbose)
         self._custom_tools = list(tools or [])
         self._custom_thought_phase_instruction = str(thought_phase_instruction or "").strip() or None
-        self._custom_action_phase_instruction = str(action_phase_instruction or "").strip() or None
+        self._custom_action_phase_instruction_factory: Optional[Callable[..., str]] = None
+        self._custom_action_phase_instruction: Optional[str] = None
+        if callable(action_phase_instruction):
+            self._custom_action_phase_instruction_factory = action_phase_instruction
+        else:
+            self._custom_action_phase_instruction = str(action_phase_instruction or "").strip() or None
         self._search_tool_names = [str(name).strip() for name in (search_tool_names or []) if str(name).strip()]
         self._analysis_tool_names = [str(name).strip() for name in (analysis_tool_names or []) if str(name).strip()]
         self._conclude_argument_name = str(conclude_argument_name or "").strip() or None
@@ -912,7 +917,15 @@ class ReActAgent:
             "- Avoid filler/self-talk (e.g. 'ok', 'sorry', repeating 'I will call tool').\n"
         )
 
-    def _get_action_phase_instruction(self) -> str:
+    def _get_action_phase_instruction(self, **kwargs: Any) -> str:
+        if self._custom_action_phase_instruction_factory is not None:
+            try:
+                instruction = self._custom_action_phase_instruction_factory(**kwargs)
+            except TypeError:
+                instruction = self._custom_action_phase_instruction_factory()
+            instruction_text = str(instruction or "").strip()
+            if instruction_text:
+                return instruction_text
         if self._custom_action_phase_instruction:
             return self._custom_action_phase_instruction
         return (
@@ -1044,7 +1057,7 @@ class ReActAgent:
         )
         propose_phase = bool(self._current_is_propose_phase)
         retrieval_budget = _parse_retrieval_budget_from_system_prompt(system_prompt or "")
-        action_phase_instruction = self._get_action_phase_instruction()
+        action_phase_instruction = ""
         proposer_candidate_target = max(
             1,
             int(
@@ -1078,6 +1091,14 @@ class ReActAgent:
         use_user_role_for_action = provider_hint in {"google", "gemini"} or ("gemini" in model_name_hint)
 
         deadline_mode = bool(self.model_config.get("deadline_mode", True))
+        action_phase_instruction = self._get_action_phase_instruction(
+            step_number=1,
+            remaining_steps=effective_max_steps,
+            max_steps=effective_max_steps,
+            deadline_mode=deadline_mode,
+            trajectory=trajectory,
+            context=context,
+        )
 
         propose_metric_line_enforce_point_estimate = bool(
             self.model_config.get("propose_metric_line_enforce_point_estimate", True)
@@ -2035,6 +2056,14 @@ class ReActAgent:
             action_msg = None
             raw_action_text = ""
             deadline_hint = ""
+            action_phase_instruction = self._get_action_phase_instruction(
+                step_number=step_number + 1,
+                remaining_steps=remaining_steps,
+                max_steps=effective_max_steps,
+                deadline_mode=deadline_mode,
+                trajectory=trajectory,
+                context=context,
+            )
             if deadline_mode and remaining_steps == 2:
                 deadline_hint = (
                     "\nDEADLINE MODE: You have only 2 steps left.\n"

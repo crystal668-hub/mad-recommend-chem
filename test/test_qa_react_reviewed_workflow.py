@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import patch
 
+from agents import react_tool_schemas as tool_schemas
 from agents.react_agent import AgentResponse
 from agents.react_reasoning import ReActTrajectory
 from pydantic import ValidationError
@@ -4613,6 +4614,65 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual("action prompt", prompt)
         self.assertEqual(7, action_mock.call_args.kwargs["proposer_candidate_target"])
 
+    def test_runtime_action_guidance_switches_to_evidence_extraction_after_locked_parse(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={},
+            max_steps_initial=10,
+            max_steps_revision=10,
+            llm_timeout_seconds=45.0,
+        )
+        run_state = _ProposerRunState(evidence_policy="prefer_fulltext")
+        run_state.query_plan_ids = ["qp_1"]
+        run_state.searched_paper_ids = {"paper-1", "paper-2"}
+        run_state.search_generation = 1
+        run_state.acquired_paper_ids = {"paper-1", "paper-2"}
+        run_state.acquisition_generation = 1
+        run_state.screening_generation = 1
+        run_state.locked_candidate_paper_ids = ["paper-1", "paper-2"]
+        run_state.fulltext_status_by_paper = {
+            "paper-1": "fulltext_indexed",
+            "paper-2": "fulltext_indexed",
+        }
+
+        guidance = proposer._runtime_action_guidance(
+            run_state=run_state,
+            step_number=6,
+            remaining_steps=5,
+            max_steps=10,
+            deadline_mode=True,
+        )
+        prompt = proposer._action_instruction(
+            PROPOSER_TOOL_NAMES,
+            conclude_call_contract={
+                "tool_call_rule": "Call conclude with exactly {\"submission\": {...}}.",
+                "tool_call_example": {"submission": {"submission_id": "submission_cycle_1"}},
+                "invalid_examples": [{"submission_id": "submission_cycle_1"}],
+            },
+            runtime_guidance=guidance,
+        )
+
+        self.assertEqual("evidence_extraction", guidance["current_stage"])
+        self.assertEqual(["extract_evidence", "read_sections"], guidance["recommended_next_tools"])
+        self.assertIn("Current stage: evidence_extraction.", prompt)
+        self.assertIn("Recommended next tools: extract_evidence, read_sections.", prompt)
+
+    def test_proposer_batch_tool_schemas_validate_expected_inputs(self):
+        parse_args = tool_schemas.ProposerParseDocumentToolInput.model_validate({"paper_ids": ["paper-1", "paper-2"]})
+        self.assertEqual(["paper-1", "paper-2"], parse_args.paper_ids)
+
+        section_args = tool_schemas.ProposerSectionAccessToolInput.model_validate(
+            {"paper_ids": ["paper-1", "paper-2"], "preferred_sections": True}
+        )
+        self.assertEqual(["paper-1", "paper-2"], section_args.paper_ids)
+        self.assertTrue(section_args.preferred_sections)
+
+        with self.assertRaises(ValidationError):
+            tool_schemas.ProposerParseDocumentToolInput.model_validate({"paper_id": "paper-1", "paper_ids": ["paper-2"]})
+        with self.assertRaises(ValidationError):
+            tool_schemas.ProposerSectionAccessToolInput.model_validate(
+                {"paper_ids": ["paper-1", "paper-2"], "section_ids": ["sec_results"]}
+            )
+
     def test_proposer_batched_search_keeps_partial_results_after_late_timeout(self):
         class _FixedPlanner:
             def run(self, *, task_spec: TaskSpec, entity_pack: EntityPack):
@@ -4804,6 +4864,155 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertTrue(download_calls)
         self.assertTrue(search_calls[0]["proposer_only_semantic"])
         self.assertTrue(download_calls[0]["proposer_pdf_download"])
+
+    def test_proposer_batch_parse_and_extract_tools_use_paper_ids(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=10,
+            max_steps_revision=10,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace()
+        captured_tools = {}
+        parse_calls: list[dict] = []
+        extract_calls: list[dict] = []
+
+        workspace.plan_queries = lambda focus="initial": [  # type: ignore[assignment]
+            {
+                "query_plan_id": "qp_1",
+                "lane": "data",
+                "query_text": "Pt/C HER alkaline",
+            }
+        ]
+        workspace.search_papers_batch = lambda **kwargs: {  # type: ignore[assignment]
+            "papers": [
+                {"paper_id": "paper-1", "query_plan_id": "qp_1"},
+                {"paper_id": "paper-2", "query_plan_id": "qp_1"},
+            ],
+            "search_warnings": [],
+            "batch_summary": {"requested_count": 1, "successful_count": 2, "failed_count": 0},
+        }
+        workspace.download_documents = lambda **kwargs: {  # type: ignore[assignment]
+            "documents": [
+                {
+                    "paper_id": "paper-1",
+                    "fulltext_available": True,
+                    "fulltext_status": "binary_only",
+                    "section_count": 0,
+                    "artifact_path": "fulltext/paper-1.pdf",
+                },
+                {
+                    "paper_id": "paper-2",
+                    "fulltext_available": True,
+                    "fulltext_status": "binary_only",
+                    "section_count": 0,
+                    "artifact_path": "fulltext/paper-2.pdf",
+                },
+            ],
+            "download_warnings": [],
+            "batch_summary": {"requested_count": 2, "successful_count": 2, "failed_count": 0},
+        }
+        workspace.parse_documents = lambda **kwargs: (  # type: ignore[assignment]
+            parse_calls.append(dict(kwargs))
+            or {
+                "documents": [
+                    {
+                        "paper_id": "paper-1",
+                        "fulltext_available": True,
+                        "fulltext_status": "fulltext_indexed",
+                        "section_count": 4,
+                        "artifact_path": "fulltext/paper-1.xml",
+                    },
+                    {
+                        "paper_id": "paper-2",
+                        "fulltext_available": True,
+                        "fulltext_status": "fulltext_indexed",
+                        "section_count": 5,
+                        "artifact_path": "fulltext/paper-2.xml",
+                    },
+                ],
+                "parse_warnings": [],
+                "batch_summary": {"requested_count": 2, "successful_count": 2, "failed_count": 0},
+            }
+        )
+        workspace.extract_evidence_batch = lambda **kwargs: (  # type: ignore[assignment]
+            extract_calls.append(dict(kwargs))
+            or {
+                "evidence": [
+                    {"paper_id": "paper-1", "evidence_id": "ev-1", "section_id": "sec_results", "source_layer": "fulltext"},
+                    {"paper_id": "paper-2", "evidence_id": "ev-2", "section_id": "sec_discussion", "source_layer": "fulltext"},
+                ],
+                "evidence_warnings": [],
+                "batch_summary": {"requested_count": 2, "successful_count": 2, "failed_count": 0},
+            }
+        )
+        proposer._screen_candidate_papers = lambda **kwargs: {  # type: ignore[assignment]
+            "screen_status": "ok",
+            "failure_domain": "",
+            "locked_paper_ids": ["paper-1", "paper-2"],
+            "dropped_paper_ids": [],
+            "ranked_candidates": [
+                {"paper_id": "paper-1", "title": "Paper 1", "decision": "lock", "reason": "fit"},
+                {"paper_id": "paper-2", "title": "Paper 2", "decision": "lock", "reason": "fit"},
+            ],
+            "paper_profiles": [],
+            "indexed_papers": [
+                {"paper_id": "paper-1", "fulltext_status": "binary_only", "fulltext_available": True},
+                {"paper_id": "paper-2", "fulltext_status": "binary_only", "fulltext_available": True},
+            ],
+        }
+
+        class _StubStructuredTool:
+            @staticmethod
+            def from_function(func, name=None, args_schema=None):
+                tool_name = name or getattr(func, "__name__", "tool")
+
+                class _Tool:
+                    def __init__(self, func, name, args_schema):
+                        self.func = func
+                        self.name = name or getattr(func, "__name__", "tool")
+                        self.args_schema = args_schema
+
+                    def invoke(self, payload):
+                        if isinstance(payload, dict):
+                            return self.func(**payload)
+                        return self.func(payload)
+
+                tool = _Tool(func, name, args_schema)
+                captured_tools[tool_name] = tool
+                return tool
+
+        class _RaisingReActAgent:
+            def __init__(self, *args, **kwargs):
+                self.current_trajectory = _trajectory("batch parse/extract capture")
+
+            def generate_response_with_react(self, *args, **kwargs):
+                raise RuntimeError("stop after tool registration")
+
+        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed_workflow.ReActAgent",
+            _RaisingReActAgent,
+        ):
+            with self.assertRaises(ReactReviewedProposerExecutionError):
+                proposer.run(
+                    workspace=workspace,
+                    cycle_number=1,
+                    open_review_items=[],
+                )
+
+        captured_tools["plan_queries"].invoke({"focus": "initial"})
+        captured_tools["search_papers"].invoke({"query_plan_id": "qp_1", "reason": "coverage"})
+        captured_tools["download_document"].invoke({"paper_ids": ["paper-1", "paper-2"]})
+        captured_tools["screen_papers"].invoke({"paper_ids": ["paper-1", "paper-2"], "max_candidates": 2})
+        parse_result = captured_tools["parse_document"].invoke({"paper_ids": ["paper-1", "paper-2"]})
+        extract_result = captured_tools["extract_evidence"].invoke(
+            {"paper_ids": ["paper-1", "paper-2"], "preferred_sections": True}
+        )
+
+        self.assertEqual([{"paper_ids": ["paper-1", "paper-2"]}], parse_calls)
+        self.assertEqual([{"paper_ids": ["paper-1", "paper-2"], "preferred_sections": True}], extract_calls)
+        self.assertEqual(2, len(parse_result.data["documents"]))
+        self.assertEqual(["ev-1", "ev-2"], [item["evidence_id"] for item in extract_result.data["evidence"]])
 
     def test_proposer_uses_configured_screen_top_k_in_tool_schema_default(self):
         proposer = ReactReviewedProposerAgent(

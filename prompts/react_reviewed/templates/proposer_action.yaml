@@ -10,18 +10,22 @@ prompt: |
   Proposer candidate target: $proposer_candidate_target cumulative strict-PDF candidates within the current cycle.
   For proposer retrieval, search_papers is Semantic Scholar-only.
   Treat a candidate as downloadable only when Semantic Scholar `openAccessPdf.url` exists, the paper has a DOI, and the normalized URL ends with `.pdf`; reject `/pdf`, `_pdf`, landing pages, and query/fragment pseudo-PDF URLs.
-  Before the current cycle cumulatively reaches the proposer candidate target, prefer continuing batched search_papers expansion instead of stopping after the first usable candidate batch, unless search budget is exhausted, the one allowed recovery search/download pair has already been spent, or deadline mode blocks discovery.
+  Default proposer budget: spend one search_papers step and one download_document step before screen_papers; do not keep broad discovery open by default.
   The proposer candidate target is a cycle-level cumulative threshold, not a single-search minimum and not a success requirement.
   If the cycle ends below the proposer candidate target, continue with the currently accumulated candidates through download/screen/parse/extract; missing the target does not by itself make retrieval fail.
   Call screen_papers only after the requested candidate papers have already been downloaded in this cycle.
   Call download_document with `paper_ids` whenever you need to fetch multiple searched papers in one step; it will use Unpaywall `best_oa_location.url_for_pdf` first and retry once with Semantic Scholar `openAccessPdf.url` if needed.
   Use screen_papers to build clipped GROBID XML profiles from the downloaded PDFs and rerank the downloaded candidates listwise before parse_document and evidence extraction.
   Call download_document only for papers returned by search_papers in this cycle.
-  If screen_papers returns `screen_status=input_exhausted` with `failure_domain=pdf_input`, you may run at most one more batched search_papers plus one more batched download_document in this cycle. If `failure_domain=profile_infra`, stop retrieval and do not keep expanding search/download.
+  If screen_papers returns `screen_status=input_exhausted` with `failure_domain=pdf_input`, you may run at most one more batched search_papers plus one more batched download_document in this cycle; otherwise stop expanding retrieval and move to parse/extract/closeout.
   Call parse_document only for papers locked by screen_papers.
+  Call parse_document with `paper_ids` when several locked papers should be parsed in parallel within one step.
+  Call read_sections with `paper_ids` only for broad multi-paper follow-up using default/preferred sections; keep `section_ids` empty in that case.
   Call extract_evidence only for papers locked by screen_papers.
+  Call extract_evidence with `paper_ids` when several locked papers should be processed in parallel within one step; keep `section_ids` empty when batching.
   Call extract_evidence before conclude. Prefer fulltext-backed evidence when it exists.
   Do not mix retrieval tools with conclude in the same step.
+  $runtime_guidance_block
 
   For conclude:
   - $tool_call_rule
