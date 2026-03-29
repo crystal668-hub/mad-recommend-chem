@@ -1,9 +1,6 @@
 # ChemQA
 
-ChemQA is a chemistry literature QA system with two supported workflow modes:
-
-- `ledger`
-- `react_reviewed`
+ChemQA is a chemistry literature QA system built around the `react_reviewed` workflow.
 
 
 ## Install
@@ -38,8 +35,6 @@ python -m chemqa --question "Does Pt/C improve HER activity in 1 M KOH?" --save-
 
 Optional flags:
 
-- `--workflow-mode ledger`
-- `--workflow-mode react_reviewed`
 - `--context "..."`
 - `--artifact-dir <path>`
 - `--config <path>`
@@ -55,12 +50,6 @@ Run the standard live-validation entrypoint:
 
 ```bash
 python -m chemqa.live_validation --question "Does Pt/C improve HER activity in 1 M KOH?"
-```
-
-Ledger-focused partial-run diagnosis is also available:
-
-```bash
-python -m qa.ledger_live_runner --run-suite
 ```
 
 ChemBench reasoning smoke tests are available as a separate runner:
@@ -83,7 +72,7 @@ Runtime configuration lives in `config/config.yaml`.
 Primary sections:
 
 - `llm.*`: provider and model settings
-- `qa.*`: workflow mode, peer review, runtime controls, provider settings
+- `qa.*`: `react_reviewed` runtime controls and provider settings
 - `logging.*`: log destinations and format
 - `paths.outputs`: exported result directory
 

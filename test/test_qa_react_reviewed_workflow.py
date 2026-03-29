@@ -24,23 +24,31 @@ from qa.nodes.router import RouterExecutionError
 from qa.nodes.retriever import RetrieverNode
 from qa.paper_profiles import GrobidPaperProfileBuilder, extract_profile_xml_segments
 from qa.pdf_extraction import PDFExtractionPipeline
-from qa.react_reviewed_state import AnswerSubmission, ReviewItem, ReviewerRunStatus, SubmissionCitation, SubmissionConfidenceRating, SubmissionSection, SubmissionStepRef
-from qa.react_reviewed_workflow import (
+from qa.react_reviewed.agents.proposer import ReactReviewedProposerAgent
+from qa.react_reviewed.agents.reviewer import ReactReviewedReviewerAgent
+from qa.react_reviewed.agents.router_wrapper import RouterAgentWrapper
+from qa.react_reviewed.agents.synthesizer import SubmissionSynthesizerAgent
+from qa.react_reviewed.common import (
     PROPOSER_TOOL_NAMES,
     ReactReviewedProposerExecutionError,
-    ReactReviewedProposerAgent,
     ReactReviewedReviewerExecutionError,
-    ReactReviewedReviewerAgent,
     ReactReviewedStructuredOutputError,
-    SubmissionSynthesizerAgent,
-    ReactReviewedWorkflow,
-    ReactReviewedWorkspace,
-    RouterAgentWrapper,
     ReviewerBudgetBlocked,
     ReviewerBudgetState,
     ReviewerSession,
     _ProposerRunState,
 )
+from qa.react_reviewed.memory.workspace import ReactReviewedWorkspace
+from qa.react_reviewed.models import (
+    AnswerSubmission,
+    ReviewItem,
+    ReviewerRunStatus,
+    SubmissionCitation,
+    SubmissionConfidenceRating,
+    SubmissionSection,
+    SubmissionStepRef,
+)
+from qa.react_reviewed.workflow import ReactReviewedWorkflow
 from qa.retrieval_state import EvidenceItem, PaperCandidate, PaperProfile, PaperRecord, QueryPlan, Section, SectionIndex
 from qa.runtime import build_qa_runtime, resolve_qa_runtime_config
 from qa.state import AnswerSection, EntityPack, SourceSpan, TaskSpec
@@ -1058,6 +1066,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             document_acquirer=_CountingDocumentAcquirer(),
             handoff=EvidenceExtractorHandoff(),
             evidence_extractor=_CountingEvidenceExtractor(),
+            paper_profile_builder=_FakePaperProfileBuilder(),
         )
         workflow.proposer = _PlanningProposer()
         artifact_dir = self.temp_dir / "workflow_planner_failure"
@@ -1402,6 +1411,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 source_artifact_path=str(self.temp_dir / "paper-1.pdf"),
             )
         }
+        self._materialize_source_pdfs(workspace)
 
         with self.assertRaises(ReactReviewedProposerExecutionError) as ctx:
             proposer._screen_candidate_papers(
@@ -1455,8 +1465,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self._materialize_source_pdfs(workspace)
         raw_response = json.dumps({"unexpected": "schema"})
 
-        with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
-            "qa.react_reviewed_workflow.invoke_llm",
+        with patch("qa.react_reviewed.agents.proposer.build_chat_model_from_config", return_value=object()), patch(
+            "qa.react_reviewed.agents.proposer.invoke_llm",
             return_value=raw_response,
         ):
             with self.assertRaises(ReactReviewedProposerExecutionError) as ctx:
@@ -1524,8 +1534,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             }
         )
 
-        with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
-            "qa.react_reviewed_workflow.invoke_llm",
+        with patch("qa.react_reviewed.agents.proposer.build_chat_model_from_config", return_value=object()), patch(
+            "qa.react_reviewed.agents.proposer.invoke_llm",
             return_value=raw_response,
         ):
             screened = proposer._screen_candidate_papers(
@@ -3262,8 +3272,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             trajectory=trajectory,
         )
 
-        with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
-            "qa.react_reviewed_workflow.invoke_llm",
+        with patch("qa.react_reviewed.agents.reviewer.build_chat_model_from_config", return_value=object()), patch(
+            "qa.react_reviewed.agents.reviewer.invoke_llm",
             return_value=json.dumps(
                 {
                     "kind": "review_items",
@@ -3368,8 +3378,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 }
                 return response, _trajectory("invalid reviewer conclude output")
 
-        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
-            "qa.react_reviewed_workflow.ReActAgent",
+        with patch("qa.react_reviewed.agents.reviewer._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed.agents.reviewer.ReActAgent",
             _InvalidReviewerReActAgent,
         ), patch.object(
             reviewer,
@@ -3492,10 +3502,10 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         proposer._repair_submission_with_llm = _repair_submission_with_llm
 
         with patch.object(_ProposerRunState, "has_any_evidence", return_value=True), patch(
-            "qa.react_reviewed_workflow._lazy_structured_tool_import",
+            "qa.react_reviewed.agents.proposer._lazy_structured_tool_import",
             return_value=_StubStructuredTool,
         ), patch(
-            "qa.react_reviewed_workflow.ReActAgent",
+            "qa.react_reviewed.agents.proposer.ReActAgent",
             _RepairableReActAgent,
         ):
             submission, trajectory = proposer.run(
@@ -3726,8 +3736,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         run_state.evidence_ids = {"ev-1"}
         repaired_submission = _submission(workspace.question, trajectory_id=trajectory.trajectory_id)
 
-        with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
-            "qa.react_reviewed_workflow.invoke_llm",
+        with patch("qa.react_reviewed.agents.proposer.build_chat_model_from_config", return_value=object()), patch(
+            "qa.react_reviewed.agents.proposer.invoke_llm",
             return_value=json.dumps({"kind": "submission", "payload": repaired_submission.model_dump(exclude_none=True)}),
         ), patch.object(proposer, "_validate_submission_payload", return_value=repaired_submission):
             submission, repaired_trajectory = proposer._repair_submission_with_llm(
@@ -3772,8 +3782,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             self.assertIn("tool_call_example", user_payload["conclude_call_contract"])
             return json.dumps({"kind": "submission", "payload": repaired_submission.model_dump(exclude_none=True)})
 
-        with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
-            "qa.react_reviewed_workflow.invoke_llm",
+        with patch("qa.react_reviewed.agents.proposer.build_chat_model_from_config", return_value=object()), patch(
+            "qa.react_reviewed.agents.proposer.invoke_llm",
             side_effect=_inspect_invoke,
         ), patch.object(proposer, "_validate_submission_payload", return_value=repaired_submission):
             submission, repaired_trajectory = proposer._repair_submission_with_llm(
@@ -3851,8 +3861,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             self.assertIsNone(user_payload["invalid_response_content"])
             return json.dumps({"kind": "submission", "payload": repaired_submission.model_dump(exclude_none=True)})
 
-        with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
-            "qa.react_reviewed_workflow.invoke_llm",
+        with patch("qa.react_reviewed.agents.proposer.build_chat_model_from_config", return_value=object()), patch(
+            "qa.react_reviewed.agents.proposer.invoke_llm",
             side_effect=_inspect_invoke,
         ), patch.object(proposer, "_validate_submission_payload", return_value=repaired_submission):
             submission, repaired_trajectory = proposer._repair_submission_with_llm(
@@ -3914,8 +3924,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             )
             return salvaged_submission
 
-        with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
-            "qa.react_reviewed_workflow.invoke_llm",
+        with patch("qa.react_reviewed.agents.proposer.build_chat_model_from_config", return_value=object()), patch(
+            "qa.react_reviewed.agents.proposer.invoke_llm",
             return_value="not json",
         ), patch.object(proposer, "_validate_submission_payload", side_effect=_validate_submission_payload):
             submission, repaired_trajectory = proposer._repair_submission_with_llm(
@@ -3985,8 +3995,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         run_state.fulltext_status_by_paper = {"paper-1": "fulltext_indexed"}
         run_state.fulltext_available_by_paper = {"paper-1": True}
 
-        with patch("qa.react_reviewed_workflow.build_chat_model_from_config", return_value=object()), patch(
-            "qa.react_reviewed_workflow.invoke_llm",
+        with patch("qa.react_reviewed.agents.proposer.build_chat_model_from_config", return_value=object()), patch(
+            "qa.react_reviewed.agents.proposer.invoke_llm",
             return_value='{"kind":"submission","payload":{"submission_id":"submission_cycle_1"',
         ):
             submission, repaired_trajectory = proposer._repair_submission_with_llm(
@@ -4082,8 +4092,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 error.structured_output = None
                 raise error
 
-        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
-            "qa.react_reviewed_workflow.ReActAgent",
+        with patch("qa.react_reviewed.agents.proposer._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed.agents.proposer.ReActAgent",
             _RaisingReActAgent,
         ):
             with self.assertRaises(ReactReviewedProposerExecutionError):
@@ -4151,8 +4161,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 error.trajectory = self.current_trajectory
                 raise error
 
-        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
-            "qa.react_reviewed_workflow.ReActAgent",
+        with patch("qa.react_reviewed.agents.proposer._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed.agents.proposer.ReActAgent",
             _RaisingReActAgent,
         ):
             with self.assertRaises(ReactReviewedProposerExecutionError) as ctx:
@@ -4222,8 +4232,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 error.trajectory = self.current_trajectory
                 raise error
 
-        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
-            "qa.react_reviewed_workflow.ReActAgent",
+        with patch("qa.react_reviewed.agents.proposer._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed.agents.proposer.ReActAgent",
             _RaisingReActAgent,
         ):
             with self.assertRaises(ReactReviewedProposerExecutionError) as ctx:
@@ -4313,10 +4323,10 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 raise error
 
         with patch.object(_ProposerRunState, "has_any_evidence", return_value=True), patch(
-            "qa.react_reviewed_workflow._lazy_structured_tool_import",
+            "qa.react_reviewed.agents.proposer._lazy_structured_tool_import",
             return_value=_StubStructuredTool,
         ), patch(
-            "qa.react_reviewed_workflow.ReActAgent",
+            "qa.react_reviewed.agents.proposer.ReActAgent",
             _RaisingReActAgent,
         ), patch.object(
             proposer,
@@ -4402,10 +4412,10 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
                 raise error
 
         with patch.object(_ProposerRunState, "has_any_evidence", return_value=True), patch(
-            "qa.react_reviewed_workflow._lazy_structured_tool_import",
+            "qa.react_reviewed.agents.proposer._lazy_structured_tool_import",
             return_value=_StubStructuredTool,
         ), patch(
-            "qa.react_reviewed_workflow.ReActAgent",
+            "qa.react_reviewed.agents.proposer.ReActAgent",
             _RaisingReActAgent,
         ), patch.object(
             proposer,
@@ -4558,8 +4568,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             def generate_response_with_react(self, *args, **kwargs):
                 raise RuntimeError("stop after tool registration")
 
-        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
-            "qa.react_reviewed_workflow.ReActAgent",
+        with patch("qa.react_reviewed.agents.proposer._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed.agents.proposer.ReActAgent",
             _RaisingReActAgent,
         ):
             with self.assertRaises(ReactReviewedProposerExecutionError):
@@ -4574,7 +4584,7 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             {"query_plan_ids": ["qp_1", "qp_2"], "reason": "batched coverage"}
         )
 
-        self.assertEqual(
+        self.assertCountEqual(
             ["Pt/C HER alkaline review", "Pt/C HER alkaline limitations"],
             retriever.calls,
         )
@@ -4601,12 +4611,12 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             "invalid_examples": [{"submission_id": "submission_cycle_1"}],
         }
 
-        with patch("qa.react_reviewed_workflow.build_proposer_system_prompt", return_value="system prompt") as system_mock:
+        with patch("qa.react_reviewed.agents.proposer.build_proposer_system_prompt", return_value="system prompt") as system_mock:
             prompt = proposer._build_system_prompt(conclude_call_contract=conclude_contract)
         self.assertEqual("system prompt", prompt)
         self.assertEqual(7, system_mock.call_args.kwargs["proposer_candidate_target"])
 
-        with patch("qa.react_reviewed_workflow.build_proposer_action_prompt", return_value="action prompt") as action_mock:
+        with patch("qa.react_reviewed.agents.proposer.build_proposer_action_prompt", return_value="action prompt") as action_mock:
             prompt = proposer._action_instruction(
                 ["plan_queries", "search_papers", "download_document", "conclude"],
                 conclude_call_contract=conclude_contract,
@@ -4756,8 +4766,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             def generate_response_with_react(self, *args, **kwargs):
                 raise RuntimeError("stop after tool registration")
 
-        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
-            "qa.react_reviewed_workflow.ReActAgent",
+        with patch("qa.react_reviewed.agents.proposer._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed.agents.proposer.ReActAgent",
             _RaisingReActAgent,
         ):
             with self.assertRaises(ReactReviewedProposerExecutionError):
@@ -4845,8 +4855,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             def generate_response_with_react(self, *args, **kwargs):
                 raise RuntimeError("stop after tool registration")
 
-        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
-            "qa.react_reviewed_workflow.ReActAgent",
+        with patch("qa.react_reviewed.agents.proposer._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed.agents.proposer.ReActAgent",
             _RaisingReActAgent,
         ):
             with self.assertRaises(ReactReviewedProposerExecutionError):
@@ -4989,8 +4999,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             def generate_response_with_react(self, *args, **kwargs):
                 raise RuntimeError("stop after tool registration")
 
-        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
-            "qa.react_reviewed_workflow.ReActAgent",
+        with patch("qa.react_reviewed.agents.proposer._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed.agents.proposer.ReActAgent",
             _RaisingReActAgent,
         ):
             with self.assertRaises(ReactReviewedProposerExecutionError):
@@ -5052,8 +5062,8 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
             def generate_response_with_react(self, *args, **kwargs):
                 raise RuntimeError("stop after tool registration")
 
-        with patch("qa.react_reviewed_workflow._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
-            "qa.react_reviewed_workflow.ReActAgent",
+        with patch("qa.react_reviewed.agents.proposer._lazy_structured_tool_import", return_value=_StubStructuredTool), patch(
+            "qa.react_reviewed.agents.proposer.ReActAgent",
             _RaisingReActAgent,
         ):
             with self.assertRaises(ReactReviewedProposerExecutionError):

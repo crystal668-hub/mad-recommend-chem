@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from prompts.qa_prompts import QUERY_PLANNER_SYSTEM_PROMPT, build_query_planner_user_prompt
+from prompts.core import QUERY_PLANNER_SYSTEM_PROMPT, build_query_planner_user_prompt
 from qa.llm_utils import invoke_llm, parse_json_object
 from qa.retrieval_state import QueryPlan
 from qa.retrieval_utils import normalize_text

@@ -10,7 +10,6 @@ from qa.live_validation import main as live_validation_main
 from qa.live_validation import validate_live_qa
 from qa.synthesis_state import QAResult
 from utils import ensure_dir, save_json
-from test.qa_test_utils import build_ledger_system
 
 
 FIXED_REVIEWER_ROLES = (
@@ -293,29 +292,6 @@ class _DispatchingSuiteSystem(_BaseFakeValidationSystem):
             question=question,
             **scenario,
         )
-
-
-class _RealLedgerSystem:
-    def __init__(self, root: Path) -> None:
-        self.system = build_ledger_system(root, save_output=False)
-        self.qa_config = self.system.qa_config
-
-    def run_qa(self, *, question: str, context=None, artifact_dir=None):
-        return self.system.run_qa(question=question, context=context, artifact_dir=artifact_dir)
-
-
-class _LedgerArtifactDeletingSystem:
-    def __init__(self, root: Path, *, missing_name: str) -> None:
-        self.system = build_ledger_system(root, save_output=False)
-        self.qa_config = self.system.qa_config
-        self.missing_name = missing_name
-
-    def run_qa(self, *, question: str, context=None, artifact_dir=None):
-        result = self.system.run_qa(question=question, context=context, artifact_dir=artifact_dir)
-        target = Path(artifact_dir) / self.missing_name
-        if target.exists():
-            target.unlink()
-        return result
 
 
 def _react_confidence(score: float = 0.84) -> dict:
@@ -691,7 +667,7 @@ class QALiveValidationTests(unittest.TestCase):
         artifact_dir = self.temp_dir / "evidence"
         report = validate_live_qa(
             "How does Pt/C affect HER activity in 1 M KOH?",
-            system=_EvidenceBackedSystem(),
+            system=_ReactReviewedSystem(entity_resolved_count=2),
             artifact_dir=str(artifact_dir),
             perform_network_probe=False,
         )
@@ -706,7 +682,7 @@ class QALiveValidationTests(unittest.TestCase):
         artifact_dir = self.temp_dir / "degraded"
         report = validate_live_qa(
             "How does Pt/C affect HER activity in 1 M KOH?",
-            system=_DegradedSystem(),
+            system=_ReactReviewedSystem(degraded=True),
             artifact_dir=str(artifact_dir),
             perform_network_probe=False,
         )
@@ -715,41 +691,6 @@ class QALiveValidationTests(unittest.TestCase):
         self.assertTrue(report.provider_failure_detected)
         self.assertTrue(report.insufficient_evidence)
         self.assertEqual(report.citation_count, 0)
-
-    def test_live_validation_accepts_real_ledger_run_artifacts(self):
-        artifact_dir = self.temp_dir / "ledger_real"
-        report = validate_live_qa(
-            "How does Pt/C affect HER activity in 1 M KOH?",
-            system=_RealLedgerSystem(self.temp_dir / "ledger_runtime"),
-            artifact_dir=str(artifact_dir),
-            perform_network_probe=False,
-        )
-
-        self.assertEqual(report.workflow_mode, "ledger")
-        self.assertTrue(all(report.required_artifacts.values()))
-        self.assertEqual([], report.missing_artifacts)
-        self.assertTrue(report.final_answer_preview.strip())
-
-    def test_live_validation_ledger_detects_missing_reviewed_ledger_or_pack(self):
-        reviewed_dir = self.temp_dir / "ledger_missing_reviewed"
-        reviewed_report = validate_live_qa(
-            "How does Pt/C affect HER activity in 1 M KOH?",
-            system=_LedgerArtifactDeletingSystem(self.temp_dir / "ledger_missing_reviewed_runtime", missing_name="evidence_ledger_reviewed.json"),
-            artifact_dir=str(reviewed_dir),
-            perform_network_probe=False,
-        )
-        self.assertEqual("FAIL_PIPELINE", reviewed_report.category)
-        self.assertIn("evidence_ledger_reviewed.json", reviewed_report.missing_artifacts)
-
-        pack_dir = self.temp_dir / "ledger_missing_pack"
-        pack_report = validate_live_qa(
-            "How does Pt/C affect HER activity in 1 M KOH?",
-            system=_LedgerArtifactDeletingSystem(self.temp_dir / "ledger_missing_pack_runtime", missing_name="synthesis_input_pack.json"),
-            artifact_dir=str(pack_dir),
-            perform_network_probe=False,
-        )
-        self.assertEqual("FAIL_PIPELINE", pack_report.category)
-        self.assertIn("synthesis_input_pack.json", pack_report.missing_artifacts)
 
     def test_react_reviewed_reports_pass_real_evidence_when_protocol_closes(self):
         artifact_dir = self.temp_dir / "react_real"

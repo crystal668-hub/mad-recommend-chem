@@ -53,15 +53,7 @@ qa:
   save_output: true
   outputs_dir: "./outputs"
   artifact_subdir: "qa_artifacts"
-  enable_peer_review: true
   model_timeout_seconds: 60
-  progress_log_every_claims: 10
-
-  peer_review:
-    max_claims_for_llm_review: 40
-    max_second_round_claims: 15
-    disable_llm_review_when_abstract_only: true
-    fallback_mode: "fail_fast_only"
 
   entity_resolution:
     seed_file: "./qa/resources/entity_seeds.yaml"
@@ -130,13 +122,6 @@ qa:
     entity_resolver: "agent2"
     query_planner: "agent2"
     evidence_extractor: "agent2"
-    claim_miner: "agent2"
-    methodology_reviewer: "agent2"
-    citation_reviewer: "agent2"
-    contradiction_reviewer: "agent2"
-    claim_revision: "agent2"
-    review_merge: "agent2"
-    synthesizer: "agent2"
     react_proposer: "agent2"
     react_reviewer_search_coverage: "agent2"
     react_reviewer_evidence_trace: "agent2"

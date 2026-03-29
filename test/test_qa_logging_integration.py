@@ -12,7 +12,6 @@ from qa.synthesis_state import QAResult
 from utils.logger import get_run_dir, setup_logging
 
 from test.qa_test_utils import (
-    build_ledger_system,
     confidence_payload,
     flush_logging_handlers,
     make_base_config,
@@ -108,11 +107,11 @@ class LoggingIntegrationTests(unittest.TestCase):
         reset_logging_state()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def _config(self, *, workflow_mode: str) -> dict:
-        return make_base_config(self.temp_dir, workflow_mode=workflow_mode, save_output=False)
+    def _config(self) -> dict:
+        return make_base_config(self.temp_dir, save_output=False)
 
     def test_setup_logging_creates_expected_run_files(self):
-        config = self._config(workflow_mode="ledger")
+        config = self._config()
         setup_logging(config, run_id="logging_files")
         flush_logging_handlers()
         run_dir = Path(get_run_dir())
@@ -121,27 +120,8 @@ class LoggingIntegrationTests(unittest.TestCase):
         self.assertTrue((run_dir / "run.log").exists())
         self.assertTrue((run_dir / "events.jsonl").exists())
 
-    def test_ledger_run_emits_key_stage_logs(self):
-        config = self._config(workflow_mode="ledger")
-        setup_logging(config, run_id="ledger_logs")
-        system = build_ledger_system(self.temp_dir, save_output=False)
-
-        system.run_qa("How does Pt/C affect HER activity in 1 M KOH?")
-        flush_logging_handlers()
-        run_log = (Path(get_run_dir()) / "run.log").read_text(encoding="utf-8")
-
-        for marker in (
-            "qa_run_start",
-            "qa_grounding_complete",
-            "qa_retrieval_start",
-            "qa_claim_mining_complete",
-            "qa_synthesis_complete",
-            "qa_run_complete",
-        ):
-            self.assertIn(marker, run_log)
-
     def test_react_reviewed_run_emits_key_stage_logs(self):
-        config = self._config(workflow_mode="react_reviewed")
+        config = self._config()
         setup_logging(config, run_id="react_logs")
         system = QASystem(
             config=config,
@@ -158,9 +138,12 @@ class LoggingIntegrationTests(unittest.TestCase):
         self.assertIn("qa_run_complete", run_log)
 
     def test_structured_events_jsonl_contains_run_id_and_logger_name(self):
-        config = self._config(workflow_mode="ledger")
+        config = self._config()
         setup_logging(config, run_id="structured_events")
-        system = build_ledger_system(self.temp_dir, save_output=False)
+        system = QASystem(
+            config=config,
+            react_reviewed_workflow=_LoggingReactReviewedWorkflow(),
+        )
 
         system.run_qa("How does Pt/C affect HER activity in 1 M KOH?")
         flush_logging_handlers()
@@ -179,7 +162,7 @@ class LoggingIntegrationTests(unittest.TestCase):
             self.assertTrue(str(row["logger"]).startswith("MAD.qa."))
 
     def test_warning_path_is_logged(self):
-        config = self._config(workflow_mode="react_reviewed")
+        config = self._config()
         setup_logging(config, run_id="warning_path")
         system = QASystem(
             config=config,

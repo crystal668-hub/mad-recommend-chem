@@ -7,7 +7,7 @@ from pydantic import Field, field_validator, model_validator
 from qa.state import StrictModel
 
 
-WorkflowMode = Literal["ledger", "react_reviewed"]
+WorkflowMode = Literal["react_reviewed"]
 ReviewerRole = Literal[
     "search_coverage",
     "evidence_trace",

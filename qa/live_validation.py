@@ -35,14 +35,6 @@ FIXED_REVIEWER_ROLES = (
 )
 COMPLETE_REVIEWER_STATUSES = {"completed", "salvaged"}
 
-REQUIRED_LEDGER_ARTIFACT_FILES = (
-    "qa_result.json",
-    "runtime_manifest.json",
-    "retrieval_diagnostics.json",
-    "provider_health.json",
-    "evidence_ledger_reviewed.json",
-    "synthesis_input_pack.json",
-)
 REQUIRED_REACT_REVIEWED_ARTIFACT_FILES = (
     "qa_result.json",
     "runtime_manifest.json",
@@ -164,7 +156,7 @@ class LiveValidationReport(StrictModel):
     case_id: Optional[str] = None
     question_type: Optional[str] = None
     tier: Optional[SuiteTier] = None
-    workflow_mode: str = "ledger"
+    workflow_mode: str = "react_reviewed"
     report_path: Optional[str] = None
     qa_result_path: Optional[str] = None
     provider_preflight: Dict[str, ProviderPreflightRecord] = Field(default_factory=dict)
@@ -266,7 +258,7 @@ def validate_live_qa(
         request_get=probe_request_get,
     )
     runtime_config = resolve_qa_runtime_config(resolved_config)
-    workflow_mode = str(runtime_config.get("workflow_mode") or "ledger").strip() or "ledger"
+    workflow_mode = str(runtime_config.get("workflow_mode") or "react_reviewed").strip() or "react_reviewed"
 
     try:
         qa_system = system or _build_system(
@@ -289,8 +281,8 @@ def validate_live_qa(
             tier=case.tier if case else None,
             workflow_mode=workflow_mode,
             provider_preflight=provider_preflight,
-            required_artifacts=_required_artifact_map(Path(resolved_artifact_dir), workflow_mode=workflow_mode),
-            missing_artifacts=_missing_artifacts(Path(resolved_artifact_dir), workflow_mode=workflow_mode),
+            required_artifacts=_required_artifact_map(Path(resolved_artifact_dir)),
+            missing_artifacts=_missing_artifacts(Path(resolved_artifact_dir)),
             validation_notes=[
                 "QA live validation failed before a complete artifact set was produced.",
             ],
@@ -628,8 +620,6 @@ def _load_validation_payloads(artifact_root: Path) -> Dict[str, Any]:
 
 def _select_react_reviewed_submission(*, payloads: Dict[str, Any], result: QAResult) -> tuple[str, Dict[str, Any]]:
     acceptance_status = str(result.acceptance_status or "accepted").strip().lower() or "accepted"
-    if str(result.workflow_mode or "").strip() != "react_reviewed":
-        return "final_submission", dict(payloads.get("final_submission") or {})
     if acceptance_status == "rejected":
         return "candidate_submission", dict(payloads.get("candidate_submission") or {})
     return "final_submission", dict(payloads.get("final_submission") or {})
@@ -674,7 +664,6 @@ def _build_validation_report(
     )
     required_artifacts = _required_artifact_map(
         artifact_root,
-        workflow_mode=result.workflow_mode,
         acceptance_status=result.acceptance_status,
     )
     missing_artifacts = [name for name, present in required_artifacts.items() if not present]
@@ -736,7 +725,7 @@ def _build_validation_report(
         case_id=case.case_id if case else None,
         question_type=case.question_type if case else None,
         tier=case.tier if case else None,
-        workflow_mode=str(result.workflow_mode or "ledger"),
+        workflow_mode=str(result.workflow_mode or "react_reviewed"),
         qa_result_path=str(result.artifact_paths.get("qa_result") or artifact_root / "qa_result.json"),
         provider_preflight=provider_preflight,
         provider_runtime_health=provider_health,
@@ -913,23 +902,7 @@ def _build_protocol_state(
     payloads: Dict[str, Any],
     result: QAResult,
 ) -> Dict[str, Any]:
-    workflow_mode = str(result.workflow_mode or "ledger").strip() or "ledger"
-    if workflow_mode != "react_reviewed":
-        return {
-            "protocol_ok": True,
-            "protocol_failures": [],
-            "workflow_protocol_stage": "not_applicable",
-            "review_completion_status": str(result.review_completion_status or "completed"),
-            "cycle_count": 0,
-            "reviewer_status_by_role": {},
-            "open_blocking_review_item_count": 0,
-            "submission_section_count": 0,
-            "submission_trace_count": len(list(result.submission_trace or [])),
-            "proposer_step_ref_integrity_ok": True,
-            "review_anchor_integrity_ok": True,
-            "reviewer_budget_integrity_ok": True,
-            "submission_trace_items": [item.model_dump(exclude_none=True) for item in list(result.submission_trace or [])],
-        }
+    workflow_mode = str(result.workflow_mode or "react_reviewed").strip() or "react_reviewed"
 
     protocol_failures: List[str] = []
     workflow_protocol_stage = "completed"
@@ -1372,29 +1345,23 @@ def _apply_case_expectations(
 def _required_artifact_map(
     artifact_root: Path,
     *,
-    workflow_mode: str = "ledger",
     acceptance_status: str = "accepted",
 ) -> Dict[str, bool]:
-    if str(workflow_mode or "").strip() == "react_reviewed":
-        required_files = list(REQUIRED_REACT_REVIEWED_ARTIFACT_FILES)
-        if str(acceptance_status or "accepted").strip() == "accepted":
-            required_files.append("final_submission.json")
-    else:
-        required_files = list(REQUIRED_LEDGER_ARTIFACT_FILES)
+    required_files = list(REQUIRED_REACT_REVIEWED_ARTIFACT_FILES)
+    if str(acceptance_status or "accepted").strip() == "accepted":
+        required_files.append("final_submission.json")
     return {name: (artifact_root / name).exists() for name in required_files}
 
 
 def _missing_artifacts(
     artifact_root: Path,
     *,
-    workflow_mode: str = "ledger",
     acceptance_status: str = "accepted",
 ) -> List[str]:
     return [
         name
         for name, present in _required_artifact_map(
             artifact_root,
-            workflow_mode=workflow_mode,
             acceptance_status=acceptance_status,
         ).items()
         if not present

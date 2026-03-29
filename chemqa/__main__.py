@@ -17,9 +17,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifact-dir", default=None, help="Optional directory for run artifacts.")
     parser.add_argument(
         "--workflow-mode",
-        choices=("ledger", "react_reviewed"),
-        default=None,
-        help="Override qa.workflow_mode from the configuration file for this run.",
+        choices=("react_reviewed",),
+        default="react_reviewed",
+        help="Workflow mode. Only `react_reviewed` is supported.",
     )
     parser.add_argument(
         "--save-output",
@@ -46,8 +46,7 @@ def main(
 
     config = copy.deepcopy(load_config(args.config))
     qa_config = dict(config.get("qa", {}) or {})
-    if args.workflow_mode:
-        qa_config["workflow_mode"] = args.workflow_mode
+    qa_config["workflow_mode"] = str(args.workflow_mode or "react_reviewed")
     if args.save_output:
         qa_config["save_output"] = True
     config["qa"] = qa_config

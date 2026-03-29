@@ -9,7 +9,7 @@ from urllib.parse import quote
 import requests
 import yaml
 
-from prompts.qa_prompts import (
+from prompts.core import (
     ENTITY_MENTION_EXTRACTION_SYSTEM_PROMPT,
     ENTITY_RESOLVER_SYSTEM_PROMPT,
     build_entity_mention_extraction_user_prompt,

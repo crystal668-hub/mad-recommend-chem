@@ -25,7 +25,7 @@ class _CapturingSystem:
         self.config_path = config_path
 
     def run_qa(self, *, question: str, context=None, artifact_dir=None):
-        workflow_mode = str((self.config.get("qa", {}) or {}).get("workflow_mode") or "ledger")
+        workflow_mode = str((self.config.get("qa", {}) or {}).get("workflow_mode") or "react_reviewed")
         save_output = bool((self.config.get("qa", {}) or {}).get("save_output"))
         artifact_root = Path(artifact_dir or ".")
         artifact_paths = {
@@ -108,25 +108,7 @@ class ChemqaCliTests(unittest.TestCase):
         self.assertIn("workflow=react_reviewed", output)
         self.assertIn("Saved QA artifacts:", output)
 
-    def test_cli_workflow_mode_flag_overrides_config_to_ledger(self):
-        config_path = self._write_config(workflow_mode="react_reviewed")
-
-        output = self._run_cli(
-            [
-                "--question",
-                "How does Pt/C affect HER activity?",
-                "--config",
-                str(config_path),
-                "--workflow-mode",
-                "ledger",
-                "--artifact-dir",
-                str(self.temp_dir / "artifacts_ledger"),
-            ]
-        )
-
-        self.assertIn("workflow=ledger", output)
-
-    def test_cli_workflow_mode_flag_overrides_config_to_react_reviewed(self):
+    def test_cli_forces_react_reviewed_even_if_config_mentions_legacy_mode(self):
         config_path = self._write_config(workflow_mode="ledger")
 
         output = self._run_cli(
@@ -135,8 +117,6 @@ class ChemqaCliTests(unittest.TestCase):
                 "How does Pt/C affect HER activity?",
                 "--config",
                 str(config_path),
-                "--workflow-mode",
-                "react_reviewed",
                 "--artifact-dir",
                 str(self.temp_dir / "artifacts_react"),
             ]
@@ -144,7 +124,7 @@ class ChemqaCliTests(unittest.TestCase):
 
         self.assertIn("workflow=react_reviewed", output)
 
-    def test_cli_workflow_mode_and_save_output_both_apply(self):
+    def test_cli_save_output_applies_without_workflow_override_flag(self):
         config_path = self._write_config(workflow_mode="ledger", save_output=False)
 
         output = self._run_cli(
@@ -153,8 +133,6 @@ class ChemqaCliTests(unittest.TestCase):
                 "How does Pt/C affect HER activity?",
                 "--config",
                 str(config_path),
-                "--workflow-mode",
-                "react_reviewed",
                 "--save-output",
                 "--artifact-dir",
                 str(self.temp_dir / "artifacts_save_output"),
@@ -163,6 +141,24 @@ class ChemqaCliTests(unittest.TestCase):
 
         self.assertIn("workflow=react_reviewed", output)
         self.assertIn("Saved QA result:", output)
+
+    def test_cli_accepts_explicit_react_reviewed_workflow_flag(self):
+        config_path = self._write_config(workflow_mode="ledger")
+
+        output = self._run_cli(
+            [
+                "--question",
+                "How does Pt/C affect HER activity?",
+                "--workflow-mode",
+                "react_reviewed",
+                "--config",
+                str(config_path),
+                "--artifact-dir",
+                str(self.temp_dir / "artifacts_explicit_react"),
+            ]
+        )
+
+        self.assertIn("workflow=react_reviewed", output)
 
 
 if __name__ == "__main__":

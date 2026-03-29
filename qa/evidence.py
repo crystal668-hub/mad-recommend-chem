@@ -7,7 +7,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from prompts.qa_prompts import (
+from prompts.core import (
     CLAIM_MINER_SYSTEM_PROMPT,
     EVIDENCE_EXTRACTOR_SYSTEM_PROMPT,
     build_claim_miner_user_prompt,

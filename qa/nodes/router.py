@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from prompts.qa_prompts import (
+from prompts.core import (
     ROUTER_LOCALIZATION_SYSTEM_PROMPT,
     ROUTER_SEMANTIC_SYSTEM_PROMPT,
     build_router_localization_user_prompt,

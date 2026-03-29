@@ -6,22 +6,16 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from agents.chat_models import build_chat_model_from_config, describe_chat_model_config, resolve_env_var
-from qa.evidence import ClaimMiner, EvidenceExtractor, EvidenceLedgerBuilder
+from qa.evidence import EvidenceExtractor
 from qa.handoff import EvidenceExtractorHandoff
-from qa.nodes.citation_reviewer import CitationReviewer
-from qa.nodes.claim_revision import ClaimRevisionNode
-from qa.nodes.contradiction_reviewer import ContradictionReviewer
 from qa.nodes.document_acquirer import DocumentAcquirerNode
 from qa.nodes.entity_resolver import EntityResolverNode, PubChemClient
-from qa.nodes.methodology_reviewer import MethodologyReviewer
 from qa.nodes.query_planner import QueryPlannerNode
 from qa.nodes.retriever import RetrieverNode
-from qa.nodes.review_merge import ReviewMergeNode
 from qa.nodes.router import RouterNode
-from qa.nodes.synthesizer import SynthesizerNode
-from qa.pipeline import QueryGroundingPipeline
 from qa.paper_profiles import GrobidPaperProfileBuilder
 from qa.pdf_extraction import PDFExtractionPipeline
+from qa.pipeline import QueryGroundingPipeline
 from qa.providers import (
     CrossrefClient,
     HttpTextFetcher,
@@ -30,12 +24,7 @@ from qa.providers import (
     SemanticScholarClient,
     UnpaywallClient,
 )
-from qa.retrieval_pipeline import HeterogeneousRetrievalPipeline
-from qa.review_pipeline import StructuredPeerReviewPipeline
-from qa.react_reviewed_workflow import ReactReviewedWorkflow
-from qa.react_reviewed_state import WorkflowMode
-from qa.synthesis_pipeline import VerifiedSynthesisPipeline
-
+from qa.react_reviewed.workflow import ReactReviewedWorkflow
 
 logger = logging.getLogger("MAD.qa.runtime")
 
@@ -44,13 +33,6 @@ INFERENCE_NODE_MODEL_KEYS = (
     "entity_resolver",
     "query_planner",
     "evidence_extractor",
-    "claim_miner",
-    "methodology_reviewer",
-    "citation_reviewer",
-    "contradiction_reviewer",
-    "claim_revision",
-    "review_merge",
-    "synthesizer",
     "react_proposer",
     "react_reviewer_search_coverage",
     "react_reviewer_evidence_trace",
@@ -59,13 +41,6 @@ INFERENCE_NODE_MODEL_KEYS = (
 )
 
 DEFAULT_QA_MODEL_ALIASES = {node_name: "agent1" for node_name in INFERENCE_NODE_MODEL_KEYS}
-
-DEFAULT_QA_PEER_REVIEW_CONFIG: Dict[str, Any] = {
-    "max_claims_for_llm_review": 40,
-    "max_second_round_claims": 15,
-    "disable_llm_review_when_abstract_only": True,
-    "fallback_mode": "fail_fast_only",
-}
 
 DEFAULT_QA_PDF_EXTRACTION_CONFIG: Dict[str, Any] = {
     "enabled": True,
@@ -97,11 +72,8 @@ DEFAULT_QA_CONFIG: Dict[str, Any] = {
     "save_output": True,
     "outputs_dir": None,
     "artifact_subdir": "qa_artifacts",
-    "enable_peer_review": True,
     "model_timeout_seconds": 45.0,
-    "progress_log_every_claims": 10,
     "models": copy.deepcopy(DEFAULT_QA_MODEL_ALIASES),
-    "peer_review": copy.deepcopy(DEFAULT_QA_PEER_REVIEW_CONFIG),
     "entity_resolution": copy.deepcopy(DEFAULT_QA_ENTITY_RESOLUTION_CONFIG),
     "react_reviewed": {
         "max_propose_steps_initial": 10,
@@ -163,10 +135,12 @@ DEFAULT_QA_CONFIG: Dict[str, Any] = {
 class QARuntime:
     qa_config: Dict[str, Any]
     grounding_pipeline: QueryGroundingPipeline
-    retrieval_pipeline: HeterogeneousRetrievalPipeline
-    peer_review_pipeline: Optional[StructuredPeerReviewPipeline]
-    synthesis_pipeline: VerifiedSynthesisPipeline
-    react_reviewed_workflow: Optional[Any]
+    query_planner: QueryPlannerNode
+    retriever: RetrieverNode
+    document_acquirer: DocumentAcquirerNode
+    handoff: EvidenceExtractorHandoff
+    evidence_extractor: EvidenceExtractor
+    react_reviewed_workflow: ReactReviewedWorkflow
     runtime_manifest: Dict[str, Any]
 
 
@@ -174,7 +148,6 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     qa_config = copy.deepcopy(DEFAULT_QA_CONFIG)
     raw_qa_config = dict((config or {}).get("qa", {}) or {})
     raw_models = dict(raw_qa_config.pop("models", {}) or {})
-    raw_peer_review = dict(raw_qa_config.pop("peer_review", {}) or {})
     raw_entity_resolution = dict(raw_qa_config.pop("entity_resolution", {}) or {})
     raw_react_reviewed = dict(raw_qa_config.pop("react_reviewed", {}) or {})
     raw_pdf_extraction = dict(raw_qa_config.pop("pdf_extraction", {}) or {})
@@ -192,8 +165,6 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
     provider_config = copy.deepcopy(DEFAULT_QA_CONFIG["providers"])
     provider_config.update(raw_providers)
-    peer_review_config = copy.deepcopy(DEFAULT_QA_PEER_REVIEW_CONFIG)
-    peer_review_config.update(raw_peer_review)
     entity_resolution_config = copy.deepcopy(DEFAULT_QA_ENTITY_RESOLUTION_CONFIG)
     entity_resolution_config.update(raw_entity_resolution)
     react_reviewed_config = copy.deepcopy(DEFAULT_QA_CONFIG["react_reviewed"])
@@ -201,277 +172,75 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     pdf_extraction_config = copy.deepcopy(DEFAULT_QA_PDF_EXTRACTION_CONFIG)
     pdf_extraction_config.update(raw_pdf_extraction)
 
-    qa_config["workflow_mode"] = _coerce_allowed_text(
-        qa_config.get("workflow_mode"),
-        allowed={"ledger", "react_reviewed"},
-        fallback=DEFAULT_QA_CONFIG["workflow_mode"],
-    )
+    workflow_mode = str(qa_config.get("workflow_mode") or DEFAULT_QA_CONFIG["workflow_mode"]).strip() or DEFAULT_QA_CONFIG["workflow_mode"]
+    if workflow_mode != "react_reviewed":
+        raise ValueError(f"qa.workflow_mode must be 'react_reviewed'; got {workflow_mode!r}.")
+    qa_config["workflow_mode"] = workflow_mode
     qa_config["save_output"] = bool(qa_config.get("save_output", DEFAULT_QA_CONFIG["save_output"]))
     qa_config["outputs_dir"] = str(outputs_dir)
     qa_config["artifact_subdir"] = artifact_subdir or str(DEFAULT_QA_CONFIG["artifact_subdir"])
-    qa_config["enable_peer_review"] = bool(
-        qa_config.get("enable_peer_review", DEFAULT_QA_CONFIG["enable_peer_review"])
-    )
-    qa_config["model_timeout_seconds"] = _coerce_positive_float(
-        qa_config.get("model_timeout_seconds"),
-        fallback=45.0,
-    )
-    qa_config["progress_log_every_claims"] = _coerce_positive_int(
-        qa_config.get("progress_log_every_claims"),
-        fallback=10,
-    )
+    qa_config["model_timeout_seconds"] = _coerce_positive_float(qa_config.get("model_timeout_seconds"), fallback=45.0)
     qa_config["models"] = model_aliases
-    qa_config["peer_review"] = {
-        "max_claims_for_llm_review": _coerce_positive_int(
-            peer_review_config.get("max_claims_for_llm_review"),
-            fallback=DEFAULT_QA_PEER_REVIEW_CONFIG["max_claims_for_llm_review"],
-        ),
-        "max_second_round_claims": _coerce_positive_int(
-            peer_review_config.get("max_second_round_claims"),
-            fallback=DEFAULT_QA_PEER_REVIEW_CONFIG["max_second_round_claims"],
-        ),
-        "disable_llm_review_when_abstract_only": bool(
-            peer_review_config.get(
-                "disable_llm_review_when_abstract_only",
-                DEFAULT_QA_PEER_REVIEW_CONFIG["disable_llm_review_when_abstract_only"],
-            )
-        ),
-        "fallback_mode": _coerce_allowed_text(
-            peer_review_config.get("fallback_mode"),
-            allowed={"fail_fast_only"},
-            fallback=DEFAULT_QA_PEER_REVIEW_CONFIG["fallback_mode"],
-        ),
-    }
     qa_config["entity_resolution"] = {
-        "seed_file": str(
-            entity_resolution_config.get("seed_file") or DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["seed_file"]
-        ).strip(),
-        "emit_seed_suggestions": bool(
-            entity_resolution_config.get(
-                "emit_seed_suggestions",
-                DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["emit_seed_suggestions"],
-            )
-        ),
-        "pubchem_enabled": bool(
-            entity_resolution_config.get("pubchem_enabled", DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["pubchem_enabled"])
-        ),
-        "pubchem_entity_types": _coerce_text_list(
-            entity_resolution_config.get("pubchem_entity_types"),
-            fallback=DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["pubchem_entity_types"],
-        ),
-        "max_pubchem_candidates": _coerce_positive_int(
-            entity_resolution_config.get("max_pubchem_candidates"),
-            fallback=DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["max_pubchem_candidates"],
-        ),
-        "mention_extraction_min_confidence": _coerce_probability(
-            entity_resolution_config.get("mention_extraction_min_confidence"),
-            fallback=DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["mention_extraction_min_confidence"],
-        ),
-        "llm_disambiguation_enabled": bool(
-            entity_resolution_config.get(
-                "llm_disambiguation_enabled",
-                DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["llm_disambiguation_enabled"],
-            )
-        ),
-        "disambiguation_min_confidence": _coerce_probability(
-            entity_resolution_config.get("disambiguation_min_confidence"),
-            fallback=DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["disambiguation_min_confidence"],
-        ),
-        "fail_open_on_provider_error": bool(
-            entity_resolution_config.get(
-                "fail_open_on_provider_error",
-                DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["fail_open_on_provider_error"],
-            )
-        ),
+        "seed_file": str(entity_resolution_config.get("seed_file") or DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["seed_file"]).strip(),
+        "emit_seed_suggestions": bool(entity_resolution_config.get("emit_seed_suggestions", DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["emit_seed_suggestions"])),
+        "pubchem_enabled": bool(entity_resolution_config.get("pubchem_enabled", DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["pubchem_enabled"])),
+        "pubchem_entity_types": _coerce_text_list(entity_resolution_config.get("pubchem_entity_types"), fallback=DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["pubchem_entity_types"]),
+        "max_pubchem_candidates": _coerce_positive_int(entity_resolution_config.get("max_pubchem_candidates"), fallback=DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["max_pubchem_candidates"]),
+        "mention_extraction_min_confidence": _coerce_probability(entity_resolution_config.get("mention_extraction_min_confidence"), fallback=DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["mention_extraction_min_confidence"]),
+        "llm_disambiguation_enabled": bool(entity_resolution_config.get("llm_disambiguation_enabled", DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["llm_disambiguation_enabled"])),
+        "disambiguation_min_confidence": _coerce_probability(entity_resolution_config.get("disambiguation_min_confidence"), fallback=DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["disambiguation_min_confidence"]),
+        "fail_open_on_provider_error": bool(entity_resolution_config.get("fail_open_on_provider_error", DEFAULT_QA_ENTITY_RESOLUTION_CONFIG["fail_open_on_provider_error"])),
     }
-    proposer_candidate_target = _coerce_positive_int(
-        react_reviewed_config.get("proposer_candidate_target"),
-        fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_candidate_target"],
-    )
-    proposer_rerank_top_k = min(
-        proposer_candidate_target,
-        _coerce_positive_int(
-            react_reviewed_config.get("proposer_rerank_top_k"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_rerank_top_k"],
-        ),
-    )
+    proposer_candidate_target = _coerce_positive_int(react_reviewed_config.get("proposer_candidate_target"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_candidate_target"])
+    proposer_rerank_top_k = min(proposer_candidate_target, _coerce_positive_int(react_reviewed_config.get("proposer_rerank_top_k"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_rerank_top_k"]))
     qa_config["react_reviewed"] = {
-        "max_propose_steps_initial": _coerce_positive_int(
-            react_reviewed_config.get("max_propose_steps_initial"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_propose_steps_initial"],
-        ),
-        "max_propose_steps_revision": _coerce_positive_int(
-            react_reviewed_config.get("max_propose_steps_revision"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_propose_steps_revision"],
-        ),
-        "proposer_fallback_mode": _coerce_allowed_text(
-            react_reviewed_config.get("proposer_fallback_mode"),
-            allowed={"fail_fast_only"},
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_fallback_mode"],
-        ),
-        "proposer_repair_attempts": _coerce_non_negative_int(
-            react_reviewed_config.get("proposer_repair_attempts"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_repair_attempts"],
-        ),
-        "reviewer_repair_attempts": _coerce_non_negative_int(
-            react_reviewed_config.get("reviewer_repair_attempts"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_repair_attempts"],
-        ),
-        "proposer_evidence_policy": _coerce_allowed_text(
-            react_reviewed_config.get("proposer_evidence_policy"),
-            allowed={"prefer_fulltext"},
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_evidence_policy"],
-        ),
+        "max_propose_steps_initial": _coerce_positive_int(react_reviewed_config.get("max_propose_steps_initial"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_propose_steps_initial"]),
+        "max_propose_steps_revision": _coerce_positive_int(react_reviewed_config.get("max_propose_steps_revision"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_propose_steps_revision"]),
+        "proposer_fallback_mode": _coerce_allowed_text(react_reviewed_config.get("proposer_fallback_mode"), allowed={"fail_fast_only"}, fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_fallback_mode"]),
+        "proposer_repair_attempts": _coerce_non_negative_int(react_reviewed_config.get("proposer_repair_attempts"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_repair_attempts"]),
+        "reviewer_repair_attempts": _coerce_non_negative_int(react_reviewed_config.get("reviewer_repair_attempts"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_repair_attempts"]),
+        "proposer_evidence_policy": _coerce_allowed_text(react_reviewed_config.get("proposer_evidence_policy"), allowed={"prefer_fulltext"}, fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_evidence_policy"]),
         "proposer_candidate_target": proposer_candidate_target,
         "proposer_rerank_top_k": proposer_rerank_top_k,
-        "proposer_pdf_probe_enabled": bool(
-            react_reviewed_config.get(
-                "proposer_pdf_probe_enabled",
-                DEFAULT_QA_CONFIG["react_reviewed"]["proposer_pdf_probe_enabled"],
-            )
-        ),
-        "proposer_pdf_probe_max_candidates": _coerce_positive_int(
-            react_reviewed_config.get("proposer_pdf_probe_max_candidates"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_pdf_probe_max_candidates"],
-        ),
-        "proposer_pdf_probe_timeout_seconds": _coerce_positive_float(
-            react_reviewed_config.get("proposer_pdf_probe_timeout_seconds"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_pdf_probe_timeout_seconds"],
-        ),
-        "expose_candidate_submission_when_rejected": bool(
-            react_reviewed_config.get(
-                "expose_candidate_submission_when_rejected",
-                DEFAULT_QA_CONFIG["react_reviewed"]["expose_candidate_submission_when_rejected"],
-            )
-        ),
-        "grobid_url": _resolve_provider_text(react_reviewed_config.get("grobid_url"))
-        or str(DEFAULT_QA_CONFIG["react_reviewed"]["grobid_url"]),
-        "grobid_preflight_enabled": bool(
-            react_reviewed_config.get(
-                "grobid_preflight_enabled",
-                DEFAULT_QA_CONFIG["react_reviewed"]["grobid_preflight_enabled"],
-            )
-        ),
-        "grobid_startup_enabled": bool(
-            react_reviewed_config.get(
-                "grobid_startup_enabled",
-                DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_enabled"],
-            )
-        ),
-        "grobid_startup_script": _resolve_provider_text(react_reviewed_config.get("grobid_startup_script"))
-        or str(DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_script"]),
-        "grobid_startup_timeout_seconds": _coerce_positive_float(
-            react_reviewed_config.get("grobid_startup_timeout_seconds"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_timeout_seconds"],
-        ),
-        "grobid_startup_wait_timeout_seconds": _coerce_positive_float(
-            react_reviewed_config.get("grobid_startup_wait_timeout_seconds"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_wait_timeout_seconds"],
-        ),
-        "grobid_startup_poll_interval_seconds": _coerce_positive_float(
-            react_reviewed_config.get("grobid_startup_poll_interval_seconds"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_poll_interval_seconds"],
-        ),
-        "stage_watchdog_seconds": _coerce_positive_float(
-            react_reviewed_config.get("stage_watchdog_seconds"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["stage_watchdog_seconds"],
-        ),
-        "max_review_cycles": _coerce_positive_int(
-            react_reviewed_config.get("max_review_cycles"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_review_cycles"],
-        ),
-        "reviewer_max_steps": _coerce_positive_int(
-            react_reviewed_config.get("reviewer_max_steps"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_max_steps"],
-        ),
-        "reviewer_max_concurrency": _coerce_positive_int(
-            react_reviewed_config.get("reviewer_max_concurrency"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_max_concurrency"],
-        ),
-        "reviewer_max_retrieval_actions": _coerce_non_negative_int(
-            react_reviewed_config.get("reviewer_max_retrieval_actions"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_max_retrieval_actions"],
-        ),
+        "proposer_pdf_probe_enabled": bool(react_reviewed_config.get("proposer_pdf_probe_enabled", DEFAULT_QA_CONFIG["react_reviewed"]["proposer_pdf_probe_enabled"])),
+        "proposer_pdf_probe_max_candidates": _coerce_positive_int(react_reviewed_config.get("proposer_pdf_probe_max_candidates"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_pdf_probe_max_candidates"]),
+        "proposer_pdf_probe_timeout_seconds": _coerce_positive_float(react_reviewed_config.get("proposer_pdf_probe_timeout_seconds"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["proposer_pdf_probe_timeout_seconds"]),
+        "expose_candidate_submission_when_rejected": bool(react_reviewed_config.get("expose_candidate_submission_when_rejected", DEFAULT_QA_CONFIG["react_reviewed"]["expose_candidate_submission_when_rejected"])),
+        "grobid_url": _resolve_provider_text(react_reviewed_config.get("grobid_url")) or str(DEFAULT_QA_CONFIG["react_reviewed"]["grobid_url"]),
+        "grobid_preflight_enabled": bool(react_reviewed_config.get("grobid_preflight_enabled", DEFAULT_QA_CONFIG["react_reviewed"]["grobid_preflight_enabled"])),
+        "grobid_startup_enabled": bool(react_reviewed_config.get("grobid_startup_enabled", DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_enabled"])),
+        "grobid_startup_script": _resolve_provider_text(react_reviewed_config.get("grobid_startup_script")) or str(DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_script"]),
+        "grobid_startup_timeout_seconds": _coerce_positive_float(react_reviewed_config.get("grobid_startup_timeout_seconds"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_timeout_seconds"]),
+        "grobid_startup_wait_timeout_seconds": _coerce_positive_float(react_reviewed_config.get("grobid_startup_wait_timeout_seconds"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_wait_timeout_seconds"]),
+        "grobid_startup_poll_interval_seconds": _coerce_positive_float(react_reviewed_config.get("grobid_startup_poll_interval_seconds"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["grobid_startup_poll_interval_seconds"]),
+        "stage_watchdog_seconds": _coerce_positive_float(react_reviewed_config.get("stage_watchdog_seconds"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["stage_watchdog_seconds"]),
+        "max_review_cycles": _coerce_positive_int(react_reviewed_config.get("max_review_cycles"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_review_cycles"]),
+        "reviewer_max_steps": _coerce_positive_int(react_reviewed_config.get("reviewer_max_steps"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_max_steps"]),
+        "reviewer_max_concurrency": _coerce_positive_int(react_reviewed_config.get("reviewer_max_concurrency"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_max_concurrency"]),
+        "reviewer_max_retrieval_actions": _coerce_non_negative_int(react_reviewed_config.get("reviewer_max_retrieval_actions"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_max_retrieval_actions"]),
         "reviewer_retrieval_budget_by_role": {
-            role: _coerce_non_negative_int(
-                dict(react_reviewed_config.get("reviewer_retrieval_budget_by_role", {}) or {}).get(role),
-                fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_retrieval_budget_by_role"][role],
-            )
+            role: _coerce_non_negative_int(dict(react_reviewed_config.get("reviewer_retrieval_budget_by_role", {}) or {}).get(role), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_retrieval_budget_by_role"][role])
             for role in DEFAULT_QA_CONFIG["react_reviewed"]["reviewer_retrieval_budget_by_role"]
         },
-        "max_review_items_per_reviewer": _coerce_positive_int(
-            react_reviewed_config.get("max_review_items_per_reviewer"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_review_items_per_reviewer"],
-        ),
-        "max_review_items_per_step_section": _coerce_positive_int(
-            react_reviewed_config.get("max_review_items_per_step_section"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_review_items_per_step_section"],
-        ),
-        "stop_on_no_blocking_items": bool(
-            react_reviewed_config.get(
-                "stop_on_no_blocking_items",
-                DEFAULT_QA_CONFIG["react_reviewed"]["stop_on_no_blocking_items"],
-            )
-        ),
-        "require_all_reviewers": bool(
-            react_reviewed_config.get(
-                "require_all_reviewers",
-                DEFAULT_QA_CONFIG["react_reviewed"]["require_all_reviewers"],
-            )
-        ),
-        "review_call_retry_limit": _coerce_non_negative_int(
-            react_reviewed_config.get("review_call_retry_limit"),
-            fallback=DEFAULT_QA_CONFIG["react_reviewed"]["review_call_retry_limit"],
-        ),
-        "review_failure_blocks_acceptance": bool(
-            react_reviewed_config.get(
-                "review_failure_blocks_acceptance",
-                DEFAULT_QA_CONFIG["react_reviewed"]["review_failure_blocks_acceptance"],
-            )
-        ),
+        "max_review_items_per_reviewer": _coerce_positive_int(react_reviewed_config.get("max_review_items_per_reviewer"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_review_items_per_reviewer"]),
+        "max_review_items_per_step_section": _coerce_positive_int(react_reviewed_config.get("max_review_items_per_step_section"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["max_review_items_per_step_section"]),
+        "stop_on_no_blocking_items": bool(react_reviewed_config.get("stop_on_no_blocking_items", DEFAULT_QA_CONFIG["react_reviewed"]["stop_on_no_blocking_items"])),
+        "require_all_reviewers": bool(react_reviewed_config.get("require_all_reviewers", DEFAULT_QA_CONFIG["react_reviewed"]["require_all_reviewers"])),
+        "review_call_retry_limit": _coerce_non_negative_int(react_reviewed_config.get("review_call_retry_limit"), fallback=DEFAULT_QA_CONFIG["react_reviewed"]["review_call_retry_limit"]),
+        "review_failure_blocks_acceptance": bool(react_reviewed_config.get("review_failure_blocks_acceptance", DEFAULT_QA_CONFIG["react_reviewed"]["review_failure_blocks_acceptance"])),
     }
     qa_config["pdf_extraction"] = {
         "enabled": bool(pdf_extraction_config.get("enabled", DEFAULT_QA_PDF_EXTRACTION_CONFIG["enabled"])),
-        "primary_backend": _coerce_allowed_text(
-            pdf_extraction_config.get("primary_backend"),
-            allowed={"pymupdf"},
-            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["primary_backend"],
-        ),
-        "secondary_backend": _coerce_allowed_text(
-            pdf_extraction_config.get("secondary_backend"),
-            allowed={"none", "docling"},
-            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["secondary_backend"],
-        ),
-        "min_total_chars": _coerce_non_negative_int(
-            pdf_extraction_config.get("min_total_chars"),
-            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["min_total_chars"],
-        ),
-        "min_chars_per_text_page": _coerce_positive_int(
-            pdf_extraction_config.get("min_chars_per_text_page"),
-            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["min_chars_per_text_page"],
-        ),
-        "min_text_page_ratio": _coerce_probability(
-            pdf_extraction_config.get("min_text_page_ratio"),
-            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["min_text_page_ratio"],
-        ),
-        "min_printable_ratio": _coerce_probability(
-            pdf_extraction_config.get("min_printable_ratio"),
-            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["min_printable_ratio"],
-        ),
-        "snippet_target_chars": _coerce_positive_int(
-            pdf_extraction_config.get("snippet_target_chars"),
-            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["snippet_target_chars"],
-        ),
-        "snippet_overlap_chars": _coerce_non_negative_int(
-            pdf_extraction_config.get("snippet_overlap_chars"),
-            fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["snippet_overlap_chars"],
-        ),
-        "preserve_page_blocks": bool(
-            pdf_extraction_config.get(
-                "preserve_page_blocks",
-                DEFAULT_QA_PDF_EXTRACTION_CONFIG["preserve_page_blocks"],
-            )
-        ),
+        "primary_backend": _coerce_allowed_text(pdf_extraction_config.get("primary_backend"), allowed={"pymupdf"}, fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["primary_backend"]),
+        "secondary_backend": _coerce_allowed_text(pdf_extraction_config.get("secondary_backend"), allowed={"none", "docling"}, fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["secondary_backend"]),
+        "min_total_chars": _coerce_non_negative_int(pdf_extraction_config.get("min_total_chars"), fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["min_total_chars"]),
+        "min_chars_per_text_page": _coerce_positive_int(pdf_extraction_config.get("min_chars_per_text_page"), fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["min_chars_per_text_page"]),
+        "min_text_page_ratio": _coerce_probability(pdf_extraction_config.get("min_text_page_ratio"), fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["min_text_page_ratio"]),
+        "min_printable_ratio": _coerce_probability(pdf_extraction_config.get("min_printable_ratio"), fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["min_printable_ratio"]),
+        "snippet_target_chars": _coerce_positive_int(pdf_extraction_config.get("snippet_target_chars"), fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["snippet_target_chars"]),
+        "snippet_overlap_chars": _coerce_non_negative_int(pdf_extraction_config.get("snippet_overlap_chars"), fallback=DEFAULT_QA_PDF_EXTRACTION_CONFIG["snippet_overlap_chars"]),
+        "preserve_page_blocks": bool(pdf_extraction_config.get("preserve_page_blocks", DEFAULT_QA_PDF_EXTRACTION_CONFIG["preserve_page_blocks"])),
     }
     qa_config["providers"] = {
         "openalex_mailto": _resolve_provider_text(provider_config.get("openalex_mailto")),
@@ -480,27 +249,12 @@ def resolve_qa_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "unpaywall_email": _resolve_provider_text(provider_config.get("unpaywall_email")),
         "http_timeout": _coerce_positive_float(provider_config.get("http_timeout"), fallback=10.0),
         "fetch_timeout": _coerce_positive_float(provider_config.get("fetch_timeout"), fallback=15.0),
-        "document_fetch_timeout_seconds": _coerce_positive_float(
-            provider_config.get("document_fetch_timeout_seconds"),
-            fallback=DEFAULT_QA_CONFIG["providers"]["document_fetch_timeout_seconds"],
-        ),
-        "document_fetch_total_timeout_seconds": _coerce_positive_float(
-            provider_config.get("document_fetch_total_timeout_seconds"),
-            fallback=DEFAULT_QA_CONFIG["providers"]["document_fetch_total_timeout_seconds"],
-        ),
-        "provider_redirect_limit": _coerce_non_negative_int(
-            provider_config.get("provider_redirect_limit"),
-            fallback=DEFAULT_QA_CONFIG["providers"]["provider_redirect_limit"],
-        ),
+        "document_fetch_timeout_seconds": _coerce_positive_float(provider_config.get("document_fetch_timeout_seconds"), fallback=DEFAULT_QA_CONFIG["providers"]["document_fetch_timeout_seconds"]),
+        "document_fetch_total_timeout_seconds": _coerce_positive_float(provider_config.get("document_fetch_total_timeout_seconds"), fallback=DEFAULT_QA_CONFIG["providers"]["document_fetch_total_timeout_seconds"]),
+        "provider_redirect_limit": _coerce_non_negative_int(provider_config.get("provider_redirect_limit"), fallback=DEFAULT_QA_CONFIG["providers"]["provider_redirect_limit"]),
         "retry_attempts": _coerce_non_negative_int(provider_config.get("retry_attempts"), fallback=2),
-        "backoff_base_seconds": _coerce_non_negative_float(
-            provider_config.get("backoff_base_seconds"),
-            fallback=1.0,
-        ),
-        "backoff_max_seconds": _coerce_non_negative_float(
-            provider_config.get("backoff_max_seconds"),
-            fallback=8.0,
-        ),
+        "backoff_base_seconds": _coerce_non_negative_float(provider_config.get("backoff_base_seconds"), fallback=1.0),
+        "backoff_max_seconds": _coerce_non_negative_float(provider_config.get("backoff_max_seconds"), fallback=8.0),
     }
     if qa_config["providers"]["backoff_max_seconds"] < qa_config["providers"]["backoff_base_seconds"]:
         qa_config["providers"]["backoff_max_seconds"] = qa_config["providers"]["backoff_base_seconds"]
@@ -512,10 +266,12 @@ def build_qa_runtime(
     config: Dict[str, Any],
     config_path: str = "./config/config.yaml",
     grounding_pipeline: Optional[QueryGroundingPipeline] = None,
-    retrieval_pipeline: Optional[HeterogeneousRetrievalPipeline] = None,
-    peer_review_pipeline: Optional[StructuredPeerReviewPipeline] = None,
-    synthesis_pipeline: Optional[VerifiedSynthesisPipeline] = None,
-    react_reviewed_workflow: Optional[Any] = None,
+    query_planner: Optional[QueryPlannerNode] = None,
+    retriever: Optional[RetrieverNode] = None,
+    document_acquirer: Optional[DocumentAcquirerNode] = None,
+    handoff: Optional[EvidenceExtractorHandoff] = None,
+    evidence_extractor: Optional[EvidenceExtractor] = None,
+    react_reviewed_workflow: Optional[ReactReviewedWorkflow] = None,
 ) -> QARuntime:
     qa_config = resolve_qa_runtime_config(config)
     llm_configs = dict((config or {}).get("llm", {}) or {})
@@ -523,26 +279,9 @@ def build_qa_runtime(
     llm_manifest: Dict[str, Any] = {}
     llm_cache: Dict[str, Any] = {}
     default_model_timeout = qa_config["model_timeout_seconds"]
-    progress_log_every_claims = qa_config["progress_log_every_claims"]
-    peer_review_config = dict(qa_config.get("peer_review", {}) or {})
 
     def _fallback_mode(node_name: str) -> str:
-        if node_name in {
-            "router",
-            "entity_resolver",
-            "query_planner",
-            "synthesizer",
-            "react_proposer",
-            "react_reviewer_search_coverage",
-            "react_reviewer_evidence_trace",
-            "react_reviewer_reasoning_consistency",
-            "react_reviewer_counterevidence",
-            "methodology_reviewer",
-            "citation_reviewer",
-            "contradiction_reviewer",
-            "claim_revision",
-            "review_merge",
-        }:
+        if node_name in {"router", "entity_resolver", "query_planner", "react_proposer", "react_reviewer_search_coverage", "react_reviewer_evidence_trace", "react_reviewer_reasoning_consistency", "react_reviewer_counterevidence"}:
             return "fail_fast"
         return "deterministic"
 
@@ -553,14 +292,10 @@ def build_qa_runtime(
             return "entity mention extraction will hard-fail when grounding runs"
         if node_name == "query_planner":
             return "query planner will hard-fail during retrieval"
-        if node_name == "synthesizer":
-            return "synthesizer will hard-fail during synthesis"
         if node_name == "react_proposer":
             return "react proposer will hard-fail during proposal"
         if node_name.startswith("react_reviewer_"):
             return "react reviewer will hard-fail during review"
-        if node_name in {"methodology_reviewer", "citation_reviewer", "contradiction_reviewer", "claim_revision", "review_merge"}:
-            return "peer review node will hard-fail during peer review"
         return "node will use deterministic fallback"
 
     def get_node_llm(node_name: str) -> Any:
@@ -574,63 +309,47 @@ def build_qa_runtime(
             "timeout_seconds": None,
         }
         llm_manifest[node_name] = entry
-
         if not requested_alias:
             message = f"qa.models.{node_name} is missing; {_fallback_label(node_name)}."
             warnings.append(message)
             logger.warning(message)
             entry["error"] = "missing_model_alias"
             return None
-
         model_config = llm_configs.get(requested_alias)
         if not isinstance(model_config, dict):
-            message = (
-                f"qa.models.{node_name} points to unknown llm alias '{requested_alias}'; "
-                f"{_fallback_label(node_name)}."
-            )
+            message = f"qa.models.{node_name} points to unknown llm alias '{requested_alias}'; {_fallback_label(node_name)}."
             warnings.append(message)
             logger.warning(message)
             entry["error"] = "unknown_model_alias"
             return None
-
         provider, model, has_api_key = describe_chat_model_config(model_config)
         entry["provider"] = provider
         entry["model"] = model
         if not has_api_key:
-            message = (
-                f"qa.models.{node_name} -> llm.{requested_alias} has no usable api_key; "
-                f"{_fallback_label(node_name)}."
-            )
+            message = f"qa.models.{node_name} -> llm.{requested_alias} has no usable api_key; {_fallback_label(node_name)}."
             warnings.append(message)
             logger.warning(message)
             entry["error"] = "missing_api_key"
             return None
-
         configured_timeout = model_config.get("timeout") or model_config.get("request_timeout") or default_model_timeout
         entry["timeout_seconds"] = configured_timeout
         if requested_alias in llm_cache:
             entry["enabled"] = True
             return llm_cache[requested_alias]
-
         effective_model_config = dict(model_config)
         configured_timeout = effective_model_config.get("timeout") or effective_model_config.get("request_timeout")
         if configured_timeout in (None, "") and default_model_timeout is not None:
             effective_model_config["timeout"] = default_model_timeout
             configured_timeout = default_model_timeout
         entry["timeout_seconds"] = configured_timeout
-
         try:
             llm = build_chat_model_from_config(effective_model_config)
         except Exception as exc:
-            message = (
-                f"Failed to build chat model for qa.models.{node_name} -> llm.{requested_alias}: {exc}; "
-                f"{_fallback_label(node_name)}."
-            )
+            message = f"Failed to build chat model for qa.models.{node_name} -> llm.{requested_alias}: {exc}; {_fallback_label(node_name)}."
             warnings.append(message)
             logger.warning(message)
             entry["error"] = str(exc)
             return None
-
         llm_cache[requested_alias] = llm
         entry["enabled"] = True
         return llm
@@ -683,114 +402,22 @@ def build_qa_runtime(
         "backoff_max_seconds": backoff_max_seconds,
     }
 
-    openalex_client = OpenAlexClient(
-        timeout=http_timeout,
-        mailto=provider_config["openalex_mailto"],
-        **retry_kwargs,
-    )
-    crossref_client = CrossrefClient(
-        timeout=http_timeout,
-        mailto=provider_config["crossref_mailto"],
-        **retry_kwargs,
-    )
+    openalex_client = OpenAlexClient(timeout=http_timeout, mailto=provider_config["openalex_mailto"], **retry_kwargs)
+    crossref_client = CrossrefClient(timeout=http_timeout, mailto=provider_config["crossref_mailto"], **retry_kwargs)
     semantic_scholar_api_key = provider_config["semantic_scholar_api_key"]
     if not semantic_scholar_api_key:
         message = "qa.providers.semantic_scholar_api_key is not configured; Semantic Scholar will run without an API key."
         warnings.append(message)
         logger.warning(message)
-    semantic_scholar_client = SemanticScholarClient(
-        timeout=http_timeout,
-        api_key=semantic_scholar_api_key,
-        **retry_kwargs,
-    )
+    semantic_scholar_client = SemanticScholarClient(timeout=http_timeout, api_key=semantic_scholar_api_key, **retry_kwargs)
     unpaywall_email = provider_config["unpaywall_email"]
     unpaywall_client = None
     if unpaywall_email:
-        unpaywall_client = UnpaywallClient(
-            email=unpaywall_email,
-            timeout=http_timeout,
-            **retry_kwargs,
-        )
+        unpaywall_client = UnpaywallClient(email=unpaywall_email, timeout=http_timeout, **retry_kwargs)
     else:
         message = "qa.providers.unpaywall_email is not configured; Unpaywall lookup will be skipped."
         warnings.append(message)
         logger.warning(message)
-
-    runtime_manifest = {
-        "config_path": config_path,
-        "qa": {
-            "workflow_mode": qa_config["workflow_mode"],
-            "save_output": qa_config["save_output"],
-            "outputs_dir": qa_config["outputs_dir"],
-            "artifact_subdir": qa_config["artifact_subdir"],
-            "enable_peer_review": qa_config["enable_peer_review"],
-            "model_timeout_seconds": qa_config["model_timeout_seconds"],
-            "progress_log_every_claims": qa_config["progress_log_every_claims"],
-            "peer_review": qa_config["peer_review"],
-            "entity_resolution": qa_config["entity_resolution"],
-            "react_reviewed": qa_config["react_reviewed"],
-            "pdf_extraction": qa_config["pdf_extraction"],
-        },
-        "models": llm_manifest,
-        "providers": {
-            "openalex": {
-                "enabled": True,
-                "mailto": provider_config["openalex_mailto"],
-                "timeout": http_timeout,
-                "retry_attempts": retry_attempts,
-                "backoff_base_seconds": backoff_base_seconds,
-                "backoff_max_seconds": backoff_max_seconds,
-            },
-            "crossref": {
-                "enabled": True,
-                "mailto": provider_config["crossref_mailto"],
-                "timeout": http_timeout,
-                "retry_attempts": retry_attempts,
-                "backoff_base_seconds": backoff_base_seconds,
-                "backoff_max_seconds": backoff_max_seconds,
-            },
-            "semantic_scholar": {
-                "enabled": True,
-                "api_key_configured": bool(semantic_scholar_api_key),
-                "timeout": http_timeout,
-                "retry_attempts": retry_attempts,
-                "backoff_base_seconds": backoff_base_seconds,
-                "backoff_max_seconds": backoff_max_seconds,
-            },
-            "unpaywall": {
-                "enabled": bool(unpaywall_client is not None),
-                "email": unpaywall_email,
-                "timeout": http_timeout,
-                "retry_attempts": retry_attempts,
-                "backoff_base_seconds": backoff_base_seconds,
-                "backoff_max_seconds": backoff_max_seconds,
-            },
-            "http_fetcher": {
-                "enabled": True,
-                "timeout": fetch_timeout,
-                "document_fetch_timeout_seconds": document_fetch_timeout_seconds,
-                "document_fetch_total_timeout_seconds": document_fetch_total_timeout_seconds,
-                "provider_redirect_limit": provider_redirect_limit,
-                "retry_attempts": retry_attempts,
-                "backoff_base_seconds": backoff_base_seconds,
-                "backoff_max_seconds": backoff_max_seconds,
-            },
-            "pubchem": {
-                "enabled": bool(qa_config["entity_resolution"]["pubchem_enabled"]),
-                "timeout": http_timeout,
-                "max_candidates": qa_config["entity_resolution"]["max_pubchem_candidates"],
-                "entity_types": list(qa_config["entity_resolution"]["pubchem_entity_types"]),
-            },
-        },
-        "warnings": warnings,
-        "overrides": {
-            "grounding_pipeline": grounding_pipeline is not None,
-            "retrieval_pipeline": retrieval_pipeline is not None,
-            "peer_review_pipeline": peer_review_pipeline is not None,
-            "synthesis_pipeline": synthesis_pipeline is not None,
-            "react_reviewed_workflow": react_reviewed_workflow is not None,
-        },
-    }
 
     if grounding_pipeline is None:
         entity_resolution_config = dict(qa_config.get("entity_resolution", {}) or {})
@@ -803,10 +430,7 @@ def build_qa_runtime(
                 pubchem_enabled=entity_resolution_config.get("pubchem_enabled", True),
                 pubchem_entity_types=entity_resolution_config.get("pubchem_entity_types"),
                 max_pubchem_candidates=entity_resolution_config.get("max_pubchem_candidates", 5),
-                mention_extraction_min_confidence=entity_resolution_config.get(
-                    "mention_extraction_min_confidence",
-                    0.7,
-                ),
+                mention_extraction_min_confidence=entity_resolution_config.get("mention_extraction_min_confidence", 0.7),
                 llm_disambiguation_enabled=entity_resolution_config.get("llm_disambiguation_enabled", True),
                 disambiguation_min_confidence=entity_resolution_config.get("disambiguation_min_confidence", 0.7),
                 fail_open_on_provider_error=entity_resolution_config.get("fail_open_on_provider_error", True),
@@ -814,70 +438,29 @@ def build_qa_runtime(
             ),
         )
 
-    if retrieval_pipeline is None:
-        handoff = EvidenceExtractorHandoff()
-        retrieval_pipeline = HeterogeneousRetrievalPipeline(
-            query_planner=QueryPlannerNode(llm=get_node_llm("query_planner")),
-            retriever=RetrieverNode(
-                openalex_client=openalex_client,
-                crossref_client=crossref_client,
-                semantic_scholar_client=semantic_scholar_client,
-            ),
-            document_acquirer=DocumentAcquirerNode(
-                unpaywall_client=unpaywall_client,
-                fetcher=HttpTextFetcher(
-                    timeout=fetch_timeout,
-                    max_redirects=provider_redirect_limit,
-                    **retry_kwargs,
-                ),
-                pdf_extractor=PDFExtractionPipeline(config=qa_config["pdf_extraction"]),
-                document_fetch_timeout_seconds=document_fetch_timeout_seconds,
-                document_fetch_total_timeout_seconds=document_fetch_total_timeout_seconds,
-            ),
-            handoff=handoff,
-            evidence_extractor=EvidenceExtractor(
-                handoff=handoff,
-                llm=get_node_llm("evidence_extractor"),
-            ),
-            claim_miner=ClaimMiner(llm=get_node_llm("claim_miner")),
-            ledger_builder=EvidenceLedgerBuilder(),
-            peer_review_pipeline=None,
-            progress_log_every=progress_log_every_claims,
-        )
+    handoff = handoff or EvidenceExtractorHandoff()
+    query_planner = query_planner or QueryPlannerNode(llm=get_node_llm("query_planner"))
+    retriever = retriever or RetrieverNode(openalex_client=openalex_client, crossref_client=crossref_client, semantic_scholar_client=semantic_scholar_client)
+    document_acquirer = document_acquirer or DocumentAcquirerNode(
+        unpaywall_client=unpaywall_client,
+        fetcher=HttpTextFetcher(timeout=fetch_timeout, max_redirects=provider_redirect_limit, **retry_kwargs),
+        pdf_extractor=PDFExtractionPipeline(config=qa_config["pdf_extraction"]),
+        document_fetch_timeout_seconds=document_fetch_timeout_seconds,
+        document_fetch_total_timeout_seconds=document_fetch_total_timeout_seconds,
+    )
+    evidence_extractor = evidence_extractor or EvidenceExtractor(handoff=handoff, llm=get_node_llm("evidence_extractor"))
 
-    if not qa_config["enable_peer_review"]:
-        peer_review_pipeline = None
-    elif peer_review_pipeline is None:
-        peer_review_pipeline = StructuredPeerReviewPipeline(
-            methodology_reviewer=MethodologyReviewer(llm=get_node_llm("methodology_reviewer")),
-            citation_reviewer=CitationReviewer(llm=get_node_llm("citation_reviewer")),
-            contradiction_reviewer=ContradictionReviewer(llm=get_node_llm("contradiction_reviewer")),
-            claim_revision_node=ClaimRevisionNode(llm=get_node_llm("claim_revision")),
-            review_merge_node=ReviewMergeNode(llm=get_node_llm("review_merge")),
-            max_claims_for_llm_review=peer_review_config["max_claims_for_llm_review"],
-            max_second_round_claims=peer_review_config["max_second_round_claims"],
-            disable_llm_review_when_abstract_only=peer_review_config["disable_llm_review_when_abstract_only"],
-            fallback_mode=peer_review_config["fallback_mode"],
-            progress_log_every_claims=progress_log_every_claims,
-        )
-
-    if synthesis_pipeline is None:
-        synthesis_pipeline = VerifiedSynthesisPipeline(
-            synthesizer=SynthesizerNode(llm=get_node_llm("synthesizer")),
-            progress_log_every=progress_log_every_claims,
-        )
-
-    if react_reviewed_workflow is None and qa_config["workflow_mode"] == "react_reviewed":
+    if react_reviewed_workflow is None:
         react_reviewed_config = dict(qa_config.get("react_reviewed", {}) or {})
         react_reviewed_workflow = ReactReviewedWorkflow(
             qa_config=qa_config,
             router=grounding_pipeline.router,
             entity_resolver=grounding_pipeline.entity_resolver,
-            query_planner=retrieval_pipeline.query_planner,
-            retriever=retrieval_pipeline.retriever,
-            document_acquirer=retrieval_pipeline.document_acquirer,
-            handoff=retrieval_pipeline.handoff,
-            evidence_extractor=retrieval_pipeline.evidence_extractor,
+            query_planner=query_planner,
+            retriever=retriever,
+            document_acquirer=document_acquirer,
+            handoff=handoff,
+            evidence_extractor=evidence_extractor,
             paper_profile_builder=GrobidPaperProfileBuilder(
                 grobid_url=react_reviewed_config.get("grobid_url"),
                 preflight_enabled=react_reviewed_config.get("grobid_preflight_enabled", True),
@@ -896,21 +479,43 @@ def build_qa_runtime(
             },
             proposer_candidate_target=react_reviewed_config.get("proposer_candidate_target", 10),
             proposer_rerank_top_k=react_reviewed_config.get("proposer_rerank_top_k", 5),
-            pdf_probe_client=PdfUrlProbeClient(
-                timeout=react_reviewed_config.get("proposer_pdf_probe_timeout_seconds", 5.0),
-                max_redirects=provider_redirect_limit,
-                **retry_kwargs,
-            ),
+            pdf_probe_client=PdfUrlProbeClient(timeout=react_reviewed_config.get("proposer_pdf_probe_timeout_seconds", 5.0), max_redirects=provider_redirect_limit, **retry_kwargs),
             proposer_pdf_probe_enabled=react_reviewed_config.get("proposer_pdf_probe_enabled", True),
             proposer_pdf_probe_max_candidates=react_reviewed_config.get("proposer_pdf_probe_max_candidates", 20),
         )
 
+    runtime_manifest = {
+        "config_path": config_path,
+        "qa": {
+            "workflow_mode": qa_config["workflow_mode"],
+            "save_output": qa_config["save_output"],
+            "outputs_dir": qa_config["outputs_dir"],
+            "artifact_subdir": qa_config["artifact_subdir"],
+            "model_timeout_seconds": qa_config["model_timeout_seconds"],
+            "entity_resolution": qa_config["entity_resolution"],
+            "react_reviewed": qa_config["react_reviewed"],
+            "pdf_extraction": qa_config["pdf_extraction"],
+        },
+        "models": llm_manifest,
+        "providers": {
+            "openalex": {"enabled": True, "mailto": provider_config["openalex_mailto"], "timeout": http_timeout, "retry_attempts": retry_attempts, "backoff_base_seconds": backoff_base_seconds, "backoff_max_seconds": backoff_max_seconds},
+            "crossref": {"enabled": True, "mailto": provider_config["crossref_mailto"], "timeout": http_timeout, "retry_attempts": retry_attempts, "backoff_base_seconds": backoff_base_seconds, "backoff_max_seconds": backoff_max_seconds},
+            "semantic_scholar": {"enabled": True, "api_key_configured": bool(semantic_scholar_api_key), "timeout": http_timeout, "retry_attempts": retry_attempts, "backoff_base_seconds": backoff_base_seconds, "backoff_max_seconds": backoff_max_seconds},
+            "unpaywall": {"enabled": bool(unpaywall_client is not None), "email": unpaywall_email, "timeout": http_timeout, "retry_attempts": retry_attempts, "backoff_base_seconds": backoff_base_seconds, "backoff_max_seconds": backoff_max_seconds},
+            "http_fetcher": {"enabled": True, "timeout": fetch_timeout, "document_fetch_timeout_seconds": document_fetch_timeout_seconds, "document_fetch_total_timeout_seconds": document_fetch_total_timeout_seconds, "provider_redirect_limit": provider_redirect_limit, "retry_attempts": retry_attempts, "backoff_base_seconds": backoff_base_seconds, "backoff_max_seconds": backoff_max_seconds},
+            "pubchem": {"enabled": bool(qa_config["entity_resolution"]["pubchem_enabled"]), "timeout": http_timeout, "max_candidates": qa_config["entity_resolution"]["max_pubchem_candidates"], "entity_types": list(qa_config["entity_resolution"]["pubchem_entity_types"])},
+        },
+        "warnings": warnings,
+    }
+
     return QARuntime(
         qa_config=qa_config,
         grounding_pipeline=grounding_pipeline,
-        retrieval_pipeline=retrieval_pipeline,
-        peer_review_pipeline=peer_review_pipeline,
-        synthesis_pipeline=synthesis_pipeline,
+        query_planner=query_planner,
+        retriever=retriever,
+        document_acquirer=document_acquirer,
+        handoff=handoff,
+        evidence_extractor=evidence_extractor,
         react_reviewed_workflow=react_reviewed_workflow,
         runtime_manifest=runtime_manifest,
     )
@@ -938,6 +543,14 @@ def _coerce_non_negative_float(value: Any, *, fallback: float) -> float:
     return number if number >= 0 else fallback
 
 
+def _coerce_positive_int(value: Any, *, fallback: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return number if number > 0 else fallback
+
+
 def _coerce_non_negative_int(value: Any, *, fallback: int) -> int:
     try:
         number = int(value)
@@ -956,30 +569,16 @@ def _coerce_probability(value: Any, *, fallback: float) -> float:
     return number
 
 
-def _coerce_positive_int(value: Any, *, fallback: int) -> int:
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return fallback
-    return number if number > 0 else fallback
-
-
 def _coerce_allowed_text(value: Any, *, allowed: set[str], fallback: str) -> str:
-    text = str(value or "").strip().lower()
+    text = str(value or "").strip()
     return text if text in allowed else fallback
 
 
 def _coerce_text_list(value: Any, *, fallback: list[str]) -> list[str]:
     if value is None:
         return list(fallback)
-    values = value if isinstance(value, list) else [value]
-    cleaned: list[str] = []
-    seen = set()
-    for item in values:
-        text = str(item or "").strip()
-        key = text.lower()
-        if not text or key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(text)
-    return cleaned or list(fallback)
+    if isinstance(value, list):
+        cleaned = [str(item).strip() for item in value if str(item).strip()]
+        return cleaned or list(fallback)
+    text = str(value).strip()
+    return [text] if text else list(fallback)
