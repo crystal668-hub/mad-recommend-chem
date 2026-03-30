@@ -1,5 +1,6 @@
 import copy
 import json
+import re
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,6 +65,27 @@ from qa.react_reviewed.common import (
     tool_schemas,
 )
 from qa.react_reviewed.memory.workspace import ReactReviewedWorkspace
+
+
+_CONSISTENCY_TITLE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "using",
+    "with",
+}
+
 
 class ReactReviewedProposerAgent:
     def __init__(
@@ -560,6 +582,11 @@ class ReactReviewedProposerAgent:
 
         agent_holder: Dict[str, Any] = {}
         run_state = _ProposerRunState(evidence_policy=self.evidence_policy)
+        self._seed_run_state_from_prior_context(
+            workspace=workspace,
+            cycle_number=cycle_number,
+            run_state=run_state,
+        )
 
         def _policy_block(message: str, *, code: str) -> ToolResult:
             return ToolResult(
@@ -641,15 +668,15 @@ class ReactReviewedProposerAgent:
             max_candidates: Optional[int] = None,
         ) -> ToolResult:
             """Rerank downloaded PDFs using clipped GROBID XML profiles and lock the strongest candidates."""
-            if not run_state.searched_paper_ids:
+            if not run_state.known_candidate_paper_ids():
                 return _policy_block(
-                    "screen_papers requires prior search_papers results in this cycle.",
+                    "screen_papers requires prior search_papers results or inherited carryover candidates in this cycle.",
                     code="screen_requires_search",
                 )
             candidate_ids = [
                 paper_id
-                for paper_id in list(paper_ids or run_state.search_ordered_paper_ids or sorted(run_state.searched_paper_ids))
-                if str(paper_id or "").strip() in run_state.searched_paper_ids
+                for paper_id in list(paper_ids or run_state.search_ordered_paper_ids or sorted(run_state.known_candidate_paper_ids()))
+                if str(paper_id or "").strip() in run_state.known_candidate_paper_ids()
             ]
             if not candidate_ids:
                 return _policy_block(
@@ -752,11 +779,11 @@ class ReactReviewedProposerAgent:
             unknown_paper_ids = [
                 current_paper_id
                 for current_paper_id in requested_paper_ids
-                if current_paper_id not in run_state.searched_paper_ids
+                if current_paper_id not in run_state.known_candidate_paper_ids()
             ]
             if unknown_paper_ids:
                 return _policy_block(
-                    "download_document requires papers selected from prior search_papers results; "
+                    "download_document requires papers selected from prior search_papers results or inherited carryover candidates; "
                     f"unknown paper_ids={unknown_paper_ids}.",
                     code="paper_not_searched",
                 )
@@ -1347,8 +1374,10 @@ class ReactReviewedProposerAgent:
         if prior_submission is None:
             return raw_payload
         prior_payload = prior_submission.model_dump(exclude_none=True)
+        section_patch_map: Dict[str, Dict[str, bool]] = {}
         if not _normalize_list_payload(raw_payload.get("citations")):
             raw_payload["citations"] = copy.deepcopy(prior_payload.get("citations") or [])
+            raw_payload["_prior_citations_patched"] = True
         if not _normalize_list_payload(raw_payload.get("limitations")):
             raw_payload["limitations"] = copy.deepcopy(prior_payload.get("limitations") or [])
         if not _normalize_list_payload(raw_payload.get("step_refs")):
@@ -1370,6 +1399,7 @@ class ReactReviewedProposerAgent:
         }
         for prior_section in prior_submission.sections:
             current = raw_sections_by_id.get(prior_section.section_id)
+            section_patch_flags = section_patch_map.setdefault(prior_section.section_id, {})
             if current is None:
                 cloned = prior_section.model_dump(exclude_none=True)
                 cloned["issue_refs"] = _merge_unique_text(
@@ -1378,13 +1408,20 @@ class ReactReviewedProposerAgent:
                 )
                 raw_sections.append(cloned)
                 raw_sections_by_id[prior_section.section_id] = cloned
+                section_patch_flags["created"] = True
+                section_patch_flags["content"] = True
+                section_patch_flags["citation_ids"] = True
+                section_patch_flags["step_refs"] = True
                 continue
             if not _compact_text(current.get("content")):
                 current["content"] = prior_section.content
+                section_patch_flags["content"] = True
             if not _normalize_list_payload(current.get("citation_ids")):
                 current["citation_ids"] = list(prior_section.citation_ids or [])
+                section_patch_flags["citation_ids"] = True
             if not _normalize_list_payload(current.get("step_refs")):
                 current["step_refs"] = [item.model_dump(exclude_none=True) for item in prior_section.step_refs]
+                section_patch_flags["step_refs"] = True
             if not isinstance(current.get("section_confidence"), dict):
                 current["section_confidence"] = prior_section.section_confidence.model_dump(exclude_none=True)
             current["issue_refs"] = _merge_unique_text(
@@ -1392,6 +1429,8 @@ class ReactReviewedProposerAgent:
                 list(prior_section.issue_refs or []) + [item.review_id for item in open_review_items],
             )
         raw_payload["sections"] = raw_sections
+        if section_patch_map:
+            raw_payload["_prior_section_patch_map"] = section_patch_map
         if raw_payload.get("overall_confidence") in (None, "", []):
             raw_payload["overall_confidence"] = prior_payload.get("overall_confidence")
         return raw_payload
@@ -1497,6 +1536,7 @@ class ReactReviewedProposerAgent:
         normalized: List[Dict[str, Any]] = []
         if run_state is None:
             return [copy.deepcopy(item) for item in list(raw_citations or []) if isinstance(item, dict)]
+        known_candidate_paper_ids = run_state.known_candidate_paper_ids().union(run_state.acquired_paper_ids)
         for index, raw_item in enumerate(list(raw_citations or []), start=1):
             if not isinstance(raw_item, dict):
                 continue
@@ -1504,7 +1544,7 @@ class ReactReviewedProposerAgent:
             paper_id = str(current.get("paper_id") or "").strip()
             if not paper_id:
                 continue
-            if paper_id not in run_state.searched_paper_ids and paper_id not in run_state.acquired_paper_ids:
+            if paper_id not in known_candidate_paper_ids:
                 continue
             valid_section_ids: List[str] = []
             for section_id in list(current.get("section_ids") or []):
@@ -1568,6 +1608,181 @@ class ReactReviewedProposerAgent:
             current["evidence_ids"] = _merge_unique_text([], valid_evidence_ids)
             normalized.append(current)
         return normalized
+
+    def _seed_run_state_from_prior_context(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        cycle_number: int,
+        run_state: _ProposerRunState,
+    ) -> None:
+        if cycle_number <= 1 or workspace.current_submission is None:
+            return
+        carryover_paper_ids: List[str] = []
+        for citation in workspace.current_submission.citations:
+            paper_id = str(citation.paper_id or "").strip()
+            if not paper_id:
+                continue
+            if paper_id not in workspace.paper_candidates and paper_id not in workspace.paper_records:
+                continue
+            if paper_id not in carryover_paper_ids:
+                carryover_paper_ids.append(paper_id)
+        run_state.seed_carryover_candidates(carryover_paper_ids)
+
+    def _citation_catalog_signature(self, citations: Sequence[Any]) -> Tuple[Tuple[str, str], ...]:
+        signature: List[Tuple[str, str]] = []
+        for item in list(citations or []):
+            if isinstance(item, SubmissionCitation):
+                citation_id = str(item.citation_id or "").strip()
+                paper_id = str(item.paper_id or "").strip()
+            elif isinstance(item, dict):
+                citation_id = str(item.get("citation_id") or "").strip()
+                paper_id = str(item.get("paper_id") or "").strip()
+            else:
+                continue
+            if citation_id and paper_id:
+                signature.append((citation_id, paper_id))
+        return tuple(signature)
+
+    def _rebuild_submission_for_validation(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        cycle_number: int,
+        open_review_items: Sequence[ReviewItem],
+        raw_payload: Dict[str, Any],
+        run_state: Optional[_ProposerRunState],
+    ) -> Optional[AnswerSubmission]:
+        if run_state is None:
+            return None
+        step_refs: List[SubmissionStepRef] = []
+        for item in list(_normalize_list_payload(raw_payload.get("step_refs")) or []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                step_refs.append(SubmissionStepRef.model_validate(item))
+            except Exception:
+                continue
+        if not step_refs:
+            step_refs = [
+                SubmissionStepRef(
+                    trajectory_id=str(raw_payload.get("trajectory_id") or f"traj_placeholder_{cycle_number}"),
+                    step_number=1,
+                )
+            ]
+        try:
+            return self._build_submission_from_workspace(
+                workspace=workspace,
+                cycle_number=cycle_number,
+                step_refs=step_refs,
+                open_review_items=open_review_items,
+                run_state=run_state,
+            )
+        except Exception:
+            return None
+
+    def _normalize_consistency_text(self, value: Any) -> str:
+        return " ".join(re.findall(r"[a-z0-9]+", str(value or "").lower()))
+
+    def _title_consistency_tokens(self, title: Any) -> List[str]:
+        tokens: List[str] = []
+        seen = set()
+        for token in re.findall(r"[a-z0-9]+", str(title or "").lower()):
+            if len(token) < 4 or token in _CONSISTENCY_TITLE_STOPWORDS or token in seen:
+                continue
+            seen.add(token)
+            tokens.append(token)
+        return tokens
+
+    def _section_mentions_uncited_paper(
+        self,
+        *,
+        content: str,
+        paper_title: str,
+        paper_year: Optional[int],
+    ) -> bool:
+        normalized_content = self._normalize_consistency_text(content)
+        if not normalized_content or not paper_title:
+            return False
+        normalized_title = self._normalize_consistency_text(paper_title)
+        if normalized_title and len(normalized_title) >= 24 and normalized_title in normalized_content:
+            return True
+        title_tokens = self._title_consistency_tokens(paper_title)
+        if not title_tokens:
+            return False
+        content_token_set = set(normalized_content.split())
+        token_hits = sum(1 for token in title_tokens if token in content_token_set)
+        threshold = min(4, max(2, len(title_tokens) // 2))
+        if token_hits >= threshold and paper_year is not None and str(paper_year) in content_token_set:
+            return True
+        return False
+
+    def _validate_section_citation_consistency(
+        self,
+        *,
+        workspace: ReactReviewedWorkspace,
+        submission: AnswerSubmission,
+    ) -> None:
+        paper_metadata: Dict[str, Dict[str, Any]] = {}
+
+        def _remember_paper(
+            *,
+            paper_id: Optional[str],
+            title: Optional[str],
+            year: Optional[int],
+        ) -> None:
+            normalized_paper_id = str(paper_id or "").strip()
+            normalized_title = _compact_text(title)
+            if not normalized_paper_id or not normalized_title:
+                return
+            current = paper_metadata.get(normalized_paper_id)
+            if current is None:
+                paper_metadata[normalized_paper_id] = {
+                    "paper_id": normalized_paper_id,
+                    "title": normalized_title,
+                    "year": year,
+                }
+                return
+            if not current.get("title") and normalized_title:
+                current["title"] = normalized_title
+            if current.get("year") is None and year is not None:
+                current["year"] = year
+
+        for citation in submission.citations:
+            _remember_paper(paper_id=citation.paper_id, title=citation.title, year=citation.year)
+        if workspace.current_submission is not None:
+            for citation in workspace.current_submission.citations:
+                _remember_paper(paper_id=citation.paper_id, title=citation.title, year=citation.year)
+        for paper_id, paper_record in workspace.paper_records.items():
+            _remember_paper(paper_id=paper_id, title=paper_record.title, year=paper_record.year)
+        for paper_id, paper_candidate in workspace.paper_candidates.items():
+            _remember_paper(paper_id=paper_id, title=paper_candidate.title, year=paper_candidate.year)
+
+        citation_lookup = {citation.citation_id: citation for citation in submission.citations}
+        consistency_errors: List[str] = []
+        for section in submission.sections:
+            cited_paper_ids = {
+                citation_lookup[citation_id].paper_id
+                for citation_id in list(section.citation_ids or [])
+                if citation_id in citation_lookup
+            }
+            if not cited_paper_ids:
+                continue
+            for paper_id, metadata in paper_metadata.items():
+                if paper_id in cited_paper_ids:
+                    continue
+                if self._section_mentions_uncited_paper(
+                    content=section.content,
+                    paper_title=str(metadata.get("title") or ""),
+                    paper_year=metadata.get("year"),
+                ):
+                    consistency_errors.append(
+                        f"Section '{section.section_id}' content references paper '{metadata['title']}' "
+                        f"({metadata.get('year') or 'n.d.'}) but cites different paper_ids: {', '.join(sorted(cited_paper_ids))}."
+                    )
+                    break
+        if consistency_errors:
+            raise ValueError(" ; ".join(_merge_unique_text([], consistency_errors)))
 
     def _salvage_submission_payload(
         self,
@@ -1758,6 +1973,20 @@ class ReactReviewedProposerAgent:
                 logger.info("react_reviewed_proposer_repair_succeeded cycle=%s attempt=%s", cycle_number, attempt_number)
                 return submission, trajectory
             except Exception as exc:
+                rebuilt_submission = self._try_rebuild_submission_from_workspace(
+                    workspace=workspace,
+                    cycle_number=cycle_number,
+                    open_review_items=open_review_items,
+                    trajectory=trajectory,
+                    run_state=run_state,
+                )
+                if rebuilt_submission is not None:
+                    logger.warning(
+                        "react_reviewed_proposer_repair_rebuilt_from_workspace cycle=%s attempt=%s",
+                        cycle_number,
+                        attempt_number,
+                    )
+                    return rebuilt_submission, trajectory
                 salvage_payload = None
                 salvage_error: Optional[Exception] = None
                 salvage_sources = [
@@ -1787,20 +2016,6 @@ class ReactReviewedProposerAgent:
                     if salvaged_payload is not None:
                         salvage_payload = salvaged_payload
                         salvage_error = salvaged_error
-                rebuilt_submission = self._try_rebuild_submission_from_workspace(
-                    workspace=workspace,
-                    cycle_number=cycle_number,
-                    open_review_items=open_review_items,
-                    trajectory=trajectory,
-                    run_state=run_state,
-                )
-                if rebuilt_submission is not None:
-                    logger.warning(
-                        "react_reviewed_proposer_repair_rebuilt_from_workspace cycle=%s attempt=%s",
-                        cycle_number,
-                        attempt_number,
-                    )
-                    return rebuilt_submission, trajectory
                 last_error = ReactReviewedStructuredOutputError(
                     stage="proposer_repair",
                     cycle_number=cycle_number,
@@ -1940,6 +2155,15 @@ class ReactReviewedProposerAgent:
             raw_payload=raw_payload,
             open_review_items=open_review_items,
         )
+        prior_section_patch_map = (
+            dict(raw_payload.pop("_prior_section_patch_map", {}))
+            if isinstance(raw_payload.get("_prior_section_patch_map"), dict)
+            else {}
+        )
+        raw_payload.pop("_prior_citations_patched", None)
+        prior_citation_signature = self._citation_catalog_signature(
+            workspace.current_submission.citations if workspace.current_submission is not None else []
+        )
         raw_payload.setdefault("submission_id", f"submission_cycle_{cycle_number}")
         raw_payload.setdefault("question", workspace.question)
         raw_payload.setdefault("version", cycle_number)
@@ -1951,11 +2175,6 @@ class ReactReviewedProposerAgent:
             raw_citations=list(_normalize_list_payload(raw_payload.get("citations")) or []),
             run_state=run_state,
         )
-        raw_citations_by_id = {
-            str(item.get("citation_id") or "").strip(): item
-            for item in list(raw_payload.get("citations") or [])
-            if isinstance(item, dict) and str(item.get("citation_id") or "").strip()
-        }
         def _raw_citation_has_fulltext_anchor(citation_payload: Dict[str, Any]) -> bool:
             paper_id = str(citation_payload.get("paper_id") or "").strip()
             evidence_ids = {
@@ -1996,8 +2215,87 @@ class ReactReviewedProposerAgent:
             for item in raw_citations
             if isinstance(item, dict)
         )
+        fallback_citations_applied = False
         if fallback_citations and (not raw_citations or not anchored_input_citation_found):
             raw_payload["citations"] = fallback_citations
+            fallback_citations_applied = True
+        current_citation_signature = self._citation_catalog_signature(raw_payload.get("citations") or [])
+        prior_section_reuse_at_risk = bool(
+            prior_section_patch_map
+            and prior_citation_signature
+            and current_citation_signature
+            and current_citation_signature != prior_citation_signature
+            and any(
+                any(flags.get(key) for key in ("created", "content", "citation_ids"))
+                for flags in prior_section_patch_map.values()
+                if isinstance(flags, dict)
+            )
+        )
+        rebuilt_submission = None
+        if fallback_citations_applied or prior_section_reuse_at_risk:
+            rebuilt_submission = self._rebuild_submission_for_validation(
+                workspace=workspace,
+                cycle_number=cycle_number,
+                open_review_items=open_review_items,
+                raw_payload=raw_payload,
+                run_state=run_state,
+            )
+        if fallback_citations_applied:
+            if rebuilt_submission is None:
+                raise ValueError(
+                    "Fallback citation replacement requires rebuilding section content from current-cycle evidence."
+                )
+            fallback_submission_citations = [
+                SubmissionCitation.model_validate(item)
+                for item in list(raw_payload.get("citations") or [])
+                if isinstance(item, dict)
+            ]
+            default_rebuilt_citation_ids = [item.citation_id for item in fallback_submission_citations]
+            rebuilt_section_payloads: List[Dict[str, Any]] = []
+            for section in rebuilt_submission.sections:
+                rebuilt_section_payload = section.model_dump(exclude_none=True)
+                rebuilt_section_payload["citation_ids"] = self._section_citation_ids(
+                    answer_section_id=section.section_id,
+                    citations=fallback_submission_citations,
+                    default_citation_ids=default_rebuilt_citation_ids,
+                )
+                rebuilt_section_payloads.append(rebuilt_section_payload)
+            raw_payload["sections"] = rebuilt_section_payloads
+        elif prior_section_reuse_at_risk:
+            if rebuilt_submission is None:
+                raise ValueError(
+                    "Prior-cycle section text cannot be reused after the citation catalog changes unless sections are rebuilt from current-cycle evidence."
+                )
+            rebuilt_sections_by_id = {
+                section.section_id: section.model_dump(exclude_none=True)
+                for section in rebuilt_submission.sections
+            }
+            replaced_sections: List[Dict[str, Any]] = []
+            for item in list(_normalize_list_payload(raw_payload.get("sections")) or []):
+                if not isinstance(item, dict):
+                    continue
+                section_id = str(item.get("section_id") or "").strip()
+                patch_flags = prior_section_patch_map.get(section_id, {})
+                if (
+                    section_id
+                    and isinstance(patch_flags, dict)
+                    and any(patch_flags.get(key) for key in ("created", "content", "citation_ids"))
+                    and section_id in rebuilt_sections_by_id
+                ):
+                    rebuilt_section_payload = copy.deepcopy(rebuilt_sections_by_id[section_id])
+                    rebuilt_section_payload["issue_refs"] = _merge_unique_text(
+                        rebuilt_section_payload.get("issue_refs"),
+                        item.get("issue_refs"),
+                    )
+                    replaced_sections.append(rebuilt_section_payload)
+                    continue
+                replaced_sections.append(copy.deepcopy(item))
+            raw_payload["sections"] = replaced_sections
+        raw_citations_by_id = {
+            str(item.get("citation_id") or "").strip(): item
+            for item in list(raw_payload.get("citations") or [])
+            if isinstance(item, dict) and str(item.get("citation_id") or "").strip()
+        }
         citation_ids = {
             str(item.get("citation_id") or "").strip()
             for item in list(raw_payload.get("citations") or [])
@@ -2092,6 +2390,10 @@ class ReactReviewedProposerAgent:
             for item in list(_normalize_list_payload(raw_payload.get("step_refs")) or [])
         ] or [{"trajectory_id": raw_payload["trajectory_id"], "step_number": 1}]
         validated = AnswerSubmission.model_validate(raw_payload)
+        self._validate_section_citation_consistency(
+            workspace=workspace,
+            submission=validated,
+        )
         if run_state is not None:
             self._validate_grounded_submission(
                 submission=validated,
@@ -2108,12 +2410,13 @@ class ReactReviewedProposerAgent:
         errors: List[str] = []
         if not run_state.query_plan_ids:
             errors.append("Submission is invalid because proposer never called plan_queries.")
-        if not run_state.searched_paper_ids:
-            errors.append("Submission is invalid because proposer never called search_papers.")
+        if not run_state.searched_paper_ids and not run_state.carryover_candidate_paper_ids:
+            errors.append("Submission is invalid because proposer never called search_papers or inherited a prior locked candidate.")
         citation_lookup = {citation.citation_id: citation for citation in submission.citations}
         if not citation_lookup:
             errors.append("Submission has no citation catalog.")
         anchored_citation_found = False
+        known_candidate_paper_ids = run_state.known_candidate_paper_ids()
 
         def _citation_has_fulltext_anchor(citation: SubmissionCitation) -> bool:
             if run_state.fulltext_evidence_ids_for_paper(citation.paper_id).intersection(set(citation.evidence_ids or [])):
@@ -2125,9 +2428,9 @@ class ReactReviewedProposerAgent:
             return False
 
         for citation in submission.citations:
-            if citation.paper_id not in run_state.searched_paper_ids:
+            if citation.paper_id not in known_candidate_paper_ids:
                 errors.append(
-                    f"Citation '{citation.citation_id}' references paper_id '{citation.paper_id}' that was not returned by search_papers in this cycle."
+                    f"Citation '{citation.citation_id}' references paper_id '{citation.paper_id}' that was neither returned by search_papers nor inherited as a carried-over candidate in this cycle."
                 )
             if citation.section_ids or citation.evidence_ids:
                 if citation.paper_id not in run_state.acquired_paper_ids:
@@ -2227,7 +2530,11 @@ class ReactReviewedProposerAgent:
         )
 
         candidate_paper_ids = _merge_unique_text(
-            [],
+            [
+                citation.paper_id
+                for citation in (workspace.current_submission.citations if cycle_number > 1 and workspace.current_submission is not None else [])
+                if citation.paper_id in workspace.paper_candidates or citation.paper_id in workspace.paper_records
+            ],
             [item.get("paper_id") for item in search_results if item.get("paper_id")],
         )
         batch_download_result = workspace.download_documents(
@@ -2615,13 +2922,31 @@ class ReactReviewedProposerAgent:
             if conditions:
                 return "Material conditions mentioned in the current evidence include " + "; ".join(conditions[:4]) + "."
         if useful_observations:
-            fragments = [
-                _compact_text(item.snippet)
-                for item in useful_observations[:2]
-                if _compact_text(item.snippet)
-            ]
+            fragments: List[str] = []
+            if answer_section_id in {"direct_answer", "effect_direction", "supporting_evidence"}:
+                for markers in (
+                    ("restricted diffusion", "diffusion", "kinetic", "equilibration"),
+                    ("relative pressure", "relative pressures", "saturation pressure", "p/p0", "0.001", "ultramicropore"),
+                ):
+                    fragment = next(
+                        (
+                            _compact_text(item.snippet)
+                            for item in useful_observations
+                            if _compact_text(item.snippet)
+                            and any(marker in _compact_text(item.snippet).lower() for marker in markers)
+                        ),
+                        "",
+                    )
+                    if fragment and fragment not in fragments:
+                        fragments.append(fragment)
+            for item in useful_observations:
+                fragment = _compact_text(item.snippet)
+                if fragment and fragment not in fragments:
+                    fragments.append(fragment)
+                if len(fragments) >= 2:
+                    break
             if fragments:
-                return " ".join(fragments)
+                return " ".join(fragments[:2])
         if citations:
             return (
                 f"The retrieved literature set for '{workspace.question}' contains usable citations, "
@@ -2713,6 +3038,7 @@ class ReactReviewedProposerAgent:
             and not run_state.has_any_evidence()
             and not locked_paper_ids
         )
+        carryover_candidate_paper_ids = list(run_state.carryover_candidate_paper_ids)
 
         if not run_state.query_plan_ids:
             current_stage = "planning"
@@ -2743,12 +3069,15 @@ class ReactReviewedProposerAgent:
         else:
             current_stage = "acquisition_or_screening"
             exit_criteria = "Leave acquisition/screening only after one search, one download, and one screen pass have either locked papers or explicitly exhausted PDF input."
-            if not run_state.searched_paper_ids:
+            if not run_state.searched_paper_ids and carryover_candidate_paper_ids and not run_state.acquired_paper_ids:
+                recommended_next_tools = ["download_document", "screen_papers"]
+                avoid_actions = ["Re-check carried-over locked candidates before expanding search."]
+            elif not run_state.searched_paper_ids:
                 recommended_next_tools = ["search_papers"]
                 avoid_actions = ["Do not spend extra steps on replanning; reuse the current query plans."]
             elif not run_state.acquired_paper_ids:
                 recommended_next_tools = ["download_document"]
-                avoid_actions = ["Do not run another search before downloading the current cycle's searched papers."]
+                avoid_actions = ["Do not run another search before downloading the current cycle's searched or carried-over papers."]
             elif run_state.screening_required():
                 recommended_next_tools = ["screen_papers"]
                 avoid_actions = ["Do not parse or extract before screen_papers locks candidates."]
@@ -2772,6 +3101,7 @@ class ReactReviewedProposerAgent:
                 "remaining_steps": int(remaining_steps),
                 "max_steps": int(max_steps),
                 "query_planned": bool(run_state.query_plan_ids),
+                "carryover_candidate_paper_ids": list(carryover_candidate_paper_ids),
                 "search_rounds_used": int(run_state.search_generation),
                 "download_rounds_used": int(run_state.acquisition_generation),
                 "screen_rounds_used": int(run_state.screening_generation),
@@ -2821,4 +3151,3 @@ class ReactReviewedProposerAgent:
             )
         )
         return step_number
-

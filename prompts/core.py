@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from prompts.ledger import (
+from prompts.basic_node import (
     build_claim_miner_system_prompt,
     build_claim_miner_user_prompt,
     build_entity_mention_extraction_system_prompt,

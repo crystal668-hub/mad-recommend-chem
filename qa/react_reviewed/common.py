@@ -551,8 +551,30 @@ def _review_item_priority_terms(open_review_items: Sequence[ReviewItem]) -> List
         "naoh",
         "rde",
         "mea",
+        "n2 77k",
+        "co2 273k",
+        "restricted diffusion",
+        "ultramicropore",
+        "ultramicropores",
+        "relative pressure",
+        "relative pressures",
+        "saturation pressure",
+        "0.7 nm",
     ]
-    return [term for term in candidate_terms if term in source_text]
+    prioritized = [term for term in candidate_terms if term in source_text]
+    for pattern, normalized in (
+        (r"\bn[\s\-]*2\b", "n2"),
+        (r"\bco[\s\-]*2\b", "co2"),
+        (r"\b77\s*k\b", "77k"),
+        (r"\b273\s*k\b", "273k"),
+        (r"\brestricted diffusion\b", "restricted diffusion"),
+        (r"\brelative pressures?\b", "relative pressure"),
+        (r"\bsaturation pressures?\b", "saturation pressure"),
+        (r"\b0\.7\s*nm\b", "0.7 nm"),
+    ):
+        if re.search(pattern, source_text) and normalized not in prioritized:
+            prioritized.append(normalized)
+    return prioritized
 
 
 def _evidence_item_priority_score(item: EvidenceItem) -> float:
@@ -955,6 +977,7 @@ class ReactReviewedReviewerExecutionError(RuntimeError):
 class _ProposerRunState:
     evidence_policy: str
     query_plan_ids: List[str] = field(default_factory=list)
+    carryover_candidate_paper_ids: List[str] = field(default_factory=list)
     search_ordered_paper_ids: List[str] = field(default_factory=list)
     searched_paper_ids: set[str] = field(default_factory=set)
     acquired_paper_ids: set[str] = field(default_factory=set)
@@ -981,6 +1004,19 @@ class _ProposerRunState:
             query_plan_id = str(item.get("query_plan_id") or "").strip()
             if query_plan_id and query_plan_id not in self.query_plan_ids:
                 self.query_plan_ids.append(query_plan_id)
+
+    def seed_carryover_candidates(self, paper_ids: Sequence[str]) -> None:
+        for paper_id in list(paper_ids or []):
+            normalized = str(paper_id or "").strip()
+            if not normalized:
+                continue
+            if normalized not in self.carryover_candidate_paper_ids:
+                self.carryover_candidate_paper_ids.append(normalized)
+            if normalized not in self.search_ordered_paper_ids:
+                self.search_ordered_paper_ids.append(normalized)
+
+    def known_candidate_paper_ids(self) -> set[str]:
+        return set(self.searched_paper_ids).union(self.carryover_candidate_paper_ids)
 
     def record_search_results(self, payload: Sequence[Dict[str, Any]]) -> None:
         self.search_generation += 1
@@ -1117,6 +1153,7 @@ class _ProposerRunState:
         return {
             "evidence_policy": self.evidence_policy,
             "query_plan_ids": list(self.query_plan_ids),
+            "carryover_candidate_paper_ids": list(self.carryover_candidate_paper_ids),
             "search_generation": self.search_generation,
             "acquisition_generation": self.acquisition_generation,
             "screening_generation": self.screening_generation,

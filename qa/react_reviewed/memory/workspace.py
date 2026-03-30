@@ -38,6 +38,7 @@ from qa.react_reviewed.common import (
     _extract_unpaywall_pdf_url,
     _merge_unique_text,
     _pdf_probe_verdict_rank,
+    _review_item_priority_terms,
     _score_proposer_semantic_scholar_candidate,
     copy,
     logger,
@@ -988,6 +989,25 @@ class ReactReviewedWorkspace:
         except QueryPlannerExecutionError as exc:
             self._write_query_planner_failure_artifacts(error=exc)
             raise
+        if str(focus or "").strip().lower() == "revision":
+            with self._state_lock:
+                review_items = [item for item in self.current_review_items if item.status == "open"]
+            priority_terms = _review_item_priority_terms(review_items)
+            if priority_terms:
+                augmented_plans: List[QueryPlan] = []
+                for plan in plans:
+                    augmented_plans.append(
+                        QueryPlan(
+                            lane=plan.lane,
+                            query_text=" ".join(_merge_unique_text([plan.query_text], priority_terms)),
+                            must_terms=_merge_unique_text(list(plan.must_terms or []), priority_terms),
+                            exclude_terms=list(plan.exclude_terms or []),
+                            year_from=plan.year_from,
+                            year_to=plan.year_to,
+                            preferred_sources=list(plan.preferred_sources or []),
+                        )
+                    )
+                plans = augmented_plans
         payloads: List[Dict[str, Any]] = []
         for plan in plans:
             query_plan_id = self._find_registered_query_plan_id(plan, prefix="qp")
@@ -2373,4 +2393,3 @@ class ReactReviewedWorkspace:
         self.store.write_json("provider_health.json", provider_health)
         self.store.write_json("evidence_items.json", evidence_items)
         self.store.write_json("execution_warnings.json", execution_warnings)
-

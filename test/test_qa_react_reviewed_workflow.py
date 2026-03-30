@@ -2770,6 +2770,80 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(["CIT-1"], normalized.sections[0].citation_ids)
         self.assertEqual("traj_prior", normalized.step_refs[0].trajectory_id)
 
+    def test_validate_submission_payload_rejects_section_text_that_mentions_a_different_paper(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace()
+        old_title = (
+            "Enhanced resolution of ultra micropore size determination of biochars and activated carbons "
+            "by dual gas analysis using N2 and CO2 with 2D-NLDFT adsorption models"
+        )
+        workspace.paper_candidates["paper-old"] = PaperCandidate(
+            paper_id="paper-old",
+            title=old_title,
+            year=2019,
+            provider_hits=["semantic_scholar"],
+            lane_sources=["review"],
+            retrieval_score=0.95,
+        )
+        workspace.paper_records["paper-new"] = PaperRecord(
+            paper_id="paper-new",
+            title="Adjustable Functionalization of Hyper-Cross-Linked Polymers of Intrinsic Microporosity",
+            doi="10.1021/acsami.2c02604",
+            year=2022,
+            venue="ACS Applied Materials and Interfaces",
+            abstract="Polymer paper abstract.",
+            fulltext_available=True,
+            fulltext_status="fulltext_indexed",
+        )
+        run_state = _ProposerRunState(evidence_policy="prefer_fulltext")
+        run_state.query_plan_ids = ["qp_1"]
+        run_state.searched_paper_ids = {"paper-new"}
+        run_state.acquired_paper_ids = {"paper-new"}
+        run_state.section_ids_by_paper["paper-new"] = {"sec_results"}
+        run_state.evidence_ids = {"ev-1"}
+        run_state.evidence_ids_by_paper["paper-new"] = {"ev-1"}
+        run_state.evidence_layers_by_id["ev-1"] = "fulltext"
+        run_state.fulltext_status_by_paper["paper-new"] = "fulltext_indexed"
+
+        with self.assertRaisesRegex(ValueError, "Enhanced resolution of ultra micropore size determination"):
+            proposer._validate_submission_payload(
+                workspace=workspace,
+                submission={
+                    "sections": [
+                        {
+                            "section_id": "direct_answer",
+                            "title": "Direct Answer",
+                            "content": (
+                                f'The paper titled "{old_title}" (2019) explains the mechanism, '
+                                "but this section points to a different citation catalog."
+                            ),
+                            "citation_ids": ["CIT-1"],
+                        }
+                    ],
+                    "citations": [
+                        {
+                            "citation_id": "CIT-1",
+                            "paper_id": "paper-new",
+                            "title": "Adjustable Functionalization of Hyper-Cross-Linked Polymers of Intrinsic Microporosity",
+                            "year": 2022,
+                            "section_ids": ["sec_results"],
+                            "evidence_ids": ["ev-1"],
+                        }
+                    ],
+                    "limitations": [],
+                    "overall_confidence": _confidence(0.8),
+                },
+                cycle_number=1,
+                open_review_items=[],
+                agent=None,
+                run_state=run_state,
+            )
+
     def test_validate_submission_payload_realigns_step_refs_to_current_trajectory_when_available(self):
         proposer = ReactReviewedProposerAgent(
             model_config={},
@@ -4013,6 +4087,115 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertIn("CIT-1", submission.sections[0].citation_ids)
         self.assertEqual(trajectory.trajectory_id, repaired_trajectory.trajectory_id)
 
+    def test_proposer_repair_prefers_workspace_rebuild_over_salvaging_mismatched_prior_payload(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={"provider": "openai", "model": "fake", "api_key": "test"},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+            repair_attempts=1,
+        )
+        workspace = self._make_workspace()
+        trajectory = _trajectory("repair mismatched salvage")
+        old_title = (
+            "Enhanced resolution of ultra micropore size determination of biochars and activated carbons "
+            "by dual gas analysis using N2 and CO2 with 2D-NLDFT adsorption models"
+        )
+        workspace.paper_candidates["paper-old"] = PaperCandidate(
+            paper_id="paper-old",
+            title=old_title,
+            year=2019,
+            provider_hits=["semantic_scholar"],
+            lane_sources=["review"],
+            retrieval_score=0.95,
+        )
+        workspace.paper_records["paper-new"] = PaperRecord(
+            paper_id="paper-new",
+            title="Correct current-cycle paper",
+            doi="10.1000/current",
+            year=2024,
+            venue="Journal",
+            abstract="Current-cycle abstract.",
+            fulltext_available=True,
+            fulltext_status="fulltext_indexed",
+        )
+        workspace.evidence_items["ev-1"] = EvidenceItem(
+            evidence_id="ev-1",
+            paper_id="paper-new",
+            doi="10.1000/current",
+            section_id="sec_results",
+            section_type="results",
+            role="observation",
+            snippet="Current-cycle evidence states that restricted diffusion and relative pressure jointly explain the measurement window.",
+            source_span={"start": 0, "end": 110},
+            source_layer="fulltext",
+            claim_polarity="support",
+            conditions={"temperature": "273 K"},
+            metric_mentions=["relative pressure"],
+            extraction_confidence=0.93,
+        )
+        invalid_error = ReactReviewedStructuredOutputError(
+            stage="proposer",
+            cycle_number=1,
+            message="invalid proposer structured output",
+            response_content=None,
+            structured_output={
+                "kind": "submission",
+                "payload": {
+                    "sections": [
+                        {
+                            "section_id": "direct_answer",
+                            "title": "Direct Answer",
+                            "content": f'The paper "{old_title}" (2019) is the cited basis for this answer.',
+                            "citation_ids": ["CIT-1"],
+                        }
+                    ],
+                    "citations": [
+                        {
+                            "citation_id": "CIT-1",
+                            "paper_id": "paper-new",
+                            "title": "Correct current-cycle paper",
+                            "year": 2024,
+                            "section_ids": ["sec_results"],
+                            "evidence_ids": ["ev-1"],
+                        }
+                    ],
+                    "limitations": [],
+                    "overall_confidence": _confidence(0.8),
+                },
+            },
+            trajectory=trajectory,
+        )
+        run_state = _ProposerRunState(evidence_policy="prefer_fulltext")
+        run_state.query_plan_ids = ["qp_1"]
+        run_state.searched_paper_ids = {"paper-new"}
+        run_state.acquired_paper_ids = {"paper-new"}
+        run_state.locked_candidate_paper_ids = ["paper-new"]
+        run_state.section_ids_by_paper = {"paper-new": {"sec_results"}}
+        run_state.evidence_ids_by_paper = {"paper-new": {"ev-1"}}
+        run_state.evidence_ids = {"ev-1"}
+        run_state.evidence_layers_by_id = {"ev-1": "fulltext"}
+        run_state.fulltext_status_by_paper = {"paper-new": "fulltext_indexed"}
+        run_state.fulltext_available_by_paper = {"paper-new": True}
+
+        with patch("qa.react_reviewed.agents.proposer.build_chat_model_from_config", return_value=object()), patch(
+            "qa.react_reviewed.agents.proposer.invoke_llm",
+            return_value='{"kind":"submission","payload":',
+        ):
+            submission, repaired_trajectory = proposer._repair_submission_with_llm(
+                workspace=workspace,
+                cycle_number=1,
+                open_review_items=[],
+                error=invalid_error,
+                trajectory=trajectory,
+                run_state=run_state,
+            )
+
+        self.assertEqual("paper-new", submission.citations[0].paper_id)
+        self.assertNotIn(old_title, submission.sections[0].content)
+        self.assertIn("restricted diffusion", submission.sections[0].content.lower())
+        self.assertEqual(trajectory.trajectory_id, repaired_trajectory.trajectory_id)
+
     def test_proposer_requires_revision_budget_large_enough_for_grounded_cycle(self):
         with self.assertRaisesRegex(ValueError, "max_steps_revision must be at least 6"):
             ReactReviewedProposerAgent(
@@ -5125,6 +5308,64 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(["qp_1", "qp_2"], [item["query_plan_id"] for item in second])
         self.assertEqual(2, len(workspace.query_plans))
 
+    def test_workspace_plan_queries_revision_includes_open_review_anchor_terms(self):
+        class _FixedPlanner:
+            def run(self, *, task_spec: TaskSpec, entity_pack: EntityPack):
+                return [
+                    QueryPlan(
+                        lane="review",
+                        query_text="microporosity adsorption review",
+                        must_terms=["microporosity"],
+                        exclude_terms=[],
+                        year_from=None,
+                        year_to=None,
+                        preferred_sources=["openalex"],
+                    )
+                ]
+
+        workspace = ReactReviewedWorkspace(
+            question="Why does CO2 extend narrow microporosity analysis?",
+            context=None,
+            task_spec=_task_spec("Why does CO2 extend narrow microporosity analysis?"),
+            entity_pack=_entity_pack(),
+            entity_resolution_snapshot={},
+            artifact_store=QAArtifactStore(base_dir=self.temp_dir / "workspace_revision_plan"),
+            query_planner=_FixedPlanner(),
+            retriever=_CountingRetriever(),
+            document_acquirer=_CountingDocumentAcquirer(),
+            handoff=EvidenceExtractorHandoff(),
+            evidence_extractor=_CountingEvidenceExtractor(),
+        )
+        workspace.set_review_context(
+            submission=None,
+            proposer_trajectory=None,
+            open_review_items=[
+                ReviewItem(
+                    review_id="counterevidence_1",
+                    reviewer_role="counterevidence",
+                    anchor_kind="section_only",
+                    severity="warning",
+                    flaw_type="missing_search_direction",
+                    critique="Search should anchor N2 77K, CO2 273K, restricted diffusion, ultramicropore, relative pressure, and 0.7 nm.",
+                    required_action="Add saturation pressure and relative pressure to the revision query plan.",
+                    evidence_refs=["standard_knowledge"],
+                    target_section_id="direct_answer",
+                )
+            ],
+            cycle_number=2,
+        )
+
+        plans = workspace.plan_queries(focus="revision")
+        query_text = plans[0]["query_text"].lower()
+        must_terms = [str(item).lower() for item in plans[0]["must_terms"]]
+
+        self.assertIn("restricted diffusion", query_text)
+        self.assertIn("relative pressure", query_text)
+        self.assertIn("0.7 nm", query_text)
+        self.assertIn("n2 77k", query_text)
+        self.assertIn("co2 273k", query_text)
+        self.assertIn("saturation pressure", must_terms)
+
     def test_validate_submission_auto_prefers_fulltext_backed_citation_when_available(self):
         proposer = ReactReviewedProposerAgent(
             model_config={},
@@ -5199,6 +5440,69 @@ class ReactReviewedWorkflowExecutionTests(unittest.TestCase):
         )
 
         self.assertEqual(["CIT-FULL", "CIT-ABS"], normalized.sections[0].citation_ids)
+
+    def test_revision_run_state_carries_prior_cited_papers_into_download_guidance(self):
+        proposer = ReactReviewedProposerAgent(
+            model_config={},
+            max_steps_initial=6,
+            max_steps_revision=6,
+            llm_timeout_seconds=45.0,
+        )
+        workspace = self._make_workspace()
+        workspace.paper_candidates["paper-1"] = PaperCandidate(
+            paper_id="paper-1",
+            title="Pt/C HER in alkaline media",
+            abstract="Pt/C improves HER activity.",
+            year=2024,
+            provider_hits=["openalex"],
+            lane_sources=["review"],
+            retrieval_score=0.8,
+        )
+        prior_submission = _submission(workspace.question, cycle_number=1, trajectory_id="traj_prior")
+        workspace.set_review_context(
+            submission=prior_submission,
+            proposer_trajectory=_trajectory("prior proposer"),
+            open_review_items=[],
+            cycle_number=2,
+        )
+        run_state = _ProposerRunState(evidence_policy="prefer_fulltext")
+        run_state.query_plan_ids = ["qp_1"]
+        proposer._seed_run_state_from_prior_context(
+            workspace=workspace,
+            cycle_number=2,
+            run_state=run_state,
+        )
+
+        self.assertEqual(["paper-1"], run_state.carryover_candidate_paper_ids)
+        self.assertIn("paper-1", run_state.search_ordered_paper_ids)
+
+        run_state.acquired_paper_ids = {"paper-1"}
+        run_state.section_ids_by_paper = {"paper-1": {"sec_results"}}
+        run_state.evidence_ids = {"ev-1"}
+        run_state.evidence_ids_by_paper = {"paper-1": {"ev-1"}}
+        run_state.evidence_layers_by_id = {"ev-1": "fulltext"}
+        run_state.fulltext_status_by_paper = {"paper-1": "fulltext_indexed"}
+
+        proposer._validate_grounded_submission(
+            submission=prior_submission,
+            run_state=run_state,
+        )
+
+        run_state.acquired_paper_ids = set()
+        run_state.section_ids_by_paper = {}
+        run_state.evidence_ids = set()
+        run_state.evidence_ids_by_paper = {}
+        run_state.evidence_layers_by_id = {}
+        run_state.fulltext_status_by_paper = {}
+        guidance = proposer._runtime_action_guidance(
+            run_state=run_state,
+            step_number=1,
+            remaining_steps=5,
+            max_steps=6,
+            deadline_mode=False,
+        )
+
+        self.assertEqual(["download_document", "screen_papers"], guidance["recommended_next_tools"])
 
     def test_validate_submission_allows_explicit_abstract_only_degradation(self):
         proposer = ReactReviewedProposerAgent(

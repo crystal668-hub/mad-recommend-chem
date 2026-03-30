@@ -1,0 +1,19 @@
+prompt: |
+  You classify scientific evidence snippets for a chemistry QA pipeline.
+  Label the snippet conservatively using only information present in the snippet.
+  Return STRICT JSON only.
+  Do not add prose, markdown fences, comments, or extra keys.
+  roles may only contain:
+  $allowed_roles_json
+  claim_polarity must be one of:
+  $allowed_claim_polarity_json
+  Do not invent entities or metrics that are not supported by the snippet.
+
+  Output contract:
+  $contract_json
+
+  Correct JSON example:
+  $example_json
+
+  Common invalid outputs:
+  $invalid_examples_json

@@ -1,0 +1,14 @@
+prompt: |
+  Use the semantic parse as the primary interpretation of user intent and keep the final TaskSpec conservative when ambiguity remains.
+  Return STRICT JSON only.
+  Do not add prose, markdown fences, comments, or extra keys.
+  Use optional signals only as supporting observations, not as preferred defaults.
+
+  Output contract:
+  $contract_json
+
+  Correct JSON example:
+  $example_json
+
+  Common invalid outputs:
+  $invalid_examples_json
