@@ -1,0 +1,45 @@
+{
+  "id": "chemqa-review",
+  "version": 1,
+  "engine_workflow_ref": "review-loop@1",
+  "roles": [
+    "debate-coordinator",
+    "proposer-1",
+    "proposer-2",
+    "proposer-3",
+    "proposer-4",
+    "proposer-5"
+  ],
+  "role_map": {
+    "debate-coordinator": "coordinator",
+    "proposer-1": "proposer_main",
+    "proposer-2": "search_coverage",
+    "proposer-3": "evidence_trace",
+    "proposer-4": "reasoning_consistency",
+    "proposer-5": "counterevidence"
+  },
+  "parameters": {
+    "proposer_count": {
+      "type": "int",
+      "default": 5,
+      "min": 5,
+      "max": 5
+    },
+    "review_rounds": {
+      "type": "int",
+      "default": 3,
+      "min": 0,
+      "max": 6
+    },
+    "rebuttal_rounds": {
+      "type": "int",
+      "default": 2,
+      "min": 0,
+      "max": 6
+    }
+  },
+  "completion": {
+    "done_when": "protocol_state_done",
+    "final_decider": "outer-entry-agent"
+  }
+}

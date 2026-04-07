@@ -1,0 +1,29 @@
+{
+  "max_propose_steps_initial": 10,
+  "max_propose_steps_revision": 10,
+  "proposer_repair_attempts": 1,
+  "reviewer_repair_attempts": 1,
+  "proposer_evidence_policy": "prefer_fulltext",
+  "proposer_candidate_target": 10,
+  "proposer_rerank_top_k": 5,
+  "proposer_pdf_probe_enabled": true,
+  "proposer_pdf_probe_max_candidates": 20,
+  "proposer_pdf_probe_timeout_seconds": 5.0,
+  "stage_watchdog_seconds": 120.0,
+  "max_review_cycles": 3,
+  "reviewer_max_steps": 3,
+  "reviewer_max_concurrency": 4,
+  "reviewer_max_retrieval_actions": 1,
+  "reviewer_retrieval_budget_by_role": {
+    "search_coverage": 1,
+    "evidence_trace": 0,
+    "reasoning_consistency": 0,
+    "counterevidence": 2
+  },
+  "max_review_items_per_reviewer": 3,
+  "max_review_items_per_step_section": 1,
+  "stop_on_no_blocking_items": true,
+  "require_all_reviewers": true,
+  "review_call_retry_limit": 1,
+  "review_failure_blocks_acceptance": true
+}

@@ -1,0 +1,24 @@
+{
+  "id": "chemqa-review-default",
+  "description": "Default fixed-slot profile for chemqa-review.",
+  "slot_models": {
+    "debate-coordinator": {
+      "model_ref": "chemqa-coordinator"
+    },
+    "debate-1": {
+      "model_ref": "chemqa-proposer-main"
+    },
+    "debate-2": {
+      "model_ref": "chemqa-reviewer-search-coverage"
+    },
+    "debate-3": {
+      "model_ref": "chemqa-reviewer-evidence-trace"
+    },
+    "debate-4": {
+      "model_ref": "chemqa-reviewer-reasoning-consistency"
+    },
+    "debate-5": {
+      "model_ref": "chemqa-reviewer-counterevidence"
+    }
+  }
+}
