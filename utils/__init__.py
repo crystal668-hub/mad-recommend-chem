@@ -29,6 +29,14 @@ from utils.electrode_composition import (
     build_electrode_composition,
     format_electrode_composition,
 )
+from utils.reaction_types import (
+    REACTION_TYPE_LABELS,
+    CATEGORY_TYPE_LABELS,
+    SUPPORTED_REACTION_TYPE_LABELS,
+    canonical_reaction_type,
+    reaction_type_matches,
+    is_supported_reaction_type,
+)
 
 __all__ = [
     'Logger',
@@ -56,4 +64,10 @@ __all__ = [
     'parse_components_with_percent',
     'build_electrode_composition',
     'format_electrode_composition',
+    'REACTION_TYPE_LABELS',
+    'CATEGORY_TYPE_LABELS',
+    'SUPPORTED_REACTION_TYPE_LABELS',
+    'canonical_reaction_type',
+    'reaction_type_matches',
+    'is_supported_reaction_type',
 ]

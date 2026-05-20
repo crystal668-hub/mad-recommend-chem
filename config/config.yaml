@@ -59,7 +59,7 @@ llm:
 vector_store:
   type: "chroma"
   persist_directory: "./data/chroma_db"
-  collection_name: "electrochemistry_literature"
+  collection_name: "literature_02"
   distance_metric: "cosine"  # 'cosine, l2, ip'
   
 # ===== RAG System Configuration =====

@@ -51,16 +51,14 @@ htmlcov/
 # Environment variables
 .env
 .env.*
-!.env.example
 
 # Logs
 logs/
 *.log
 
 # Data
-data/chroma_db/
-data/raw/
-data/experience_db.json
+data/
+metadata/
 *.db
 *.sqlite
 *.sqlite3
@@ -68,7 +66,7 @@ data/experience_db.json
 *.sqlite-journal
 *.sqlite-wal
 *.sqlite-shm
-metadata/
+
 
 # Outputs
 outputs/

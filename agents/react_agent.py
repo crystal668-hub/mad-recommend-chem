@@ -28,6 +28,7 @@ from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from agents.react_reasoning import ReActTrajectory, ReActStep, ActionType, ToolCallRecord
+from utils.reaction_types import canonical_reaction_type, reaction_type_matches
 from utils.source_id import build_chroma_source_id, normalize_doc_id, parse_chroma_source_id
 from utils.request_limiter import get_global_limiter
 
@@ -255,7 +256,9 @@ class ReActAgent:
         rag_filter_by_reaction_type = bool(self.model_config.get("rag_filter_by_reaction_type", True))
         where = None
         if rag_filter_by_reaction_type and task_reaction:
-            where = {"reaction_type": str(task_reaction).strip().upper()}
+            target_rt = canonical_reaction_type(task_reaction)
+            if target_rt:
+                where = {"reaction_type": target_rt}
 
         results = self.retrieve_knowledge(query=query, top_k=fetch_k, where=where)
 
@@ -273,15 +276,15 @@ class ReActAgent:
         # Hard guarantee: if a target reaction type is known, only return chunks whose metadata.reaction_type matches it.
         # Missing/unknown reaction_type is treated as mismatch and dropped (no cross-type fallback).
         if rag_filter_by_reaction_type and task_reaction:
-            target_rt = str(task_reaction).strip().upper()
+            target_rt = canonical_reaction_type(task_reaction)
             filtered: List[Dict[str, Any]] = []
             for r in raw_results:
                 meta = r.get("metadata") or {}
                 rt_val = meta.get("reaction_type")
-                rt = str(rt_val or "").strip().upper()
-                if not rt or rt == "UNKNOWN":
+                rt = canonical_reaction_type(rt_val)
+                if not rt or rt.upper() == "UNKNOWN":
                     continue
-                if rt != target_rt:
+                if not reaction_type_matches(rt, target_rt):
                     continue
                 filtered.append(r)
             raw_results = filtered
@@ -2266,14 +2269,15 @@ def _infer_task_constraints(
     """
     raw = str(text or "")
 
-    reaction = (fallback_reaction or "").strip() or None
-    for pat in [r"Target reaction:\s*([A-Za-z0-9_+-]+)", r"Reaction Type:\s*([A-Za-z0-9_+-]+)", r"Reaction:\s*([A-Za-z0-9_+-]+)"]:
+    reaction = canonical_reaction_type(fallback_reaction) if fallback_reaction else None
+    for pat in [r"Target reaction:\s*([^\n\r]+)", r"Reaction Type:\s*([^\n\r]+)", r"Reaction:\s*([^\n\r]+)"]:
         m = re.search(pat, raw, flags=re.IGNORECASE)
         if m:
             reaction = str(m.group(1) or "").strip()
+            reaction = re.split(r"\s*(?:[,;]|\s+-\s+)\s*", reaction, maxsplit=1)[0].strip()
             break
     if reaction:
-        reaction = reaction.strip()
+        reaction = canonical_reaction_type(reaction)
 
     comps: List[str] = []
     # Prefer explicit fallback components (passed by the coordinator).
@@ -2346,9 +2350,10 @@ def _extract_element_symbols(text: str) -> set[str]:
 
 
 def _text_mentions_reaction(text: str, reaction_type: str) -> bool:
-    rt = str(reaction_type or "").strip().upper()
+    rt = canonical_reaction_type(reaction_type)
     if not rt:
         return False
+    rt_key = str(rt).strip().upper()
     t = str(text or "").lower()
 
     kw_map = {
@@ -2360,8 +2365,13 @@ def _text_mentions_reaction(text: str, reaction_type: str) -> bool:
         "EOR": ["eor", "ethanol oxidation"],
         "HZOR": ["hzor", "hydrazine oxidation"],
         "CO2RR": ["co2rr", "co2 reduction", "carbon dioxide reduction"],
+        "conductivity": ["conductivity", "electrical conductivity"],
+        "thermal conductivity": ["thermal conductivity"],
+        "photothermal conversion efficiency": ["photothermal conversion", "photothermal conversion efficiency"],
+        "ferromagnetism": ["ferromagnetism", "ferromagnetic"],
+        "ferrimagnetism": ["ferrimagnetism", "ferrimagnetic"],
     }
-    for kw in kw_map.get(rt, [rt.lower()]):
+    for kw in kw_map.get(rt, kw_map.get(rt_key, [str(rt).lower()])):
         if kw and kw in t:
             return True
     return False

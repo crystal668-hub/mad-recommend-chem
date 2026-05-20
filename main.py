@@ -37,6 +37,12 @@ from utils import (
     save_json,
     ensure_dir
 )
+from utils.reaction_types import (
+    SUPPORTED_REACTION_TYPE_LABELS,
+    REACTION_TYPE_LABELS,
+    canonical_reaction_type,
+    is_supported_reaction_type,
+)
 from database import RAGSystem
 from database.embedder import MultiModelEmbedder
 from agents import AgentConfig
@@ -262,6 +268,8 @@ class MADSystem:
         if not is_valid:
             raise ValueError(f"Component validation failed: {error_msg}")
         
+        reaction_type = canonical_reaction_type(reaction_type) if reaction_type else None
+
         if reaction_type:
             self.logger.info(
                 "Starting debate with reaction type %s and catalysts: %s (electrode=%s)",
@@ -375,18 +383,20 @@ class MADSystem:
         # Resolve reaction types: explicit arg > config.yaml > built-in fallback.
         rt_list: List[str] = []
         if reaction_types:
-            rt_list = [str(x).strip().upper() for x in reaction_types if str(x).strip()]
+            rt_list = [canonical_reaction_type(x) for x in reaction_types if str(x).strip()]
+            rt_list = [x for x in rt_list if x]
         else:
             cfg_rts = (((self.config or {}).get("chemistry", {}) or {}).get("reaction_types")) or []
             if isinstance(cfg_rts, list) and cfg_rts:
-                rt_list = [str(x).strip().upper() for x in cfg_rts if str(x).strip()]
+                rt_list = [canonical_reaction_type(x) for x in cfg_rts if str(x).strip()]
+                rt_list = [x for x in rt_list if x]
         if not rt_list:
-            rt_list = ["CO2RR", "EOR", "HER", "HOR", "HZOR", "O5H", "OER", "ORR", "UOR"]
+            rt_list = list(REACTION_TYPE_LABELS)
         # De-duplicate while preserving order (avoid re-running the same reaction twice).
         seen_rt: set[str] = set()
         rt_dedup: List[str] = []
         for rt in rt_list:
-            s = str(rt or "").strip().upper()
+            s = canonical_reaction_type(rt)
             if not s or s in seen_rt:
                 continue
             seen_rt.add(s)
@@ -427,7 +437,7 @@ class MADSystem:
         ) -> Dict[str, Any]:
             from prompts.debate_phase_prompts import build_initial_debate_prompt
 
-            rt = str(reaction_type or "").strip().upper() or "UNKNOWN"
+            rt = canonical_reaction_type(reaction_type) or "UNKNOWN"
 
             if rt and rt != "UNKNOWN":
                 self.logger.info(
@@ -570,7 +580,7 @@ class MADSystem:
             """
             import time
 
-            reaction = str(rt or "").strip().upper()
+            reaction = canonical_reaction_type(rt) or "UNKNOWN"
             attempts = 2  # best-effort retry for transient 429/rate-limit type failures
             last_err = None
 
@@ -659,7 +669,7 @@ class MADSystem:
                         # Should be rare since _run_one_reaction catches, but keep robust.
                         summaries.append(
                             {
-                                "reaction_type": str(future_to_rt.get(fut) or "").strip().upper(),
+                                "reaction_type": canonical_reaction_type(future_to_rt.get(fut)) or "UNKNOWN",
                                 "error": str(e),
                                 "performance_evaluation": None,
                                 "metric_value": None,
@@ -669,8 +679,8 @@ class MADSystem:
                         )
 
             # Preserve original reaction_types order as a stable secondary key for equal ranks.
-            order = {str(rt).strip().upper(): i for i, rt in enumerate(rt_list)}
-            summaries.sort(key=lambda d: order.get(str(d.get("reaction_type") or "").strip().upper(), 10**9))
+            order = {canonical_reaction_type(rt) or str(rt).strip(): i for i, rt in enumerate(rt_list)}
+            summaries.sort(key=lambda d: order.get(canonical_reaction_type(d.get("reaction_type")) or "", 10**9))
 
         # ---- Rank and save summary ----
         from utils.reaction_ranking import rank_reactions
@@ -758,9 +768,7 @@ class MADSystem:
 
 def main():
     """Main program entry point"""
-    valid_reaction_types = [
-        "CO2RR", "EOR", "HER", "HOR", "HZOR", "O5H", "OER", "ORR", "UOR"
-    ]
+    valid_reaction_types = list(SUPPORTED_REACTION_TYPE_LABELS)
 
     # Parse command-line arguments
     parser = argparse.ArgumentParser(
@@ -777,8 +785,7 @@ def main():
     parser.add_argument(
         '--reaction-type',
         type=str,
-        choices=valid_reaction_types,
-        help='Specify Reaction Type: CO2RR/EOR/HER/HOR/HZOR/O5H/OER/ORR/UOR'
+        help='Specify reaction/category type'
     )
     parser.add_argument(
         '--rank-reactions',
@@ -852,8 +859,9 @@ def main():
 
                 subset = None
                 if args.reaction_types:
-                    subset = [s.strip().upper() for s in str(args.reaction_types).split(",") if s.strip()]
-                    bad = [s for s in subset if s not in valid_reaction_types]
+                    subset = [canonical_reaction_type(s) for s in str(args.reaction_types).split(",") if s.strip()]
+                    subset = [s for s in subset if s]
+                    bad = [s for s in subset if not is_supported_reaction_type(s)]
                     if bad:
                         raise ValueError(f"Unknown reaction types in --reaction-types: {bad}. Choices: {valid_reaction_types}")
 
@@ -879,7 +887,7 @@ def main():
                 print("Rank | RT   | Grade        | Metric              | Consensus | Error")
                 print("-----|------|--------------|---------------------|----------|------")
                 for idx, it in enumerate(ranking, start=1):
-                    rt = str(it.get("reaction_type") or "").strip().upper() or "?"
+                    rt = canonical_reaction_type(it.get("reaction_type")) or "?"
                     grade = str(it.get("grade") or "N/A")
                     metric = _fmt_metric(it)
                     consensus = "Yes" if bool(it.get("consensus_reached")) else "No"
@@ -890,7 +898,7 @@ def main():
 
                 print_header(f"Top {len(top_items)} Reaction Types")
                 for idx, it in enumerate(top_items, start=1):
-                    rt = str(it.get("reaction_type") or "").strip().upper() or "?"
+                    rt = canonical_reaction_type(it.get("reaction_type")) or "?"
                     grade = str(it.get("grade") or "N/A")
                     metric = _fmt_metric(it)
                     print(f"{idx}. {rt} | Grade: {grade} | Metric: {metric}")
@@ -901,7 +909,11 @@ def main():
                     print(f"\nSaved ranking summary: {out_dir}\\rank_{ts}.json")
 
             else:
-                result = system.run_debate(components, reaction_type=args.reaction_type, engine=args.engine)
+                reaction_type = canonical_reaction_type(args.reaction_type) if args.reaction_type else None
+                if reaction_type and not is_supported_reaction_type(reaction_type):
+                    raise ValueError(f"Unknown reaction type: {args.reaction_type}. Choices: {valid_reaction_types}")
+
+                result = system.run_debate(components, reaction_type=reaction_type, engine=args.engine)
 
                 # Print result summary
                 print_header("Debate Result Summary")

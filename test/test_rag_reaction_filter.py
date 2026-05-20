@@ -36,13 +36,39 @@ class _DummyRAG:
         ]
 
 
-class RAGReactionFilterTests(unittest.TestCase):
-    def test_reaction_type_where_filter_is_passed_to_rag_adapter(self):
-        from agents.react_agent import ReActAgent
-        from agents.react_reasoning import ReActTrajectory
+class _DummyCategoryRAG:
+    collection_name = "test_collection"
 
-        rag = _DummyRAG()
-        agent = ReActAgent(
+    def __init__(self):
+        self.last_where = None
+
+    def retrieve(self, query: str, top_k: int = 5, where=None):
+        self.last_where = where
+        return [
+            {
+                "text": (
+                    "This paper reports high electrical conductivity values for a multi-metal material "
+                    "and discusses transport behavior in detail."
+                ),
+                "score": 0.95,
+                "metadata": {"doc_id": "10.1234/conductivity", "chunk_id": 1, "reaction_type": "conductivity"},
+            },
+            {
+                "text": (
+                    "This paper reports thermal conductivity for a related material with enough detail "
+                    "to exercise reaction_type hard filtering."
+                ),
+                "score": 0.9,
+                "metadata": {"doc_id": "10.1234/thermal", "chunk_id": 2, "reaction_type": "thermal conductivity"},
+            },
+        ]
+
+
+class RAGReactionFilterTests(unittest.TestCase):
+    def _make_agent(self, rag):
+        from agents.react_agent import ReActAgent
+
+        return ReActAgent(
             agent_id="t2",
             name="test",
             model_config={
@@ -55,6 +81,11 @@ class RAGReactionFilterTests(unittest.TestCase):
             verbose=False,
         )
 
+    def test_reaction_type_where_filter_is_passed_to_rag_adapter(self):
+        from agents.react_reasoning import ReActTrajectory
+
+        rag = _DummyRAG()
+        agent = self._make_agent(rag)
         agent.current_trajectory = ReActTrajectory(
             query="Reaction Type: ORR\nMetal catalyst elements: Pt, Cu, Ni, Fe, Co"
         )
@@ -64,6 +95,21 @@ class RAGReactionFilterTests(unittest.TestCase):
         data = out.data or []
         self.assertEqual(len(data), 1)
         self.assertEqual(((data[0].get("metadata") or {}).get("reaction_type") or "").upper(), "ORR")
+
+    def test_category_type_where_filter_preserves_chroma_metadata_label(self):
+        from agents.react_reasoning import ReActTrajectory
+
+        rag = _DummyCategoryRAG()
+        agent = self._make_agent(rag)
+        agent.current_trajectory = ReActTrajectory(
+            query="Reaction Type: conductivity\nMetal catalyst elements: Pt, Cu, Ni, Fe, Co"
+        )
+
+        out = agent._tool_search_literature(query="conductivity", top_k=2)
+        self.assertEqual(rag.last_where, {"reaction_type": "conductivity"})
+        data = out.data or []
+        self.assertEqual(len(data), 1)
+        self.assertEqual((data[0].get("metadata") or {}).get("reaction_type"), "conductivity")
 
 
 if __name__ == "__main__":
