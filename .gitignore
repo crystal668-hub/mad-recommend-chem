@@ -79,3 +79,6 @@ results/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Config
+config.yaml
