@@ -449,7 +449,7 @@ class TextProcessor:
         """
         Load {id: doi} metadata from a single XLSX file.
 
-        The flat-data layout maps Markdown file stems to the XLSX `id` column.
+        When an explicit `id` column exists, Markdown file stems are mapped directly.
         Category layouts can pass candidate_ids and allow the best matching column
         to be selected when an explicit `id` column is not present.
         """
@@ -470,7 +470,7 @@ class TextProcessor:
         except Exception as exc:  # pragma: no cover - dependency error path
             raise ModuleNotFoundError(
                 "pandas and openpyxl are required to read metadata XLSX files. "
-                "Install project requirements before using flat input layout."
+                "Install project requirements before using XLSX-backed metadata loading."
             ) from exc
 
         try:
@@ -478,7 +478,7 @@ class TextProcessor:
         except ImportError as exc:  # pragma: no cover - depends on optional engine availability
             raise ModuleNotFoundError(
                 "openpyxl is required to read .xlsx metadata files. "
-                "Install project requirements before using flat input layout."
+                "Install project requirements before using XLSX-backed metadata loading."
             ) from exc
 
         column_lookup = {str(col).strip().lower(): col for col in frame.columns}
@@ -789,75 +789,6 @@ class TextProcessor:
             
         except Exception as e:
             logger.error(f" Failed to load documents: {str(e)}")
-            return []
-
-    def load_flat_documents(
-        self,
-        data_dir: str,
-        metadata_xlsx_path: str,
-        reaction_type: str = "Antiferromagnetism",
-    ) -> List[Document]:
-        """
-        Load top-level Markdown files from `data_dir` and map filename stems to XLSX metadata ids.
-
-        Metadata schema:
-            - reaction_type: provided flat-layout label
-            - doc_id: DOI from XLSX id->doi, Markdown DOI fallback, or stable no-doi fallback
-        """
-        data_path = Path(data_dir)
-        if not data_path.exists():
-            logger.error(f"Directory does not exist: {data_dir}")
-            return []
-
-        md_files = sorted([p for p in data_path.glob("*.md") if p.is_file()])
-        if not md_files:
-            logger.error(f"No top-level Markdown files found: {data_dir}")
-            return []
-
-        id_to_doi = self._load_metadata_xlsx_index(metadata_xlsx_path)
-
-        try:
-            # Local import: DOI-only scripts shouldn't require LlamaIndex installed.
-            from llama_index.core import SimpleDirectoryReader
-
-            reader = SimpleDirectoryReader(
-                input_files=[str(p) for p in md_files],
-                required_exts=[".md"],
-                recursive=False,
-            )
-            documents = reader.load_data()
-
-            if not documents:
-                logger.error(f"No Markdown files loaded: {data_dir}")
-                return []
-
-            processed_documents = []
-            for doc in documents:
-                file_name = doc.metadata.get("file_name", "")
-                file_path_str = doc.metadata.get("file_path", "")
-                file_stem = Path(file_name).stem if file_name else Path(file_path_str).stem
-
-                doc_id = id_to_doi.get(file_stem)
-                if not doc_id:
-                    doc_id = self.extract_doi_from_content(doc.text, file_name, file_path_str)
-
-                resolved_reaction_type = (reaction_type or "Antiferromagnetism").strip() or "Antiferromagnetism"
-                doc.metadata = {
-                    "reaction_type": resolved_reaction_type,
-                    "doc_id": doc_id,
-                }
-
-                processed_documents.append(doc)
-
-                logger.info(f" Loaded {file_name}")
-                logger.info(f" Reaction Type: {resolved_reaction_type}")
-                logger.info(f" DOI: {doc.metadata['doc_id']}")
-
-            logger.info(f"\nLoaded a total of {len(processed_documents)} flat Document objects")
-            return processed_documents
-
-        except Exception as e:
-            logger.error(f" Failed to load flat documents: {str(e)}")
             return []
 
     def load_category_documents(

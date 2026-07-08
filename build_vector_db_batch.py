@@ -48,6 +48,10 @@ REACTION_CONFIGS = {
 }
 
 CATEGORY_CONFIGS = {
+    "Antiferromagnetism": {
+        "path": "antiferromagnetism",
+        "metadata_xlsx": "./metadata/Antiferromagnetism.xlsx",
+    },
     "Conductivity": {
         "path": "conductivity",
         "metadata_xlsx": "./metadata/Conductivity.xlsx",
@@ -171,8 +175,6 @@ def build_vector_databases_batch(
     config_path: str = "./config/config.yaml",
     data_dir: str = "./data/raw",
     input_layout: str = "reaction",
-    metadata_xlsx_path: Optional[str] = None,
-    flat_reaction_type: str = "Antiferromagnetism",
     reaction_configs: Optional[Dict[str, Dict]] = None,
     category_configs: Optional[Dict[str, Dict]] = None,
     agent_names: Optional[List[str]] = None,
@@ -197,10 +199,8 @@ def build_vector_databases_batch(
     Args:
         config_path: 配置文件路径
         data_dir: 原始数据目录
-        input_layout: "reaction" loads data_dir/<reaction>/*.md; "flat" loads data_dir/*.md;
+        input_layout: "reaction" loads data_dir/<reaction>/*.md;
             "category" loads data_dir/<category>/*.md with per-category XLSX metadata
-        metadata_xlsx_path: flat layout metadata XLSX with id/doi columns
-        flat_reaction_type: reaction_type metadata value for flat layout documents
         reaction_configs: 反应类型配置字典（None则使用 REACTION_CONFIGS）
         category_configs: category layout config dict (None uses CATEGORY_CONFIGS)
         agent_names: 要构建的agent列表（None则使用config里的agent1~agent4顺序）
@@ -227,8 +227,8 @@ def build_vector_databases_batch(
     logger.info("Starting batch Chroma vector database build", extra={"event": "vector_db.batch_build.start"})
 
     input_layout = (input_layout or "reaction").strip().lower()
-    if input_layout not in {"reaction", "flat", "category"}:
-        raise ValueError("input_layout must be one of: reaction, flat, category")
+    if input_layout not in {"reaction", "category"}:
+        raise ValueError("input_layout must be one of: reaction, category")
 
     if reaction_configs is None:
         reaction_configs = REACTION_CONFIGS
@@ -273,8 +273,6 @@ def build_vector_databases_batch(
     logger.info(f"✓ chunk_size: {chunk_size}, chunk_overlap: {chunk_overlap}")
     logger.info(f"✓ max_workers: {max_workers}")
     logger.info(f"✓ input_layout: {input_layout}")
-    if input_layout == "flat":
-        logger.info(f"✓ flat_reaction_type: {flat_reaction_type}")
 
     # Build all agent configs (used by MultiModelEmbedder to select per-agent embedding provider/model).
     all_agent_configs = {name: config.get_llm_config(name) for name in agent_names}
@@ -292,24 +290,14 @@ def build_vector_databases_batch(
             logger.error("  Please ensure the data directory structure is as follows:")
             for _, cfg in reaction_configs.items():
                 logger.error(f"    {data_dir}/{cfg['path']}/*.md")
-        elif input_layout == "category":
+        else:
             logger.error("  Please ensure the category data directory structure is as follows:")
             for _, cfg in category_configs.items():
                 logger.error(f"    {data_dir}/{cfg['path']}/*.md")
-        else:
-            logger.error(f"  Please place Markdown files directly under: {data_dir}/*.md")
         return {}
 
     if input_layout == "reaction":
         documents = processor.load_reaction_documents(base_dir=data_dir, reaction_configs=reaction_configs)
-    elif input_layout == "flat":
-        resolved_metadata_xlsx_path = _resolve_metadata_xlsx_path(metadata_xlsx_path)
-        logger.info(f"✓ metadata_xlsx: {resolved_metadata_xlsx_path}")
-        documents = processor.load_flat_documents(
-            data_dir=data_dir,
-            metadata_xlsx_path=resolved_metadata_xlsx_path,
-            reaction_type=flat_reaction_type,
-        )
     else:
         documents = processor.load_category_documents(
             base_dir=data_dir,
@@ -677,25 +665,6 @@ def _parse_agent_list(value: str) -> List[str]:
     return [x.strip() for x in raw if x.strip()]
 
 
-def _resolve_metadata_xlsx_path(metadata_xlsx_path: Optional[str]) -> str:
-    if metadata_xlsx_path:
-        path = Path(metadata_xlsx_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Metadata XLSX does not exist: {metadata_xlsx_path}")
-        if not path.is_file():
-            raise ValueError(f"Metadata XLSX path is not a file: {metadata_xlsx_path}")
-        return str(path)
-
-    metadata_dir = Path("./metadata")
-    matches = sorted(metadata_dir.glob("*.xlsx")) if metadata_dir.exists() else []
-    if len(matches) != 1:
-        raise ValueError(
-            "Flat input layout requires exactly one metadata XLSX under ./metadata, "
-            f"found {len(matches)}. Use --metadata-xlsx to specify the file."
-        )
-    return str(matches[0])
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Batch build Chroma collections for agent1~agent4.")
     parser.add_argument("--config", dest="config_path", default="./config/config.yaml", help="config yaml path")
@@ -703,24 +672,12 @@ def main() -> int:
     parser.add_argument(
         "--input-layout",
         dest="input_layout",
-        choices=["reaction", "flat", "category"],
+        choices=["reaction", "category"],
         default="reaction",
         help=(
-            "input layout: reaction=data-dir/<reaction>/*.md, flat=data-dir/*.md with one XLSX metadata, "
+            "input layout: reaction=data-dir/<reaction>/*.md, "
             "category=data-dir/<category>/*.md with per-category XLSX metadata"
         ),
-    )
-    parser.add_argument(
-        "--metadata-xlsx",
-        dest="metadata_xlsx_path",
-        default=None,
-        help="metadata XLSX path for flat input layout (columns: id, doi)",
-    )
-    parser.add_argument(
-        "--flat-reaction-type",
-        dest="flat_reaction_type",
-        default="antiferromagnetism",
-        help="reaction_type metadata value for flat input layout (default: antiferromagnetism)",
     )
     parser.add_argument(
         "--agents",
@@ -796,8 +753,6 @@ def main() -> int:
         config_path=args.config_path,
         data_dir=args.data_dir,
         input_layout=args.input_layout,
-        metadata_xlsx_path=args.metadata_xlsx_path,
-        flat_reaction_type=args.flat_reaction_type,
         reaction_configs=REACTION_CONFIGS,
         category_configs=CATEGORY_CONFIGS,
         agent_names=agent_names,

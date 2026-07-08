@@ -9,6 +9,7 @@ class ReactionTypeNormalizationTests(unittest.TestCase):
         self.assertEqual(canonical_reaction_type("CO2RR"), "CO2RR")
 
     def test_new_categories_match_chroma_metadata_labels(self):
+        self.assertEqual(canonical_reaction_type("Antiferromagnetism"), "antiferromagnetism")
         self.assertEqual(canonical_reaction_type("conductivity"), "conductivity")
         self.assertEqual(canonical_reaction_type("thermal_conductivity"), "thermal conductivity")
         self.assertEqual(
@@ -22,6 +23,7 @@ class ReactionTypeNormalizationTests(unittest.TestCase):
         self.assertFalse(reaction_type_matches("conductivity", "thermal conductivity"))
 
     def test_supported_type_check(self):
+        self.assertTrue(is_supported_reaction_type("antiferromagnetism"))
         self.assertTrue(is_supported_reaction_type("ferrimagnetism"))
         self.assertFalse(is_supported_reaction_type("unknown category"))
 

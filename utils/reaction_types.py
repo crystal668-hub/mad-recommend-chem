@@ -17,6 +17,7 @@ REACTION_TYPE_LABELS: List[str] = [
 ]
 
 CATEGORY_TYPE_LABELS: List[str] = [
+    "antiferromagnetism",
     "conductivity",
     "ferrimagnetism",
     "ferromagnetism",

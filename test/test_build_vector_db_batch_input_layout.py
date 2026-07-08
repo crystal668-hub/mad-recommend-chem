@@ -63,39 +63,6 @@ class BuildVectorDbBatchInputLayoutTests(unittest.TestCase):
                 )
 
             processor.load_reaction_documents.assert_called_once()
-            processor.load_flat_documents.assert_not_called()
-            processor.load_category_documents.assert_not_called()
-
-    def test_flat_layout_uses_flat_loader(self):
-        with self._tempdir() as tmp:
-            root = Path(tmp)
-            data_dir = root / "data"
-            metadata_dir = root / "metadata"
-            data_dir.mkdir()
-            metadata_dir.mkdir()
-            xlsx_path = metadata_dir / "metadata.xlsx"
-            xlsx_path.write_bytes(b"placeholder")
-
-            processor = MagicMock()
-            processor.load_flat_documents.return_value = ["doc"]
-            processor.chunk_documents.return_value = []
-
-            with patch.object(batch, "AgentConfig", return_value=self._fake_config()), patch.object(
-                batch, "TextProcessor", return_value=processor
-            ), patch.object(batch, "setup_logging", return_value=None):
-                batch.build_vector_databases_batch(
-                    data_dir=str(data_dir),
-                    input_layout="flat",
-                    metadata_xlsx_path=str(xlsx_path),
-                    agent_names=["agent1"],
-                )
-
-            processor.load_flat_documents.assert_called_once_with(
-                data_dir=str(data_dir),
-                metadata_xlsx_path=str(xlsx_path),
-                reaction_type="Antiferromagnetism",
-            )
-            processor.load_reaction_documents.assert_not_called()
             processor.load_category_documents.assert_not_called()
 
     def test_category_layout_uses_category_loader(self):
@@ -120,15 +87,31 @@ class BuildVectorDbBatchInputLayoutTests(unittest.TestCase):
                 category_configs=batch.CATEGORY_CONFIGS,
             )
             processor.load_reaction_documents.assert_not_called()
-            processor.load_flat_documents.assert_not_called()
 
-    def test_flat_metadata_auto_resolve_requires_exactly_one_xlsx(self):
+    def test_category_layout_includes_antiferromagnetism(self):
+        self.assertIn("Antiferromagnetism", batch.CATEGORY_CONFIGS)
+        self.assertEqual(
+            batch.CATEGORY_CONFIGS["Antiferromagnetism"]["path"],
+            "antiferromagnetism",
+        )
+        self.assertEqual(
+            batch.CATEGORY_CONFIGS["Antiferromagnetism"]["metadata_xlsx"],
+            "./metadata/Antiferromagnetism.xlsx",
+        )
+
+    def test_flat_input_layout_is_rejected(self):
         with self._tempdir() as tmp:
-            metadata_dir = Path(tmp) / "metadata"
-            metadata_dir.mkdir()
-            with patch.object(batch, "Path", side_effect=lambda value=".": Path(tmp) / value):
-                with self.assertRaisesRegex(ValueError, "exactly one metadata XLSX"):
-                    batch._resolve_metadata_xlsx_path(None)
+            data_dir = Path(tmp) / "data"
+            data_dir.mkdir()
+            with patch.object(batch, "AgentConfig", return_value=self._fake_config()), patch.object(
+                batch, "setup_logging", return_value=None
+            ):
+                with self.assertRaisesRegex(ValueError, "input_layout must be one of: reaction, category"):
+                    batch.build_vector_databases_batch(
+                        data_dir=str(data_dir),
+                        input_layout="flat",
+                        agent_names=["agent1"],
+                    )
 
 
 if __name__ == "__main__":
