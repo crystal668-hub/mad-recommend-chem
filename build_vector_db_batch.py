@@ -30,49 +30,11 @@ sys.path.insert(0, str(project_root))
 
 from agents.agent_config import AgentConfig
 from database.embedder import MultiModelEmbedder
+from database.literature_types import LITERATURE_TYPE_CONFIGS
 from database.text_processor import TextProcessor
 from database.vector_store import VectorStore
 from utils.logger import Logger, setup_logging
 
-
-REACTION_CONFIGS = {
-    "CO2RR": {"path": "CO2RR", "type": "fulltext"},  # CO2 Reduction Reaction
-    "EOR": {"path": "EOR", "type": "fulltext"},  # Ethanol Oxidation Reaction
-    "HER": {"path": "HER", "type": "fulltext"},  # Hydrogen Evolution Reaction
-    "HOR": {"path": "HOR", "type": "fulltext"},  # Hydrogen Oxidation Reaction
-    "HZOR": {"path": "HZOR", "type": "fulltext"},  # Hydrazine Oxidation Reaction
-    "O5H": {"path": "O5H", "type": "fulltext"},  # Oxidation of 5-hydroxymethylfurfural
-    "OER": {"path": "OER", "type": "fulltext"},  # Oxygen Evolution Reaction
-    "ORR": {"path": "ORR", "type": "fulltext"},  # Oxygen Reduction Reaction
-    "UOR": {"path": "UOR", "type": "fulltext"},  # Urea Oxidation Reaction
-}
-
-CATEGORY_CONFIGS = {
-    "Antiferromagnetism": {
-        "path": "antiferromagnetism",
-        "metadata_xlsx": "./metadata/Antiferromagnetism.xlsx",
-    },
-    "Conductivity": {
-        "path": "conductivity",
-        "metadata_xlsx": "./metadata/Conductivity.xlsx",
-    },
-    "Ferrimagnetism": {
-        "path": "ferrimagnetism",
-        "metadata_xlsx": "./metadata/Ferrimagnetism.xlsx",
-    },
-    "Ferromagnetism": {
-        "path": "ferromagnetism",
-        "metadata_xlsx": "./metadata/Ferromagnetism.xlsx",
-    },
-    "Photothermal conversion efficiency": {
-        "path": "photothermal conversion efficiency",
-        "metadata_xlsx": "./metadata/Photothermal conversion efficiency.xlsx",
-    },
-    "Thermal Conductivity": {
-        "path": "thermal conductivity",
-        "metadata_xlsx": "./metadata/Thermal Conductivity.xlsx",
-    },
-}
 
 _DOI_PREFIX_RE = re.compile(r"(?i)^10\.\d{4,9}/")
 
@@ -174,9 +136,7 @@ def _prepare_chroma_ids_and_metadatas(
 def build_vector_databases_batch(
     config_path: str = "./config/config.yaml",
     data_dir: str = "./data/raw",
-    input_layout: str = "reaction",
-    reaction_configs: Optional[Dict[str, Dict]] = None,
-    category_configs: Optional[Dict[str, Dict]] = None,
+    literature_type_configs: Optional[Dict[str, Dict]] = None,
     agent_names: Optional[List[str]] = None,
     chunk_size: Optional[int] = None,
     chunk_overlap: Optional[int] = None,
@@ -199,10 +159,7 @@ def build_vector_databases_batch(
     Args:
         config_path: 配置文件路径
         data_dir: 原始数据目录
-        input_layout: "reaction" loads data_dir/<reaction>/*.md;
-            "category" loads data_dir/<category>/*.md with per-category XLSX metadata
-        reaction_configs: 反应类型配置字典（None则使用 REACTION_CONFIGS）
-        category_configs: category layout config dict (None uses CATEGORY_CONFIGS)
+        literature_type_configs: Literature Type directory and CSV metadata configuration
         agent_names: 要构建的agent列表（None则使用config里的agent1~agent4顺序）
         chunk_size: 分块大小（默认使用config.rag.chunk_size；CLI可显式覆盖）
         chunk_overlap: 分块重叠（默认使用config.rag.chunk_overlap；CLI可显式覆盖）
@@ -226,14 +183,8 @@ def build_vector_databases_batch(
 
     logger.info("Starting batch Chroma vector database build", extra={"event": "vector_db.batch_build.start"})
 
-    input_layout = (input_layout or "reaction").strip().lower()
-    if input_layout not in {"reaction", "category"}:
-        raise ValueError("input_layout must be one of: reaction, category")
-
-    if reaction_configs is None:
-        reaction_configs = REACTION_CONFIGS
-    if category_configs is None:
-        category_configs = CATEGORY_CONFIGS
+    if literature_type_configs is None:
+        literature_type_configs = LITERATURE_TYPE_CONFIGS
 
     # -------------------------
     # 1) Load config
@@ -272,7 +223,7 @@ def build_vector_databases_batch(
     logger.info(f"✓ base_collection_name: {base_collection_name}")
     logger.info(f"✓ chunk_size: {chunk_size}, chunk_overlap: {chunk_overlap}")
     logger.info(f"✓ max_workers: {max_workers}")
-    logger.info(f"✓ input_layout: {input_layout}")
+    logger.info(f"✓ literature_types: {list(literature_type_configs)}")
 
     # Build all agent configs (used by MultiModelEmbedder to select per-agent embedding provider/model).
     all_agent_configs = {name: config.get_llm_config(name) for name in agent_names}
@@ -286,23 +237,16 @@ def build_vector_databases_batch(
     data_path = Path(data_dir)
     if not data_path.exists():
         logger.error(f"\n✗ Data directory does not exist: {data_dir}")
-        if input_layout == "reaction":
-            logger.error("  Please ensure the data directory structure is as follows:")
-            for _, cfg in reaction_configs.items():
-                logger.error(f"    {data_dir}/{cfg['path']}/*.md")
-        else:
-            logger.error("  Please ensure the category data directory structure is as follows:")
-            for _, cfg in category_configs.items():
-                logger.error(f"    {data_dir}/{cfg['path']}/*.md")
+        logger.error("  Please ensure each Literature Type has Markdown and CSV metadata:")
+        for _, cfg in literature_type_configs.items():
+            logger.error(f"    {data_dir}/{cfg['path']}/*.md")
+            logger.error(f"    {cfg['metadata_csv']}")
         return {}
 
-    if input_layout == "reaction":
-        documents = processor.load_reaction_documents(base_dir=data_dir, reaction_configs=reaction_configs)
-    else:
-        documents = processor.load_category_documents(
-            base_dir=data_dir,
-            category_configs=category_configs,
-        )
+    documents = processor.load_literature_type_documents(
+        base_dir=data_dir,
+        literature_type_configs=literature_type_configs,
+    )
     logger.info(f"\n✓ Loaded {len(documents)} Document objects")
     if not documents:
         logger.error("\n✗ No documents found, please check the data directory (supported: .md)")
@@ -670,16 +614,6 @@ def main() -> int:
     parser.add_argument("--config", dest="config_path", default="./config/config.yaml", help="config yaml path")
     parser.add_argument("--data-dir", dest="data_dir", default="./data/raw", help="raw markdown data dir")
     parser.add_argument(
-        "--input-layout",
-        dest="input_layout",
-        choices=["reaction", "category"],
-        default="reaction",
-        help=(
-            "input layout: reaction=data-dir/<reaction>/*.md, "
-            "category=data-dir/<category>/*.md with per-category XLSX metadata"
-        ),
-    )
-    parser.add_argument(
         "--agents",
         dest="agents",
         default="agent1,agent2,agent3,agent4",
@@ -752,9 +686,7 @@ def main() -> int:
     build_vector_databases_batch(
         config_path=args.config_path,
         data_dir=args.data_dir,
-        input_layout=args.input_layout,
-        reaction_configs=REACTION_CONFIGS,
-        category_configs=CATEGORY_CONFIGS,
+        literature_type_configs=LITERATURE_TYPE_CONFIGS,
         agent_names=agent_names,
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
