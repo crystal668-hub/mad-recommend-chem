@@ -35,19 +35,27 @@ Notes:
 - See `config/config.yaml` for the exact mapping.
 
 ### 3) Prepare literature data
-Place Markdown papers under:
+Every supported Literature Type is declared once in
+`database/literature_types.py`. Each entry points to a Markdown directory and a CSV
+metadata file, for example:
 
 ```text
-data/raw/CO2RR/*.md
-data/raw/EOR/*.md
-data/raw/HER/*.md
-data/raw/HOR/*.md
-data/raw/HZOR/*.md
-data/raw/O5H/*.md
-data/raw/OER/*.md
-data/raw/ORR/*.md
-data/raw/UOR/*.md
+data/raw/OER/*.md                  metadata/OER.csv
+data/raw/conductivity/*.md         metadata/Conductivity.csv
 ```
+
+Every CSV must use this fixed schema:
+
+```csv
+file_name,doi,abstract
+```
+
+`file_name` is the local PDF name. The Markdown file must have the same basename and
+the `.md` extension. DOI resolution prefers the CSV value, falls back to a DOI in the
+Markdown body, and finally uses a stable `no-doi` identifier. `abstract` is validated
+but is not copied into Chroma chunk metadata. The canonical Literature Type is stored
+in the existing `reaction_type` metadata field for compatibility with existing
+collections and retrieval filters.
 
 ### 4) Build vector databases (Chroma)
 Preferred: build per-agent collections via the batch script.
@@ -133,7 +141,8 @@ All runtime configuration lives in `config/config.yaml`:
 - `paths.outputs`: output directory for saved results
 
 ## How it works (high level)
-- `database/text_processor.py`: load + chunk Markdown documents (LlamaIndex parsers)
+- `database/literature_types.py`: shared Literature Type directory + CSV configuration
+- `database/text_processor.py`: load CSV-backed Markdown documents + chunk them (LlamaIndex parsers)
 - `database/embedder.py`: multi-provider embeddings selected per agent
 - `database/vector_store.py`: Chroma persistence with stable chunk ids
 - `database/rag_system.py`: query embedding + Chroma similarity search

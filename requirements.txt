@@ -20,8 +20,6 @@ langchain-openai>=0.1.0
 openai>=1.10.0
 
 # Data Processing 
-pandas>=2.1.0
-openpyxl>=3.1.0
 numpy>=1.24.0
 pydantic>=2.5.0
 
