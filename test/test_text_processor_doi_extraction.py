@@ -1,5 +1,6 @@
 import csv
 import shutil
+import tempfile
 import unittest
 import uuid
 from contextlib import contextmanager
@@ -78,6 +79,34 @@ class TextProcessorLiteratureTypeDocumentTests(unittest.TestCase):
             writer = csv.DictWriter(handle, fieldnames=resolved_fieldnames)
             writer.writeheader()
             writer.writerows(rows)
+
+    def test_load_documents_cleans_acknowledgements_and_references(self):
+        with tempfile.TemporaryDirectory(prefix="text_processor_load_documents_") as tmp:
+            root = Path(tmp)
+            data_dir = root / "data" / "OER"
+            data_dir.mkdir(parents=True)
+            (data_dir / "paper.md").write_text(
+                "# Paper\n\n"
+                "DOI: 10.1021/ACS.JACS.0C00000\n\n"
+                "Main body paragraph.\n\n"
+                "## Acknowledgements\n"
+                "Funding support.\n\n"
+                "## References\n"
+                "[1] Ref author. 2024. https://doi.org/10.1002/ref-doi\n",
+                encoding="utf-8",
+            )
+
+            docs = TextProcessor(data_dir=str(root / "data")).load_documents(
+                data_dir=str(data_dir),
+                reaction_type="OER",
+            )
+
+            self.assertEqual(len(docs), 1)
+            self.assertIn("Main body paragraph.", docs[0].text)
+            self.assertNotIn("Acknowledgements", docs[0].text)
+            self.assertNotIn("Funding support.", docs[0].text)
+            self.assertNotIn("References", docs[0].text)
+            self.assertEqual(docs[0].metadata["doc_id"], "10.1021/acs.jacs.0c00000")
 
     def test_matches_pdf_name_to_markdown_and_omits_abstract_metadata(self):
         with self._tempdir() as tmp:
@@ -165,6 +194,38 @@ class TextProcessorLiteratureTypeDocumentTests(unittest.TestCase):
             self.assertEqual(len(docs), 1)
             self.assertTrue(docs[0].metadata["doc_id"].startswith("no-doi:paper_003_"))
             self.assertEqual(docs[0].metadata["reaction_type"], "OER")
+
+    def test_literature_type_loader_cleans_acknowledgements_and_references(self):
+        with self._tempdir() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data" / "OER"
+            metadata_dir = root / "metadata"
+            data_dir.mkdir(parents=True)
+            metadata_dir.mkdir()
+            (data_dir / "paper.md").write_text(
+                "# Paper\n\n"
+                "Main body paragraph.\n\n"
+                "## References\n"
+                "[1] Ref author. 2024. https://doi.org/10.1002/ref-doi\n",
+                encoding="utf-8",
+            )
+            csv_path = metadata_dir / "OER.csv"
+            self._write_csv(
+                csv_path,
+                [{"file_name": "paper.pdf", "doi": "10.1002/cctc.202200897", "abstract": "Abstract"}],
+            )
+
+            docs = TextProcessor(data_dir=str(root / "data")).load_literature_type_directory_documents(
+                data_dir=str(data_dir),
+                metadata_csv_path=str(csv_path),
+                literature_type="OER",
+            )
+
+            self.assertEqual(len(docs), 1)
+            self.assertIn("Main body paragraph.", docs[0].text)
+            self.assertNotIn("References", docs[0].text)
+            self.assertNotIn("ref-doi", docs[0].text)
+            self.assertEqual(docs[0].metadata["doc_id"], "10.1002/cctc.202200897")
 
     def test_missing_required_csv_header_is_rejected(self):
         with self._tempdir() as tmp:

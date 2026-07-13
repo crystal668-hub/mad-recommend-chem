@@ -139,6 +139,19 @@ class TextProcessor:
         
         return text
 
+    def _prepare_loaded_document_text(self, doc: Document) -> str:
+        """
+        Clean a loaded Markdown document in-place before metadata extraction/chunking.
+
+        This ensures downstream chunking sees the cleaned paper body rather than
+        trailing acknowledgements or reference sections.
+        """
+        raw_text = getattr(doc, "text", "") or ""
+        cleaned_text = self.clean_text(raw_text)
+        if cleaned_text != raw_text:
+            doc.set_content(cleaned_text)
+        return cleaned_text
+
     @staticmethod
     def _normalize_title_for_match(text: str) -> str:
         """
@@ -670,6 +683,8 @@ class TextProcessor:
             # Add custom metadata to each document
             processed_documents = []
             for doc in documents:
+                cleaned_text = self._prepare_loaded_document_text(doc)
+
                 # Get file name (from original metadata)
                 file_name = doc.metadata.get('file_name', '')
                 file_path_str = doc.metadata.get('file_path', '')
@@ -686,7 +701,7 @@ class TextProcessor:
                             break
                 
                 # Extract DOI 
-                doc_id = self.extract_doi_from_content(doc.text, file_name, file_path_str)
+                doc_id = self.extract_doi_from_content(cleaned_text, file_name, file_path_str)
                 
                 # Reset metadata to only include reaction_type and doc_id
                 doc.metadata = {
@@ -763,6 +778,7 @@ class TextProcessor:
         resolved_type = (literature_type or "unknown").strip() or "unknown"
 
         for doc in documents:
+            cleaned_text = self._prepare_loaded_document_text(doc)
             file_name = doc.metadata.get("file_name", "")
             file_path_str = doc.metadata.get("file_path", "")
             file_stem = Path(file_name).stem if file_name else Path(file_path_str).stem
@@ -785,7 +801,7 @@ class TextProcessor:
                     )
 
             if not doc_id:
-                doc_id = self._extract_doi_from_markdown(doc.text)
+                doc_id = self._extract_doi_from_markdown(cleaned_text)
             if not doc_id:
                 doc_id = self._build_fallback_doc_id(file_name, file_path_str)
 
