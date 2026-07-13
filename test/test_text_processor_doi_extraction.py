@@ -1,15 +1,13 @@
-import unittest
+import csv
 import shutil
+import unittest
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
+import database.text_processor as text_processor_module
 from database.text_processor import TextProcessor
-
-try:
-    import pandas as pd
-except Exception:  # pragma: no cover
-    pd = None
 
 try:
     import llama_index.core  # noqa: F401
@@ -61,24 +59,27 @@ class TextProcessorDoiExtractionTests(unittest.TestCase):
         self.assertEqual(doi, "10.1002/cctc.202200897")
 
 
-@unittest.skipIf(pd is None, "pandas is required for category XLSX metadata tests")
 @unittest.skipUnless(llama_index_available, "llama-index is required for document loading tests")
-class TextProcessorCategoryDocumentTests(unittest.TestCase):
+class TextProcessorLiteratureTypeDocumentTests(unittest.TestCase):
     @contextmanager
     def _tempdir(self):
         cache_dir = Path(".cache")
         cache_dir.mkdir(exist_ok=True)
-        path = cache_dir / f"category_text_processor_{uuid.uuid4().hex[:8]}"
+        path = cache_dir / f"literature_type_text_processor_{uuid.uuid4().hex[:8]}"
         path.mkdir()
         try:
             yield str(path)
         finally:
             shutil.rmtree(path, ignore_errors=True)
 
-    def _write_xlsx(self, path: Path, rows):
-        pd.DataFrame(rows).to_excel(path, index=False)
+    def _write_csv(self, path: Path, rows, fieldnames=None):
+        resolved_fieldnames = fieldnames or ["file_name", "doi", "abstract"]
+        with path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=resolved_fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
 
-    def test_loads_antiferromagnetism_document_doi_from_xlsx_id(self):
+    def test_matches_pdf_name_to_markdown_and_omits_abstract_metadata(self):
         with self._tempdir() as tmp:
             root = Path(tmp)
             data_dir = root / "data" / "antiferromagnetism"
@@ -86,26 +87,38 @@ class TextProcessorCategoryDocumentTests(unittest.TestCase):
             data_dir.mkdir(parents=True)
             metadata_dir.mkdir()
             (data_dir / "paper_001.md").write_text("# Paper\n\nNo DOI here.\n", encoding="utf-8")
-            xlsx_path = metadata_dir / "Antiferromagnetism.xlsx"
-            self._write_xlsx(
-                xlsx_path,
-                [{" ID ": "paper_001", " DOI ": "https://doi.org/10.1002/CCTC.202200897"}],
+            csv_path = metadata_dir / "Antiferromagnetism.csv"
+            self._write_csv(
+                csv_path,
+                [
+                    {
+                        "file_name": "PAPER_001.pdf",
+                        "doi": "https://doi.org/10.1002/CCTC.202200897",
+                        "abstract": "CSV abstract that must not reach Chroma metadata.",
+                    }
+                ],
             )
 
-            docs = TextProcessor(data_dir=str(root / "data")).load_category_directory_documents(
+            docs = TextProcessor(data_dir=str(root / "data")).load_literature_type_directory_documents(
                 data_dir=str(data_dir),
-                metadata_xlsx_path=str(xlsx_path),
-                category_label="Antiferromagnetism",
+                metadata_csv_path=str(csv_path),
+                literature_type="antiferromagnetism",
             )
 
             self.assertEqual(len(docs), 1)
-            self.assertEqual(docs[0].metadata["doc_id"], "10.1002/cctc.202200897")
-            self.assertEqual(docs[0].metadata["reaction_type"], "antiferromagnetism")
+            self.assertEqual(
+                docs[0].metadata,
+                {
+                    "reaction_type": "antiferromagnetism",
+                    "doc_id": "10.1002/cctc.202200897",
+                },
+            )
+            self.assertNotIn("abstract", docs[0].metadata)
 
-    def test_antiferromagnetism_document_falls_back_to_markdown_doi_when_id_missing(self):
+    def test_missing_csv_row_falls_back_to_markdown_doi(self):
         with self._tempdir() as tmp:
             root = Path(tmp)
-            data_dir = root / "data" / "antiferromagnetism"
+            data_dir = root / "data" / "OER"
             metadata_dir = root / "metadata"
             data_dir.mkdir(parents=True)
             metadata_dir.mkdir()
@@ -113,106 +126,151 @@ class TextProcessorCategoryDocumentTests(unittest.TestCase):
                 "# Paper\n\nDOI: 10.1021/ACS.JACS.0C00000\n",
                 encoding="utf-8",
             )
-            xlsx_path = metadata_dir / "Antiferromagnetism.xlsx"
-            self._write_xlsx(xlsx_path, [{"id": "other", "doi": "10.1002/cctc.202200897"}])
+            csv_path = metadata_dir / "OER.csv"
+            self._write_csv(
+                csv_path,
+                [{"file_name": "other.pdf", "doi": "10.1002/cctc.202200897", "abstract": "Other"}],
+            )
 
-            docs = TextProcessor(data_dir=str(root / "data")).load_category_directory_documents(
+            docs = TextProcessor(data_dir=str(root / "data")).load_literature_type_directory_documents(
                 data_dir=str(data_dir),
-                metadata_xlsx_path=str(xlsx_path),
-                category_label="Antiferromagnetism",
+                metadata_csv_path=str(csv_path),
+                literature_type="OER",
             )
 
             self.assertEqual(len(docs), 1)
             self.assertEqual(docs[0].metadata["doc_id"], "10.1021/acs.jacs.0c00000")
-            self.assertEqual(docs[0].metadata["reaction_type"], "antiferromagnetism")
+            self.assertEqual(docs[0].metadata["reaction_type"], "OER")
 
-    def test_antiferromagnetism_document_falls_back_to_stable_no_doi_id(self):
+    def test_invalid_csv_doi_falls_back_to_stable_no_doi_id(self):
         with self._tempdir() as tmp:
             root = Path(tmp)
-            data_dir = root / "data" / "antiferromagnetism"
+            data_dir = root / "data" / "OER"
             metadata_dir = root / "metadata"
             data_dir.mkdir(parents=True)
             metadata_dir.mkdir()
             (data_dir / "paper_003.md").write_text("# Paper\n\nNo DOI here.\n", encoding="utf-8")
-            xlsx_path = metadata_dir / "Antiferromagnetism.xlsx"
-            self._write_xlsx(xlsx_path, [{"id": "paper_003", "doi": "not-a-doi"}])
+            csv_path = metadata_dir / "OER.csv"
+            self._write_csv(
+                csv_path,
+                [{"file_name": "paper_003.pdf", "doi": "not-a-doi", "abstract": "Abstract"}],
+            )
 
-            docs = TextProcessor(data_dir=str(root / "data")).load_category_directory_documents(
+            docs = TextProcessor(data_dir=str(root / "data")).load_literature_type_directory_documents(
                 data_dir=str(data_dir),
-                metadata_xlsx_path=str(xlsx_path),
-                category_label="Antiferromagnetism",
+                metadata_csv_path=str(csv_path),
+                literature_type="OER",
             )
 
             self.assertEqual(len(docs), 1)
             self.assertTrue(docs[0].metadata["doc_id"].startswith("no-doi:paper_003_"))
-            self.assertEqual(docs[0].metadata["reaction_type"], "antiferromagnetism")
+            self.assertEqual(docs[0].metadata["reaction_type"], "OER")
 
-    def test_loads_category_document_doi_from_best_matching_xlsx_column(self):
+    def test_missing_required_csv_header_is_rejected(self):
         with self._tempdir() as tmp:
             root = Path(tmp)
-            data_dir = root / "data" / "conductivity"
+            data_dir = root / "data" / "OER"
             metadata_dir = root / "metadata"
             data_dir.mkdir(parents=True)
             metadata_dir.mkdir()
-            (data_dir / "1.md").write_text("# Paper 1\n\nNo DOI here.\n", encoding="utf-8")
-            (data_dir / "2.md").write_text("# Paper 2\n\nNo DOI here.\n", encoding="utf-8")
-            xlsx_path = metadata_dir / "Conductivity.xlsx"
-            self._write_xlsx(
-                xlsx_path,
+            (data_dir / "paper.md").write_text("# Paper\n", encoding="utf-8")
+            csv_path = metadata_dir / "OER.csv"
+            self._write_csv(
+                csv_path,
+                [{"file_name": "paper.pdf", "doi": "10.1002/test"}],
+                fieldnames=["file_name", "doi"],
+            )
+
+            with self.assertRaisesRegex(ValueError, "missing required columns: abstract"):
+                TextProcessor(data_dir=str(root / "data")).load_literature_type_directory_documents(
+                    data_dir=str(data_dir),
+                    metadata_csv_path=str(csv_path),
+                    literature_type="OER",
+                )
+
+    def test_duplicate_case_insensitive_pdf_basenames_are_rejected(self):
+        with self._tempdir() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data" / "OER"
+            metadata_dir = root / "metadata"
+            data_dir.mkdir(parents=True)
+            metadata_dir.mkdir()
+            (data_dir / "paper.md").write_text("# Paper\n", encoding="utf-8")
+            csv_path = metadata_dir / "OER.csv"
+            self._write_csv(
+                csv_path,
                 [
-                    {
-                        "row_number": "300",
-                        "doi": "10.1002/cctc.202200897",
-                        "Unnamed: 10": "1",
-                    },
-                    {
-                        "row_number": "301",
-                        "doi": "10.1021/acs.jacs.0c00000",
-                        "Unnamed: 10": "2",
-                    },
+                    {"file_name": "paper.pdf", "doi": "10.1002/one", "abstract": "One"},
+                    {"file_name": "PAPER.PDF", "doi": "10.1002/two", "abstract": "Two"},
                 ],
             )
 
-            docs = TextProcessor(data_dir=str(root / "data")).load_category_directory_documents(
-                data_dir=str(data_dir),
-                metadata_xlsx_path=str(xlsx_path),
-                category_label="Conductivity",
-            )
+            with self.assertRaisesRegex(ValueError, "Duplicate file_name basename"):
+                TextProcessor(data_dir=str(root / "data")).load_literature_type_directory_documents(
+                    data_dir=str(data_dir),
+                    metadata_csv_path=str(csv_path),
+                    literature_type="OER",
+                )
 
-            doc_ids = {doc.metadata["doc_id"] for doc in docs}
-            self.assertEqual(len(docs), 2)
-            self.assertEqual(
-                doc_ids,
-                {"10.1002/cctc.202200897", "10.1021/acs.jacs.0c00000"},
-            )
-            self.assertTrue(all(doc.metadata["reaction_type"] == "conductivity" for doc in docs))
-
-    def test_category_document_missing_metadata_falls_back_to_stable_no_doi_id(self):
+    def test_extra_csv_rows_are_ignored_with_warning(self):
         with self._tempdir() as tmp:
             root = Path(tmp)
-            data_dir = root / "data" / "conductivity"
+            data_dir = root / "data" / "OER"
             metadata_dir = root / "metadata"
             data_dir.mkdir(parents=True)
             metadata_dir.mkdir()
-            (data_dir / "1.md").write_text("# Paper 1\n\nNo DOI here.\n", encoding="utf-8")
-            (data_dir / "2.md").write_text("# Paper 2\n\nNo DOI here.\n", encoding="utf-8")
-            xlsx_path = metadata_dir / "Conductivity.xlsx"
-            self._write_xlsx(
-                xlsx_path,
-                [{"doi": "10.1002/cctc.202200897", "Unnamed: 10": "1"}],
+            (data_dir / "paper.md").write_text("# Paper\n", encoding="utf-8")
+            csv_path = metadata_dir / "OER.csv"
+            self._write_csv(
+                csv_path,
+                [
+                    {"file_name": "paper.pdf", "doi": "10.1002/matched", "abstract": "Matched"},
+                    {"file_name": "extra.pdf", "doi": "10.1002/extra", "abstract": "Extra"},
+                ],
             )
 
-            docs = TextProcessor(data_dir=str(root / "data")).load_category_directory_documents(
-                data_dir=str(data_dir),
-                metadata_xlsx_path=str(xlsx_path),
-                category_label="Conductivity",
+            with patch.object(text_processor_module.logger, "warning") as warning:
+                docs = TextProcessor(data_dir=str(root / "data")).load_literature_type_directory_documents(
+                    data_dir=str(data_dir),
+                    metadata_csv_path=str(csv_path),
+                    literature_type="OER",
+                )
+
+            self.assertEqual(len(docs), 1)
+            self.assertTrue(any("extra" in str(call).lower() for call in warning.call_args_list))
+
+    def test_aggregate_loader_preserves_canonical_type_keys(self):
+        with self._tempdir() as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            metadata_dir = root / "metadata"
+            oer_dir = data_root / "OER"
+            conductivity_dir = data_root / "conductivity"
+            oer_dir.mkdir(parents=True)
+            conductivity_dir.mkdir(parents=True)
+            metadata_dir.mkdir()
+            (oer_dir / "oer.md").write_text("# OER\n", encoding="utf-8")
+            (conductivity_dir / "cond.md").write_text("# Conductivity\n", encoding="utf-8")
+            oer_csv = metadata_dir / "OER.csv"
+            conductivity_csv = metadata_dir / "Conductivity.csv"
+            self._write_csv(oer_csv, [{"file_name": "oer.pdf", "doi": "10.1002/oer", "abstract": "OER"}])
+            self._write_csv(
+                conductivity_csv,
+                [{"file_name": "cond.pdf", "doi": "10.1002/cond", "abstract": "Conductivity"}],
             )
 
-            doc_ids = {doc.metadata["doc_id"] for doc in docs}
-            self.assertEqual(len(docs), 2)
-            self.assertIn("10.1002/cctc.202200897", doc_ids)
-            self.assertTrue(any(doc_id.startswith("no-doi:2_") for doc_id in doc_ids))
-            self.assertTrue(all(doc.metadata["reaction_type"] == "conductivity" for doc in docs))
+            docs = TextProcessor(data_dir=str(data_root)).load_literature_type_documents(
+                base_dir=str(data_root),
+                literature_type_configs={
+                    "OER": {"path": "OER", "metadata_csv": str(oer_csv)},
+                    "conductivity": {
+                        "path": "conductivity",
+                        "metadata_csv": str(conductivity_csv),
+                    },
+                },
+            )
+
+            self.assertEqual({doc.metadata["reaction_type"] for doc in docs}, {"OER", "conductivity"})
 
 
 if __name__ == "__main__":

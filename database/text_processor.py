@@ -8,6 +8,7 @@ Includes text loading, chunking, and supports LlamaIndex parsing of Markdown fil
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import re
 from pathlib import Path
@@ -53,7 +54,6 @@ class TextProcessor:
         # Lazy-loaded mapping: reaction_key -> {normalized_title: doi}
         self._metadata_tsv_index: Dict[str, Dict[str, str]] = {}
         self._metadata_tsv_paths: Optional[Dict[str, List[Path]]] = None
-        self._metadata_xlsx_index: Dict[str, Dict[str, str]] = {}
     
     def clean_text(self, text: str) -> str:
         """
@@ -440,128 +440,44 @@ class TextProcessor:
 
         return None
 
-    def _load_metadata_xlsx_index(
-        self,
-        metadata_xlsx_path: str,
-        candidate_ids: Optional[set[str]] = None,
-        require_id_column: bool = True,
-    ) -> Dict[str, str]:
-        """
-        Load {id: doi} metadata from a single XLSX file.
+    def _load_metadata_csv_index(self, metadata_csv_path: str) -> Dict[str, Dict[str, str]]:
+        """Load CSV metadata keyed by the case-insensitive PDF filename stem."""
+        csv_path = Path(metadata_csv_path)
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Metadata CSV does not exist: {metadata_csv_path}")
+        if not csv_path.is_file():
+            raise ValueError(f"Metadata CSV path is not a file: {metadata_csv_path}")
 
-        When an explicit `id` column exists, Markdown file stems are mapped directly.
-        Category layouts can pass candidate_ids and allow the best matching column
-        to be selected when an explicit `id` column is not present.
-        """
-        xlsx_path = Path(metadata_xlsx_path)
-        candidate_key = ""
-        if candidate_ids is not None:
-            candidate_key = hashlib.sha256("\n".join(sorted(candidate_ids)).encode("utf-8")).hexdigest()
-        cache_key = f"{xlsx_path.resolve()}|require_id={require_id_column}|candidates={candidate_key}"
-        if cache_key in self._metadata_xlsx_index:
-            return self._metadata_xlsx_index[cache_key]
-        if not xlsx_path.exists():
-            raise FileNotFoundError(f"Metadata XLSX does not exist: {metadata_xlsx_path}")
-        if not xlsx_path.is_file():
-            raise ValueError(f"Metadata XLSX path is not a file: {metadata_xlsx_path}")
-
-        try:
-            import pandas as pd
-        except Exception as exc:  # pragma: no cover - dependency error path
-            raise ModuleNotFoundError(
-                "pandas and openpyxl are required to read metadata XLSX files. "
-                "Install project requirements before using XLSX-backed metadata loading."
-            ) from exc
-
-        try:
-            frame = pd.read_excel(xlsx_path, dtype=str, keep_default_na=False)
-        except ImportError as exc:  # pragma: no cover - depends on optional engine availability
-            raise ModuleNotFoundError(
-                "openpyxl is required to read .xlsx metadata files. "
-                "Install project requirements before using XLSX-backed metadata loading."
-            ) from exc
-
-        column_lookup = {str(col).strip().lower(): col for col in frame.columns}
-        if "doi" not in column_lookup:
-            raise ValueError(
-                "Metadata XLSX must contain column 'doi'; missing: doi"
-            )
-
-        doi_col = column_lookup["doi"]
-        id_col = column_lookup.get("id")
-        if id_col is None:
-            if require_id_column:
-                raise ValueError("Metadata XLSX must contain columns 'id' and 'doi'; missing: id")
-            id_col = self._select_xlsx_id_column(frame, candidate_ids or set(), doi_col)
-
-        index: Dict[str, str] = {}
-        duplicate_ids: set[str] = set()
-
-        for _, row in frame.iterrows():
-            raw_id = str(row.get(id_col, "")).strip()
-            raw_doi = str(row.get(doi_col, "")).strip()
-            if not raw_id:
-                continue
-            if raw_id in index:
-                duplicate_ids.add(raw_id)
-                continue
-            doi = self._normalize_doi(raw_doi)
-            if not doi:
-                continue
-            index[raw_id] = doi
-
-        if duplicate_ids:
-            examples = ", ".join(sorted(duplicate_ids)[:10])
-            logger.warning(
-                f"Duplicate id values in metadata XLSX; keeping first DOI for: {examples}"
-            )
-
-        self._metadata_xlsx_index[cache_key] = index
-        return index
-
-    @staticmethod
-    def _select_xlsx_id_column(frame: object, candidate_ids: set[str], doi_col: object) -> object:
-        """
-        Choose the XLSX column whose values best match Markdown filename stems.
-        """
-        if not candidate_ids:
-            raise ValueError("Cannot infer XLSX id column without candidate Markdown file stems")
-
-        best_col = None
-        best_hits = -1
-        best_non_empty = -1
-
-        for col in getattr(frame, "columns", []):
-            if col == doi_col:
-                continue
-            values = {
-                str(v).strip()
-                for v in frame[col].tolist()
-                if str(v).strip()
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            header_lookup = {
+                str(name or "").strip(): name
+                for name in (reader.fieldnames or [])
             }
-            hits = len(candidate_ids & values)
-            non_empty = len(values)
-            if hits > best_hits or (hits == best_hits and non_empty > best_non_empty):
-                best_col = col
-                best_hits = hits
-                best_non_empty = non_empty
+            required_headers = {"file_name", "doi", "abstract"}
+            missing = sorted(required_headers - set(header_lookup))
+            if missing:
+                raise ValueError(
+                    f"Metadata CSV missing required columns: {', '.join(missing)}"
+                )
 
-        if best_col is None or best_hits <= 0:
-            raise ValueError(
-                "Metadata XLSX must contain an 'id' column or another column matching Markdown file stems"
-            )
+            index: Dict[str, Dict[str, str]] = {}
+            for row in reader:
+                file_name = str(row.get(header_lookup["file_name"]) or "").strip()
+                if not file_name:
+                    continue
+                key = Path(file_name).stem.casefold()
+                if key in index:
+                    raise ValueError(
+                        f"Duplicate file_name basename in metadata CSV: {key}"
+                    )
+                index[key] = {
+                    "file_name": file_name,
+                    "doi": str(row.get(header_lookup["doi"]) or "").strip(),
+                    "abstract": str(row.get(header_lookup["abstract"]) or "").strip(),
+                }
 
-        missing_count = len(candidate_ids) - best_hits
-        if missing_count:
-            logger.warning(
-                f"Selected metadata id column '{best_col}' with {best_hits}/{len(candidate_ids)} Markdown filename matches "
-                f"({missing_count} missing mappings)."
-            )
-        else:
-            logger.info(
-                f"Selected metadata id column '{best_col}' with {best_hits}/{len(candidate_ids)} Markdown filename matches."
-            )
-        return best_col
+        return index
     
     @staticmethod
     def _normalize_doi(raw: str) -> Optional[str]:
@@ -791,157 +707,109 @@ class TextProcessor:
             logger.error(f" Failed to load documents: {str(e)}")
             return []
 
-    def load_category_documents(
+    def load_literature_type_documents(
         self,
         base_dir: str,
-        category_configs: Dict[str, Dict],
+        literature_type_configs: Dict[str, Dict],
     ) -> List[Document]:
-        """
-        Load category subdirectories and map Markdown filename stems to per-category XLSX DOI metadata.
-
-        Metadata schema:
-            - reaction_type: category label, kept for existing RAG filtering
-            - doc_id: DOI from XLSX, Markdown DOI fallback, or stable no-doi fallback
-        """
+        """Load every configured Literature Type through the CSV-backed workflow."""
         all_documents: List[Document] = []
         base_path = Path(base_dir)
 
-        for category_label, config in category_configs.items():
-            category_path = base_path / config.get("path", category_label)
-            metadata_xlsx = config.get("metadata_xlsx")
-
-            logger.info(f"\n--- Loading {category_label} ---")
-
-            if not category_path.exists():
-                logger.error(f"Category directory does not exist: {category_path}")
-                continue
-            if not metadata_xlsx:
-                logger.error(f"Category metadata_xlsx is not configured: {category_label}")
-                continue
-
-            docs = self.load_category_directory_documents(
-                data_dir=str(category_path),
-                metadata_xlsx_path=str(metadata_xlsx),
-                category_label=category_label,
+        for literature_type, config in literature_type_configs.items():
+            literature_path = base_path / config.get("path", literature_type)
+            logger.info(f"\n--- Loading {literature_type} ---")
+            docs = self.load_literature_type_directory_documents(
+                data_dir=str(literature_path),
+                metadata_csv_path=str(config["metadata_csv"]),
+                literature_type=literature_type,
             )
             all_documents.extend(docs)
 
         return all_documents
 
-    def load_category_directory_documents(
+    def load_literature_type_directory_documents(
         self,
         data_dir: str,
-        metadata_xlsx_path: str,
-        category_label: str,
+        metadata_csv_path: str,
+        literature_type: str,
     ) -> List[Document]:
-        """
-        Load one category directory using XLSX DOI metadata inferred against Markdown file stems.
-        """
+        """Load one Literature Type directory and resolve metadata from its CSV."""
+        metadata_index = self._load_metadata_csv_index(metadata_csv_path)
         data_path = Path(data_dir)
         if not data_path.exists():
             logger.error(f"Directory does not exist: {data_dir}")
             return []
 
-        md_files = sorted([p for p in data_path.glob("*.md") if p.is_file()])
+        md_files = sorted(path for path in data_path.glob("*.md") if path.is_file())
         if not md_files:
             logger.error(f"No top-level Markdown files found: {data_dir}")
             return []
 
-        md_stems = {p.stem for p in md_files}
-        id_to_doi = self._load_metadata_xlsx_index(
-            metadata_xlsx_path,
-            candidate_ids=md_stems,
-            require_id_column=False,
+        from llama_index.core import SimpleDirectoryReader
+
+        reader = SimpleDirectoryReader(
+            input_files=[str(path) for path in md_files],
+            required_exts=[".md"],
+            recursive=False,
         )
-
-        try:
-            from llama_index.core import SimpleDirectoryReader
-
-            reader = SimpleDirectoryReader(
-                input_files=[str(p) for p in md_files],
-                required_exts=[".md"],
-                recursive=False,
-            )
-            documents = reader.load_data()
-
-            if not documents:
-                logger.error(f"No Markdown files loaded: {data_dir}")
-                return []
-
-            processed_documents = []
-            missing_metadata_count = 0
-            resolved_category = ((category_label or "unknown").strip() or "unknown").lower()
-
-            for doc in documents:
-                file_name = doc.metadata.get("file_name", "")
-                file_path_str = doc.metadata.get("file_path", "")
-                file_stem = Path(file_name).stem if file_name else Path(file_path_str).stem
-
-                doc_id = id_to_doi.get(file_stem)
-                if not doc_id:
-                    missing_metadata_count += 1
-                    logger.warning(
-                        f"No XLSX DOI mapping for {resolved_category}/{file_stem}; falling back to Markdown DOI or no-doi id."
-                    )
-                    doc_id = self.extract_doi_from_content(doc.text, file_name, file_path_str)
-
-                doc.metadata = {
-                    "reaction_type": resolved_category,
-                    "doc_id": doc_id,
-                }
-
-                processed_documents.append(doc)
-
-                logger.info(f" Loaded {file_name}")
-                logger.info(f" Reaction Type: {resolved_category}")
-                logger.info(f" DOI: {doc.metadata['doc_id']}")
-
-            if missing_metadata_count:
-                logger.warning(
-                    f"{resolved_category}: {missing_metadata_count}/{len(processed_documents)} Markdown files used fallback DOI resolution."
-                )
-
-            logger.info(
-                f"\nLoaded a total of {len(processed_documents)} category Document objects for {resolved_category}"
-            )
-            return processed_documents
-
-        except Exception as e:
-            logger.error(f" Failed to load category documents: {str(e)}")
+        documents = reader.load_data()
+        if not documents:
+            logger.error(f"No Markdown files loaded: {data_dir}")
             return []
-    
-    def load_reaction_documents(
-        self,
-        base_dir: str,
-        reaction_configs: Dict[str, Dict]
-    ) -> List[Document]:
-        """
-        按反应类型加载所有文献数据
-        
-        Args:
-            base_dir: 数据根目录
-            reaction_configs: 反应类型配置字典
-        
-        Returns:
-            List[Document]: 所有反应类型的Document列表
-            每个Document的metadata包含：
-                - reaction_type: 反应类型
-                - doc_id: 文献DOI号
-        """
-        all_documents = []
-        base_path = Path(base_dir)
-        
-        for reaction_type, config in reaction_configs.items():
-            reaction_path = base_path / config.get("path", reaction_type)
-            
-            logger.info(f"\n--- Loading {reaction_type} ---")
-            docs = self.load_documents(
-                data_dir=str(reaction_path),
-                reaction_type=reaction_type
+
+        processed_documents: List[Document] = []
+        matched_keys: set[str] = set()
+        resolved_type = (literature_type or "unknown").strip() or "unknown"
+
+        for doc in documents:
+            file_name = doc.metadata.get("file_name", "")
+            file_path_str = doc.metadata.get("file_path", "")
+            file_stem = Path(file_name).stem if file_name else Path(file_path_str).stem
+            metadata_key = file_stem.casefold()
+            metadata_row = metadata_index.get(metadata_key)
+            doc_id = None
+
+            if metadata_row is None:
+                logger.warning(
+                    f"No CSV metadata mapping for {resolved_type}/{file_stem}; "
+                    "falling back to Markdown DOI or no-doi id."
+                )
+            else:
+                matched_keys.add(metadata_key)
+                doc_id = self._normalize_doi(metadata_row.get("doi", ""))
+                if not doc_id:
+                    logger.warning(
+                        f"Missing or invalid CSV DOI for {resolved_type}/{file_stem}; "
+                        "falling back to Markdown DOI or no-doi id."
+                    )
+
+            if not doc_id:
+                doc_id = self._extract_doi_from_markdown(doc.text)
+            if not doc_id:
+                doc_id = self._build_fallback_doc_id(file_name, file_path_str)
+
+            doc.metadata = {
+                "reaction_type": resolved_type,
+                "doc_id": doc_id,
+            }
+            processed_documents.append(doc)
+
+            logger.info(f" Loaded {file_name}")
+            logger.info(f" Literature Type: {resolved_type}")
+            logger.info(f" DOI: {doc_id}")
+
+        extra_keys = sorted(set(metadata_index) - matched_keys)
+        if extra_keys:
+            examples = ", ".join(extra_keys[:10])
+            logger.warning(
+                f"Metadata CSV has {len(extra_keys)} extra row(s) without corresponding Markdown files: {examples}"
             )
-            all_documents.extend(docs)
-        
-        return all_documents
+
+        logger.info(
+            f"\nLoaded a total of {len(processed_documents)} Document objects for {resolved_type}"
+        )
+        return processed_documents
     
     def chunk_documents(
         self,
