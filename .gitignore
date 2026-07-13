@@ -35,6 +35,7 @@ env/
 .tox/
 .nox/
 .hypothesis/
+.worktrees/
 .coverage
 coverage.xml
 htmlcov/
