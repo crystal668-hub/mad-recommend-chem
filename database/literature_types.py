@@ -13,6 +13,14 @@ LITERATURE_TYPE_CONFIGS: Dict[str, Dict[str, str]] = {
     "OER": {"path": "OER", "metadata_csv": "./metadata/OER.csv"},
     "ORR": {"path": "ORR", "metadata_csv": "./metadata/ORR.csv"},
     "UOR": {"path": "UOR", "metadata_csv": "./metadata/UOR.csv"},
+    "Antibacterial": {
+        "path": "Antibacterial",
+        "metadata_csv": "./metadata/Antibacterial.csv",
+    },
+    "Thermoelectric": {
+        "path": "Thermoelectric",
+        "metadata_csv": "./metadata/Thermoelectric.csv",
+    },
     "antiferromagnetism": {
         "path": "antiferromagnetism",
         "metadata_csv": "./metadata/Antiferromagnetism.csv",
@@ -32,6 +40,10 @@ LITERATURE_TYPE_CONFIGS: Dict[str, Dict[str, str]] = {
     "photothermal conversion efficiency": {
         "path": "photothermal conversion efficiency",
         "metadata_csv": "./metadata/Photothermal conversion efficiency.csv",
+    },
+    "photocatalytic H2O2 production": {
+        "path": "photocatalytic H2O2 production",
+        "metadata_csv": "./metadata/Photocatalytic H2O2 production.csv",
     },
     "thermal conductivity": {
         "path": "thermal conductivity",
