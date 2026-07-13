@@ -16,28 +16,16 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from agents.agent_config import AgentConfig
+from database.literature_types import LITERATURE_TYPE_CONFIGS
 from database.vector_store import VectorStore
 from database.text_processor import TextProcessor
 from database.embedder import MultiModelEmbedder
 from utils.logger import Logger, setup_logging
 
-REACTION_CONFIGS = {
-    "CO2RR": {"path": "CO2RR", "type": "fulltext"},   # CO2 Reduction Reaction
-    "EOR": {"path": "EOR", "type": "fulltext"},       # Ethanol Oxidation Reaction
-    "HER": {"path": "HER", "type": "fulltext"},       # Hydrogen Evolution Reaction
-    "HOR": {"path": "HOR", "type": "fulltext"},       # Hydrogen Oxidation Reaction
-    "HZOR": {"path": "HZOR", "type": "fulltext"},     # Hydrazine Oxidation Reaction
-    "O5H": {"path": "O5H", "type": "fulltext"},       # Oxidation of 5-hydroxymethylfurfural
-    "OER": {"path": "OER", "type": "fulltext"},       # Oxygen Evolution Reaction
-    "ORR": {"path": "ORR", "type": "fulltext"},       # Oxygen Reduction Reaction
-    "UOR": {"path": "UOR", "type": "fulltext"},       # Urea Oxidation Reaction
-}
-
-
 def build_vector_database(
     config_path: str = "./config/config.yaml",
     data_dir: str = "./data/raw",
-    reaction_configs: dict = None,
+    literature_type_configs: dict = None,
     agent_name: str = "agent2",
     chunk_size: int = 256,
     chunk_overlap: int = 50
@@ -49,8 +37,8 @@ def build_vector_database(
     
     Args:
         config_path: 配置文件路径
-        data_dir: 原始数据目录，包含各反应类型的子目录
-        reaction_configs: 反应类型配置字典
+        data_dir: 原始数据目录，包含各 Literature Type 的子目录
+        literature_type_configs: Literature Type 目录和 CSV 元数据配置
         agent_name: 使用的Agent配置名称
         chunk_size: 分块大小
         chunk_overlap: 分块重叠大小
@@ -65,9 +53,8 @@ def build_vector_database(
 
     logger.info("Starting Chroma vector database build", extra={"event": "vector_db.build.start"})
     
-    # Build reaction type configuration
-    if reaction_configs is None:
-        reaction_configs = REACTION_CONFIGS
+    if literature_type_configs is None:
+        literature_type_configs = LITERATURE_TYPE_CONFIGS
 
     #--------------------------------------------------
     # 1. Load configuration
@@ -113,16 +100,15 @@ def build_vector_database(
     data_path = Path(data_dir)
     if not data_path.exists():
         logger.error(f"\n✗ Data directory does not exist: {data_dir}")
-        logger.error("  Please ensure the data directory structure is as follows:")
-        for _, cfg in reaction_configs.items():
-            file_type = "*.md"
-            logger.error(f"    {data_dir}/{cfg['path']}/{file_type}")
+        logger.error("  Please ensure each Literature Type has Markdown and CSV metadata:")
+        for _, cfg in literature_type_configs.items():
+            logger.error(f"    {data_dir}/{cfg['path']}/*.md")
+            logger.error(f"    {cfg['metadata_csv']}")
         return
     
-    # Load all documents based on reaction configurations
-    documents = processor.load_reaction_documents(
+    documents = processor.load_literature_type_documents(
         base_dir=data_dir,
-        reaction_configs=reaction_configs
+        literature_type_configs=literature_type_configs,
     )  
     
     logger.info(f"\n✓ Loaded {len(documents)} Document objects")
@@ -220,7 +206,7 @@ if __name__ == "__main__":
     build_vector_database(
         config_path="./config/config.yaml",
         data_dir="./data/raw",              
-        reaction_configs=REACTION_CONFIGS,  
+        literature_type_configs=LITERATURE_TYPE_CONFIGS,
         agent_name="agent2",                
         chunk_size=256,                     
         chunk_overlap=50                    
