@@ -154,7 +154,7 @@ def _missing_required_envs(config: AgentConfig, embedding_agents_needed: Set[str
             if not os.environ.get(env):
                 needed.append(env)
 
-    # Optional separate embedding API keys (e.g., agent chats via OpenRouter but embeds via Bailian).
+    # Optional separate embedding API keys (e.g., agent chats via OpenRouter but embeds via Aliyun).
     for agent_id in (embedding_agents_needed or set()):
         if agent_id == "agent2":
             continue  # handled above (Voyage)

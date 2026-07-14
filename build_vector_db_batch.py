@@ -164,7 +164,7 @@ def build_vector_databases_batch(
         chunk_size: 分块大小（默认使用config.rag.chunk_size；CLI可显式覆盖）
         chunk_overlap: 分块重叠（默认使用config.rag.chunk_overlap；CLI可显式覆盖）
         embedding_batch_size: embedding批大小
-        embedding_concurrency: OpenRouter embedding异步并发的batch数量（默认1=关闭；>1启用）
+        embedding_concurrency: OpenAI-compatible embedding异步并发的batch数量（默认1=关闭；>1启用）
         max_workers: 并发worker数量（默认4；设为1可退回串行）
         sleep_between_batches: 每个agent在embedding batch之间的sleep（秒），用于简单限速（默认0.5）
         resume: 断点续跑（默认True）；为True时会跳过已存在的chunk并补齐缺失部分
@@ -400,7 +400,10 @@ def build_vector_databases_batch(
         already_present = 0
         newly_added = 0
 
-        async_enabled = str(resolved_provider or "").lower() == "openrouter" and int(embedding_concurrency) > 1
+        async_enabled = (
+            str(resolved_provider or "").lower() in MultiModelEmbedder.OPENAI_COMPATIBLE_PROVIDERS
+            and int(embedding_concurrency) > 1
+        )
         pending: List[Dict[str, object]] = []
         loop: Optional[asyncio.AbstractEventLoop] = None
         if async_enabled:
@@ -409,7 +412,7 @@ def build_vector_databases_batch(
             asyncio.set_event_loop(loop)
 
         async def _embed_many(text_batches: List[List[str]]) -> List[object]:
-            tasks = [embedder.embed_texts_openrouter_async(b, agent_name=agent_name) for b in text_batches]
+            tasks = [embedder.embed_texts_openai_compatible_async(b, agent_name=agent_name) for b in text_batches]
             return await asyncio.gather(*tasks, return_exceptions=True)
 
         def _flush_pending() -> None:
@@ -639,7 +642,7 @@ def main() -> int:
         dest="embedding_concurrency",
         type=int,
         default=1,
-        help="async OpenRouter embedding concurrency (default: 1; set >1 to enable per-agent async batching)",
+        help="async OpenAI-compatible embedding concurrency (default: 1; set >1 to enable per-agent async batching)",
     )
     resume_group = parser.add_mutually_exclusive_group()
     resume_group.add_argument("--resume", dest="resume", action="store_true", help="resume from existing collection data")

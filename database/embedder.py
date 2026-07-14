@@ -1,7 +1,7 @@
 """
 ===================================
 Embedder Module
-Function: Use OpenAI-compatible SDK to call OpenRouter/Bailian API for text vectorization
+Function: Route text vectorization across supported embedding providers
 ===================================
 """
 
@@ -26,10 +26,18 @@ class MultiModelEmbedder:
     """
     多模型文本向量化器
     支持根据agent配置动态切换嵌入模型
-    支持使用OpenRouter API、Voyage Python Package
+    支持使用OpenAI-compatible API、Voyage Python Package
     支持OpenAI、Voyage AI、Google等多种嵌入模型
     """
     
+    SUPPORTED_EMBEDDING_PROVIDERS = frozenset({
+        'openrouter',
+        'zenmux',
+        'voyage',
+        'aliyun',
+    })
+    OPENAI_COMPATIBLE_PROVIDERS = frozenset({'openrouter', 'zenmux'})
+
     def __init__(self, model_config: Dict, agent_configs: Dict = None):
         """
         初始化多模型向量化器
@@ -41,6 +49,7 @@ class MultiModelEmbedder:
         self.default_model = model_config.get('embedding_model', 'text-embedding-3-large')
         self.api_key = model_config.get('api_key')
         self.base_url = model_config.get('emb_url', 'https://openrouter.ai/api/v1/embeddings')
+        self.default_provider = self._infer_provider_by_agent('default', model_config)
         
         # Save agent configurations for dynamic model selection
         self.agent_configs = agent_configs or {}
@@ -85,17 +94,22 @@ class MultiModelEmbedder:
         return emb_url
 
     def _infer_provider_by_agent(self, agent_name: str, agent_config: Dict) -> str:
-        if agent_name in ['agent2']:
-            return 'voyage'
-        if agent_name in ['agent4']:
-            return 'bailian'
-        if agent_name in ['agent1', 'agent3']:
-            return 'openrouter'
+        configured_provider = (agent_config or {}).get('embedding_provider', '')
+        if configured_provider:
+            provider = str(configured_provider).strip().lower()
+        else:
+            provider = {
+                'agent2': 'voyage',
+                'agent4': 'aliyun',
+            }.get(agent_name, 'openrouter')
 
-        embedding_provider = (agent_config or {}).get('embedding_provider', '')
-        if embedding_provider:
-            return embedding_provider.lower()
-        return 'openrouter'
+        if provider not in self.SUPPORTED_EMBEDDING_PROVIDERS:
+            supported = ', '.join(sorted(self.SUPPORTED_EMBEDDING_PROVIDERS))
+            raise ValueError(
+                f"Unsupported embedding provider '{provider}' for {agent_name}. "
+                f"Supported providers: {supported}"
+            )
+        return provider
 
     def _build_agent_embedding_profiles(self) -> Dict[str, Dict]:
         profiles: Dict[str, Dict] = {}
@@ -104,7 +118,7 @@ class MultiModelEmbedder:
             emb_url = cfg.get('emb_url', self.base_url)
             openai_base_url = self._normalize_openai_base_url(emb_url)
             # Allow embeddings to use a different API key than the chat model.
-            # This is needed when an agent chats via OpenRouter but embeds via DashScope/Bailian.
+            # This is needed when an agent chats via one provider but embeds via Aliyun.
             embedding_api_key = cfg.get('embedding_api_key') or cfg.get('emb_api_key') or cfg.get('api_key', self.api_key)
             api_key = self._resolve_env_var(embedding_api_key)
             voyage_api_key = self._resolve_env_var(cfg.get('voyage_api_key'))
@@ -186,22 +200,22 @@ class MultiModelEmbedder:
         embedding_provider = self.agent_embedding_profiles[agent_name].get('embedding_provider', '')
         return embedding_provider == 'voyage'
 
-    def _is_bailian_model(self, agent_name: str = None) -> bool:
+    def _is_aliyun_model(self, agent_name: str = None) -> bool:
         """
-        判断指定agent是否使用百炼向量模型
+        判断指定agent是否使用阿里云向量模型
         
         Args:
             agent_name: agent name
             
         Returns:
-            bool: whether using Aliyun Bailian
+            bool: whether using Aliyun
         """
         if not agent_name or agent_name not in self.agent_embedding_profiles:
             return False
         provider = self.agent_embedding_profiles[agent_name].get('embedding_provider', '')
-        return provider in ['bailian', 'aliyun', 'qwen']
+        return provider == 'aliyun'
 
-    def _get_bailian_base_url(self, agent_name: str) -> str:
+    def _get_aliyun_base_url(self, agent_name: str) -> str:
         profile = self.agent_embedding_profiles.get(agent_name, {})
         return profile.get('emb_url', 'https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings')
 
@@ -213,7 +227,7 @@ class MultiModelEmbedder:
             'emb_url': self.base_url,
             'openai_base_url': self._normalize_openai_base_url(self.base_url),
             'api_key': self.api_key,
-            'embedding_provider': 'openrouter'
+            'embedding_provider': self.default_provider
         }
 
     def embed_text(self, text: str, retry: int = 3, agent_name: str = None) -> List[float]:
@@ -237,12 +251,12 @@ class MultiModelEmbedder:
         # Determine which agent to use
         use_agent = agent_name
         
-        # Check if using Bailian or Voyage AI
-        if use_agent and self._is_bailian_model(use_agent):
-            return self._embed_text_bailian(text, retry, use_agent)
+        # Route according to the normalized provider in the agent profile.
+        if use_agent and self._is_aliyun_model(use_agent):
+            return self._embed_text_aliyun(text, retry, use_agent)
         if use_agent and self._is_voyage_model(use_agent):
             return self._embed_text_voyage(text, retry, use_agent)
-        return self._embed_text_openrouter(text, retry, use_agent)
+        return self._embed_text_openai_compatible(text, retry, use_agent)
 
     def embed_query(self, text: str, retry: int = 3, agent_name: str = None) -> List[float]:
         """
@@ -327,9 +341,9 @@ class MultiModelEmbedder:
         
         raise Exception(f"Embedding failed, retried {retry} times")
 
-    def _embed_text_bailian(self, text: str, retry: int, agent_name: str) -> List[float]:
+    def _embed_text_aliyun(self, text: str, retry: int, agent_name: str) -> List[float]:
         """
-        Use Aliyun Bailian OpenAI-compatible SDK for text embedding
+        Use the Aliyun OpenAI-compatible SDK for text embedding
         
         Args:
             text: input text
@@ -342,9 +356,9 @@ class MultiModelEmbedder:
         profile = self._get_agent_profile(agent_name)
         api_key = profile.get('api_key')
         if not api_key:
-            raise ValueError("Bailian API Key not configured")
+            raise ValueError("Aliyun API Key not configured")
 
-        base_url = self._normalize_openai_base_url(self._get_bailian_base_url(agent_name))
+        base_url = self._normalize_openai_base_url(self._get_aliyun_base_url(agent_name))
         model = profile.get('embedding_model', self.default_model)
         client = self._get_openai_client(agent_name, api_key, base_url)
 
@@ -354,7 +368,7 @@ class MultiModelEmbedder:
                     result = client.embeddings.create(model=model, input=text)
                 if result and result.data:
                     return result.data[0].embedding
-                raise Exception("Bailian returned empty result")
+                raise Exception("Aliyun returned empty result")
             except Exception as e:
                 logger.error(f"[ERROR] Embedding failed (attempt {attempt + 1}/{retry}): {str(e)}")
                 if attempt < retry - 1:
@@ -362,9 +376,9 @@ class MultiModelEmbedder:
 
         raise Exception(f"Embedding failed, retried {retry} times")
     
-    def _embed_text_openrouter(self, text: str, retry: int, agent_name: str = None) -> List[float]:
+    def _embed_text_openai_compatible(self, text: str, retry: int, agent_name: str = None) -> List[float]:
         """
-        Use OpenRouter OpenAI-compatible SDK for text embedding
+        Use an OpenAI-compatible SDK for text embedding.
         
         Args:
             text: input text
@@ -375,11 +389,14 @@ class MultiModelEmbedder:
             List[float]: embedding vector
         """
         profile = self._get_agent_profile(agent_name)
+        provider = profile.get('embedding_provider', 'openrouter')
+        if provider not in self.OPENAI_COMPATIBLE_PROVIDERS:
+            raise ValueError(f"Embedding provider '{provider}' is not OpenAI-compatible")
         model = profile.get('embedding_model', self.default_model)
         base_url = profile.get('openai_base_url') or self._normalize_openai_base_url(profile.get('emb_url', self.base_url))
         api_key = profile.get('api_key')
         if not api_key:
-            raise ValueError("OpenRouter API Key not configured")
+            raise ValueError(f"Embedding API Key not configured for provider '{provider}'")
 
         for attempt in range(retry):
             try:
@@ -388,19 +405,19 @@ class MultiModelEmbedder:
                     result = client.embeddings.create(model=model, input=text)
                 if result and result.data:
                     return result.data[0].embedding
-                raise Exception("OpenRouter returned empty result")
+                raise Exception(f"Embedding provider '{provider}' returned empty result")
             except Exception as e:
                 logger.error(f"[ERROR] Embedding failed (attempt {attempt + 1}/{retry}): {str(e)}")
                 if attempt < retry - 1:
                     time.sleep(2 ** attempt)
         
-        raise Exception(f"Embedding failed, retried {retry} times")
+        raise Exception(f"Embedding failed for provider '{provider}' after {retry} attempts")
 
-    async def embed_texts_openrouter_async(
+    async def embed_texts_openai_compatible_async(
         self, texts: List[str], retry: int = 3, agent_name: str = None
     ) -> List[List[float]]:
         """
-        Async batch embedding for OpenRouter (OpenAI-compatible) provider.
+        Async batch embedding for an OpenAI-compatible provider.
 
         Notes:
         - Uses `input=[...]` to embed multiple texts in a single request.
@@ -408,11 +425,14 @@ class MultiModelEmbedder:
         - On repeated failure, returns zero vectors for the whole batch to keep pipelines robust.
         """
         profile = self._get_agent_profile(agent_name)
+        provider = profile.get("embedding_provider", "openrouter")
+        if provider not in self.OPENAI_COMPATIBLE_PROVIDERS:
+            raise ValueError(f"Embedding provider '{provider}' is not OpenAI-compatible")
         model = profile.get("embedding_model", self.default_model)
         base_url = profile.get("openai_base_url") or self._normalize_openai_base_url(profile.get("emb_url", self.base_url))
         api_key = profile.get("api_key")
         if not api_key:
-            raise ValueError("OpenRouter API Key not configured")
+            raise ValueError(f"Embedding API Key not configured for provider '{provider}'")
 
         dim = self.get_embedding_dimension(model)
 
@@ -430,18 +450,21 @@ class MultiModelEmbedder:
         if not non_blank:
             return [x if x is not None else [0.0] * dim for x in out]
 
-        # Retry loop mirrors the sync OpenRouter path.
+        # Retry loop mirrors the synchronous OpenAI-compatible path.
         last_err: Optional[Exception] = None
         for attempt in range(int(retry)):
             try:
                 client = self._get_async_openai_client(agent_name or "default", api_key, base_url)
                 result = await client.embeddings.create(model=model, input=non_blank)
                 if not result or not getattr(result, "data", None):
-                    raise Exception("OpenRouter returned empty result")
+                    raise Exception(f"Embedding provider '{provider}' returned empty result")
 
                 # Result order should match input order.
                 if len(result.data) != len(non_blank):
-                    raise Exception(f"OpenRouter returned {len(result.data)} embeddings for {len(non_blank)} inputs")
+                    raise Exception(
+                        f"Embedding provider '{provider}' returned {len(result.data)} embeddings "
+                        f"for {len(non_blank)} inputs"
+                    )
 
                 for out_i, d in zip(non_blank_indices, result.data):
                     out[out_i] = d.embedding

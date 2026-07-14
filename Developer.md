@@ -110,7 +110,7 @@ flowchart TD
 | 阶段提示词 | `prompts/debate_phase_prompts.py` | PROPOSE、REVIEW、REBUTTAL 阶段协议 |
 | 统一提示词 | `prompts/system_prompts.py` | 领域约束、证据优先、输出格式约束 |
 | RAG adapter | `database/rag_system.py` | 查询 embedding + Chroma 相似度检索 |
-| Embedding | `database/embedder.py` | 按 agent 动态选择 OpenRouter/Voyage/Bailian embedding |
+| Embedding | `database/embedder.py` | 按 agent 动态选择 OpenRouter/ZenMux/Voyage/Aliyun embedding |
 | Chroma 封装 | `database/vector_store.py` | collection 创建、写入、查询、稳定 chunk id |
 | 文献处理 | `database/text_processor.py` | Markdown 文献加载、DOI 提取、分块 |
 | 经验库 | `experience/experience_store.py` | YAML 经验包 + JSON 动态经验检索 |
@@ -954,10 +954,10 @@ python -m unittest discover -s test -p "test_*.py"
 
 不同 Agent 使用不同 embedding 模型。为了保证查询向量与库向量同源，项目为每个 Agent 构建独立 collection：
 
-- agent1 使用 OpenRouter/OpenAI embedding。
+- agent1 使用配置的 ZenMux/OpenAI-compatible embedding。
 - agent2 使用 Voyage embedding。
-- agent3 使用 Gemini embedding。
-- agent4 使用 Bailian/Qwen embedding。
+- agent3 使用配置的 ZenMux/OpenAI-compatible embedding。
+- agent4 使用 Aliyun/Qwen embedding。
 
 运行时 RAG adapter 根据 agent_id 选择对应 embedding profile 和 collection。
 

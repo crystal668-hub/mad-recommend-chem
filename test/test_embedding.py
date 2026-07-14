@@ -55,7 +55,7 @@ def test_embedding_selection():
     
     # 测试1: 使用agent1的嵌入模型
     print("\n" + "=" * 60)
-    print("测试1: 使用agent1 (openai/text-embedding-3-large via OpenRouter)")
+    print("测试1: 使用agent1 (text-embedding-3-large via ZenMux)")
     print("=" * 60)
     try:
         embedding1 = embedder.embed_text(test_text, agent_name='agent1')
@@ -79,7 +79,7 @@ def test_embedding_selection():
     
     # 测试3: 使用agent3的嵌入模型
     print("\n" + "=" * 60)
-    print("测试3: 使用agent3 (google/gemini-embedding-001 via OpenRouter)")
+    print("测试3: 使用agent3 (google/gemini-embedding-2 via ZenMux)")
     print("=" * 60)
     try:
         embedding3 = embedder.embed_text(test_text, agent_name='agent3')
@@ -123,9 +123,9 @@ def test_embedding_selection():
     print("=" * 60)
     print("\n总结:")
     print("✓ MultiModelEmbedder已支持根据agent_name动态选择嵌入模型")
-    print("✓ agent1/agent3使用OpenRouter API")
+    print("✓ agent1/agent3使用配置的ZenMux API")
     print("✓ agent2使用Voyage AI官方SDK")
-    print("✓ agent4使用")
+    print("✓ agent4使用配置的Aliyun API")
     print("✓ 可以在build_vector_db.py中指定agent_name来选择对应的嵌入模型")
 
 
