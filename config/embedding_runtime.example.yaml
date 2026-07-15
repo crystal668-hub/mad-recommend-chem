@@ -51,8 +51,9 @@ llm:
   agent3:
     embedding_transport: "openai_compatible"
     embedding_quota_group: "myrimate"
-    embedding_request_batch_size: 32
-    embedding_max_batch_items: 2048
+    # Live gateway validation returned one vector for list input on this model.
+    embedding_request_batch_size: 1
+    embedding_max_batch_items: 1
     embedding_max_batch_tokens: 300000
 
   agent4:

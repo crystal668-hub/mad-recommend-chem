@@ -79,6 +79,8 @@ Chroma pipeline. Failed chunks are not stored as zero vectors; they remain missi
 `--embedding-batch-size`, `--embedding-concurrency`, `--max-workers`, and
 `--sleep-between-batches` controls remain accepted as deprecated compatibility options.
 See `config/embedding_runtime.example.yaml` for explicit quota overrides.
+The myrimate route for `google/gemini-embedding-2` is kept at request batch 1
+because live validation returned only one vector for list input.
 
 Legacy (single-agent) script:
 

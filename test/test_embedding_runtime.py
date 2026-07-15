@@ -52,7 +52,11 @@ class EmbeddingRuntimeSettingsTests(unittest.TestCase):
             agent_configs={
                 "agent1": {"embedding_provider": "zenmux", "emb_url": shared_url},
                 "agent2": {"embedding_provider": "voyage"},
-                "agent3": {"embedding_provider": "zenmux", "emb_url": shared_url},
+                "agent3": {
+                    "embedding_provider": "zenmux",
+                    "embedding_model": "google/gemini-embedding-2",
+                    "emb_url": shared_url,
+                },
                 "agent4": {"embedding_provider": "aliyun", "emb_url": shared_url},
             },
         )
@@ -63,7 +67,7 @@ class EmbeddingRuntimeSettingsTests(unittest.TestCase):
         self.assertNotEqual(settings.agents["agent2"].quota_group, shared_group)
         self.assertEqual(settings.request_batch_size_for("agent1"), 32)
         self.assertEqual(settings.request_batch_size_for("agent2"), 128)
-        self.assertEqual(settings.request_batch_size_for("agent3"), 32)
+        self.assertEqual(settings.request_batch_size_for("agent3"), 1)
         self.assertEqual(settings.request_batch_size_for("agent4"), 1)
         self.assertEqual(settings.quota_groups[shared_group].initial_inflight, 2)
         self.assertEqual(settings.quota_groups[shared_group].max_inflight, 4)

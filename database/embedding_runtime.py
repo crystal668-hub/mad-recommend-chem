@@ -128,6 +128,8 @@ class EmbeddingRuntimeSettings:
         for agent_name, raw_agent_cfg in agent_configs.items():
             agent_cfg = dict(raw_agent_cfg or {})
             provider = str(agent_cfg.get("embedding_provider") or "openrouter").strip().lower()
+            model = str(agent_cfg.get("embedding_model") or "").strip().lower()
+            singleton_models = {"google/gemini-embedding-2"}
             configured_group = agent_cfg.get("embedding_quota_group")
             if configured_group:
                 quota_group = str(configured_group).strip()
@@ -155,20 +157,28 @@ class EmbeddingRuntimeSettings:
 
             request_size = legacy_batch_size
             if request_size is None:
-                provider_default_batch = {
-                    "voyage": 128,
-                    "aliyun": 1,
-                    "zenmux": 32,
-                    "openrouter": 32,
-                }.get(provider, 10)
+                provider_default_batch = (
+                    1
+                    if model in singleton_models
+                    else {
+                        "voyage": 128,
+                        "aliyun": 1,
+                        "zenmux": 32,
+                        "openrouter": 32,
+                    }.get(provider, 10)
+                )
                 request_size = agent_cfg.get("embedding_request_batch_size", provider_default_batch)
             request_size = max(1, int(request_size))
-            provider_max_items = {
-                "zenmux": 2048,
-                "openrouter": 2048,
-                "voyage": 128,
-                "aliyun": 1,
-            }.get(provider, request_size)
+            provider_max_items = (
+                1
+                if model in singleton_models
+                else {
+                    "zenmux": 2048,
+                    "openrouter": 2048,
+                    "voyage": 128,
+                    "aliyun": 1,
+                }.get(provider, request_size)
+            )
             max_items = max(1, int(agent_cfg.get("embedding_max_batch_items", provider_max_items)))
             request_size = min(request_size, max_items)
             raw_max_tokens = agent_cfg.get("embedding_max_batch_tokens")
