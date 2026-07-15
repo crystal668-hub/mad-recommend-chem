@@ -2375,6 +2375,11 @@ def _text_mentions_reaction(text: str, reaction_type: str) -> bool:
             "h2o2 production",
             "hydrogen peroxide production",
         ],
+        "hydrogenation of furfural": [
+            "hydrogenation of furfural",
+            "furfural hydrogenation",
+            "furfural reduction",
+        ],
         "photothermal conversion efficiency": ["photothermal conversion", "photothermal conversion efficiency"],
         "ferromagnetism": ["ferromagnetism", "ferromagnetic"],
         "ferrimagnetism": ["ferrimagnetism", "ferrimagnetic"],

@@ -23,6 +23,7 @@ CATEGORY_TYPE_LABELS: List[str] = [
     "conductivity",
     "ferrimagnetism",
     "ferromagnetism",
+    "hydrogenation of furfural",
     "photocatalytic H2O2 production",
     "photothermal conversion efficiency",
     "thermal conductivity",

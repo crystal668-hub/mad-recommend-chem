@@ -23,11 +23,16 @@ class ReactionTypeNormalizationTests(unittest.TestCase):
             canonical_reaction_type("photocatalytic_h2o2_production"),
             "photocatalytic H2O2 production",
         )
+        self.assertEqual(
+            canonical_reaction_type("HYDROGENATION_OF_FURFURAL"),
+            "hydrogenation of furfural",
+        )
 
     def test_matches_ignore_case_spacing_and_underscores(self):
         self.assertTrue(reaction_type_matches("THERMAL_CONDUCTIVITY", "thermal conductivity"))
         self.assertTrue(reaction_type_matches("photothermal_conversion_efficiency", "photothermal conversion efficiency"))
         self.assertTrue(reaction_type_matches("Photocatalytic H2O2 Production", "photocatalytic_h2o2_production"))
+        self.assertTrue(reaction_type_matches("HYDROGENATION_OF_FURFURAL", "hydrogenation of furfural"))
         self.assertFalse(reaction_type_matches("conductivity", "thermal conductivity"))
 
     def test_supported_type_check(self):
@@ -36,6 +41,7 @@ class ReactionTypeNormalizationTests(unittest.TestCase):
         self.assertTrue(is_supported_reaction_type("Antibacterial"))
         self.assertTrue(is_supported_reaction_type("thermoelectric"))
         self.assertTrue(is_supported_reaction_type("photocatalytic H2O2 production"))
+        self.assertTrue(is_supported_reaction_type("hydrogenation_of_furfural"))
         self.assertFalse(is_supported_reaction_type("unknown category"))
 
     def test_new_literature_type_query_terms(self):
@@ -45,6 +51,12 @@ class ReactionTypeNormalizationTests(unittest.TestCase):
             _text_mentions_reaction(
                 "Photocatalytic hydrogen peroxide production under visible light",
                 "photocatalytic H2O2 production",
+            )
+        )
+        self.assertTrue(
+            _text_mentions_reaction(
+                "Selective furfural hydrogenation to furfuryl alcohol",
+                "hydrogenation of furfural",
             )
         )
 

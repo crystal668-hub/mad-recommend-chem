@@ -21,6 +21,7 @@ class LiteratureTypeConfigsTests(unittest.TestCase):
             "conductivity",
             "ferrimagnetism",
             "ferromagnetism",
+            "hydrogenation of furfural",
             "photocatalytic H2O2 production",
             "photothermal conversion efficiency",
             "thermal conductivity",
@@ -45,6 +46,13 @@ class LiteratureTypeConfigsTests(unittest.TestCase):
             {
                 "path": "photocatalytic H2O2 production",
                 "metadata_csv": "./metadata/Photocatalytic H2O2 production.csv",
+            },
+        )
+        self.assertEqual(
+            LITERATURE_TYPE_CONFIGS["hydrogenation of furfural"],
+            {
+                "path": "hydrogenation of furfural",
+                "metadata_csv": "./metadata/Hydrogenation of furfural.csv",
             },
         )
 

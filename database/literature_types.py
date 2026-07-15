@@ -45,6 +45,10 @@ LITERATURE_TYPE_CONFIGS: Dict[str, Dict[str, str]] = {
         "path": "photocatalytic H2O2 production",
         "metadata_csv": "./metadata/Photocatalytic H2O2 production.csv",
     },
+    "hydrogenation of furfural": {
+        "path": "hydrogenation of furfural",
+        "metadata_csv": "./metadata/Hydrogenation of furfural.csv",
+    },
     "thermal conductivity": {
         "path": "thermal conductivity",
         "metadata_csv": "./metadata/Thermal Conductivity.csv",
