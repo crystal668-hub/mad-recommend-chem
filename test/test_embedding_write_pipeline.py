@@ -1,9 +1,17 @@
 import asyncio
+import json
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 
-from database.embedding_runtime import EmbeddingWriteItem, EmbeddingWritePipeline
+from database.embedding_runtime import (
+    EmbeddingFailure,
+    EmbeddingWriteItem,
+    EmbeddingWritePipeline,
+    write_failure_manifest,
+)
 
 
 class FakeVectorStore:
@@ -103,6 +111,30 @@ class EmbeddingWritePipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pipeline.queue.maxsize, 1)
         await pipeline.start()
         await pipeline.close()
+
+
+class FailureManifestTests(unittest.TestCase):
+    def test_manifest_is_jsonl_and_sanitizes_secrets(self):
+        failure = EmbeddingFailure(
+            agent="agent1",
+            collection="collection_agent1",
+            chunk_id="chunk-1",
+            provider="zenmux",
+            model="model",
+            quota_group="shared",
+            attempts=2,
+            error_type="rate_limit",
+            retryable=True,
+            message="Authorization: Bearer secret-value",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "failures.jsonl"
+            result = write_failure_manifest(target, [failure])
+            payload = json.loads(target.read_text(encoding="utf-8"))
+
+        self.assertEqual(result, target)
+        self.assertEqual(payload["chunk_id"], "chunk-1")
+        self.assertNotIn("secret-value", payload["message"])
 
 
 if __name__ == "__main__":

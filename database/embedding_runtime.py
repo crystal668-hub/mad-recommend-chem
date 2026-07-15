@@ -16,6 +16,7 @@ from datetime import timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, Optional, Sequence, TypeVar
+from urllib.parse import urlparse
 
 
 T = TypeVar("T")
@@ -127,19 +128,52 @@ class EmbeddingRuntimeSettings:
         for agent_name, raw_agent_cfg in agent_configs.items():
             agent_cfg = dict(raw_agent_cfg or {})
             provider = str(agent_cfg.get("embedding_provider") or "openrouter").strip().lower()
-            quota_group = str(agent_cfg.get("embedding_quota_group") or provider).strip()
+            configured_group = agent_cfg.get("embedding_quota_group")
+            if configured_group:
+                quota_group = str(configured_group).strip()
+            elif provider == "voyage":
+                quota_group = "voyage_org"
+            else:
+                endpoint = str(agent_cfg.get("emb_url") or agent_cfg.get("base_url") or "")
+                hostname = (urlparse(endpoint).hostname or "").strip().lower()
+                quota_group = f"endpoint:{hostname}" if hostname else provider
             if explicit_groups and quota_group not in groups:
                 raise ValueError(f"Agent '{agent_name}' references unknown quota group '{quota_group}'")
             if quota_group not in groups:
-                groups[quota_group] = QuotaPolicy().normalized()
+                if provider == "voyage":
+                    groups[quota_group] = QuotaPolicy(
+                        initial_inflight=2,
+                        max_inflight=4,
+                        requests_per_minute=2000,
+                        tokens_per_minute=3000000,
+                    ).normalized()
+                else:
+                    groups[quota_group] = QuotaPolicy(
+                        initial_inflight=2,
+                        max_inflight=4,
+                    ).normalized()
 
             request_size = legacy_batch_size
             if request_size is None:
-                request_size = agent_cfg.get("embedding_request_batch_size", 10)
+                provider_default_batch = {
+                    "voyage": 128,
+                    "aliyun": 1,
+                    "zenmux": 32,
+                    "openrouter": 32,
+                }.get(provider, 10)
+                request_size = agent_cfg.get("embedding_request_batch_size", provider_default_batch)
             request_size = max(1, int(request_size))
-            max_items = max(1, int(agent_cfg.get("embedding_max_batch_items", request_size)))
+            provider_max_items = {
+                "zenmux": 2048,
+                "openrouter": 2048,
+                "voyage": 128,
+                "aliyun": 1,
+            }.get(provider, request_size)
+            max_items = max(1, int(agent_cfg.get("embedding_max_batch_items", provider_max_items)))
             request_size = min(request_size, max_items)
             raw_max_tokens = agent_cfg.get("embedding_max_batch_tokens")
+            if raw_max_tokens in (None, "") and provider in {"zenmux", "openrouter"}:
+                raw_max_tokens = 300000
             max_tokens = None if raw_max_tokens in (None, "") else max(1, int(raw_max_tokens))
             agents[str(agent_name)] = AgentEmbeddingRuntime(
                 quota_group=quota_group,
@@ -645,12 +679,15 @@ class EmbeddingWritePipeline:
         if self._closed:
             return
         self._closed = True
-        if self._task is None:
-            await self.start()
-        await self.queue.put(_WRITE_SENTINEL)
-        assert self._task is not None
-        await self._task
-        self.executor.shutdown(wait=True)
+        try:
+            if self._task is None:
+                await self.start()
+            assert self._task is not None
+            if not self._task.done():
+                await self.queue.put(_WRITE_SENTINEL)
+            await self._task
+        finally:
+            self.executor.shutdown(wait=True)
 
     async def _run(self) -> None:
         buffers: Dict[str, _WriteBuffer] = {}

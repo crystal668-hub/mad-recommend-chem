@@ -1,6 +1,8 @@
 import asyncio
 import math
+import time
 import unittest
+from types import SimpleNamespace
 
 from database.embedding_runtime import (
     EmbeddingFailure,
@@ -42,6 +44,29 @@ class EmbeddingRuntimeSettingsTests(unittest.TestCase):
                     }
                 },
             )
+
+    def test_safe_defaults_group_shared_endpoints_and_select_provider_batches(self):
+        shared_url = "https://agent-team-api.myrimate.cn/v1"
+        settings = EmbeddingRuntimeSettings.from_config(
+            {},
+            agent_configs={
+                "agent1": {"embedding_provider": "zenmux", "emb_url": shared_url},
+                "agent2": {"embedding_provider": "voyage"},
+                "agent3": {"embedding_provider": "zenmux", "emb_url": shared_url},
+                "agent4": {"embedding_provider": "aliyun", "emb_url": shared_url},
+            },
+        )
+
+        shared_group = settings.agents["agent1"].quota_group
+        self.assertEqual(settings.agents["agent3"].quota_group, shared_group)
+        self.assertEqual(settings.agents["agent4"].quota_group, shared_group)
+        self.assertNotEqual(settings.agents["agent2"].quota_group, shared_group)
+        self.assertEqual(settings.request_batch_size_for("agent1"), 32)
+        self.assertEqual(settings.request_batch_size_for("agent2"), 128)
+        self.assertEqual(settings.request_batch_size_for("agent3"), 32)
+        self.assertEqual(settings.request_batch_size_for("agent4"), 1)
+        self.assertEqual(settings.quota_groups[shared_group].initial_inflight, 2)
+        self.assertEqual(settings.quota_groups[shared_group].max_inflight, 4)
 
 
 class EmbeddingBatchTests(unittest.TestCase):
@@ -108,6 +133,35 @@ class EmbeddingValidationTests(unittest.TestCase):
 
 
 class EmbeddingQuotaSchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancellation_releases_group_and_global_slots(self):
+        scheduler = EmbeddingQuotaScheduler(
+            global_max_inflight=1,
+            quota_groups={"q": QuotaPolicy(initial_inflight=1, max_inflight=1)},
+            retry_policy=RetryPolicy(max_attempts=1),
+        )
+        started = asyncio.Event()
+
+        async def blocked():
+            started.set()
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(scheduler.execute("q", 1, blocked))
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(scheduler.snapshot()["q"]["inflight"], 0)
+
+        async def completed():
+            return "ok"
+
+        result = await asyncio.wait_for(
+            scheduler.execute("q", 1, completed),
+            timeout=0.1,
+        )
+        self.assertEqual(result, "ok")
+
     async def test_group_and_global_caps_cover_multiple_agents(self):
         scheduler = EmbeddingQuotaScheduler(
             global_max_inflight=2,
@@ -194,6 +248,67 @@ class EmbeddingQuotaSchedulerTests(unittest.IsolatedAsyncioTestCase):
             await scheduler.execute("q", 1, throttled)
 
         self.assertEqual(scheduler.snapshot()["q"]["effective_inflight"], 2)
+
+    async def test_rpm_window_delays_the_next_attempt(self):
+        scheduler = EmbeddingQuotaScheduler(
+            global_max_inflight=1,
+            quota_groups={
+                "q": QuotaPolicy(
+                    initial_inflight=1,
+                    max_inflight=1,
+                    requests_per_minute=1,
+                    window_seconds=0.05,
+                )
+            },
+            retry_policy=RetryPolicy(max_attempts=1),
+        )
+
+        async def operation():
+            return "ok"
+
+        started = time.monotonic()
+        await scheduler.execute("q", 1, operation)
+        await scheduler.execute("q", 1, operation)
+        self.assertGreaterEqual(time.monotonic() - started, 0.045)
+
+    async def test_retry_after_takes_precedence_over_backoff(self):
+        delays = []
+
+        async def fake_sleep(delay):
+            delays.append(delay)
+
+        scheduler = EmbeddingQuotaScheduler(
+            global_max_inflight=1,
+            quota_groups={
+                "q": QuotaPolicy(
+                    initial_inflight=1,
+                    max_inflight=1,
+                    cooldown_seconds=0,
+                )
+            },
+            retry_policy=RetryPolicy(
+                max_attempts=2,
+                base_delay_seconds=10,
+                max_delay_seconds=10,
+                honor_retry_after=True,
+            ),
+            sleep=fake_sleep,
+        )
+        attempts = 0
+
+        class RateLimitError(RuntimeError):
+            status_code = 429
+            response = SimpleNamespace(headers={"Retry-After": "0.25"})
+
+        async def operation():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RateLimitError("rate limited")
+            return "ok"
+
+        self.assertEqual(await scheduler.execute("q", 1, operation), "ok")
+        self.assertEqual(delays, [0.25])
 
 
 if __name__ == "__main__":

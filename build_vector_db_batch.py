@@ -13,12 +13,10 @@ import hashlib
 import json
 import re
 import sys
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from dotenv import load_dotenv
 
@@ -30,6 +28,19 @@ sys.path.insert(0, str(project_root))
 
 from agents.agent_config import AgentConfig
 from database.embedder import MultiModelEmbedder
+from database.embedding_runtime import (
+    EmbeddingBatch,
+    EmbeddingFailure,
+    EmbeddingQuotaScheduler,
+    EmbeddingRuntimeSettings,
+    EmbeddingWriteItem,
+    EmbeddingWritePipeline,
+    build_text_batches,
+    is_retryable_error,
+    is_throttling_error,
+    validate_embeddings,
+    write_failure_manifest,
+)
 from database.literature_types import LITERATURE_TYPE_CONFIGS
 from database.text_processor import TextProcessor
 from database.vector_store import VectorStore
@@ -133,6 +144,218 @@ def _prepare_chroma_ids_and_metadatas(
     return ids, out_metas
 
 
+@dataclass
+class _AgentEmbeddingContext:
+    agent_name: str
+    collection_name: str
+    provider: str
+    model: str
+    dimension: int
+    quota_group: str
+    embedder: Any
+    vector_store: Any
+    batches: Sequence[EmbeddingBatch]
+    already_present: int = 0
+
+
+@dataclass
+class _EmbeddingPipelineOutcome:
+    agent_results: Dict[str, Dict[str, object]]
+    failures: List[EmbeddingFailure]
+    scheduler_snapshot: Dict[str, Dict[str, Any]]
+    peak_write_queue_depth: int
+
+
+class _FailFastStop(RuntimeError):
+    """Internal signal used to stop producers after recording a batch failure."""
+
+
+def _get_missing_indices(
+    vector_store: Any,
+    ids: Sequence[str],
+    batch_size: int,
+) -> tuple[List[int], int]:
+    existing: set[str] = set()
+    size = max(1, int(batch_size))
+    for start in range(0, len(ids), size):
+        candidate_ids = list(ids[start:start + size])
+        existing.update(vector_store.get_existing_ids(candidate_ids))
+    missing = [index for index, chunk_id in enumerate(ids) if chunk_id not in existing]
+    return missing, len(existing)
+
+
+async def _run_embedding_pipeline(
+    contexts: Sequence[_AgentEmbeddingContext],
+    settings: EmbeddingRuntimeSettings,
+    continue_on_error: bool = True,
+) -> _EmbeddingPipelineOutcome:
+    scheduler = EmbeddingQuotaScheduler(
+        global_max_inflight=settings.global_max_inflight,
+        quota_groups=settings.quota_groups,
+        retry_policy=settings.retry_policy,
+    )
+    writer = EmbeddingWritePipeline(
+        write_batch_size=settings.write_batch_size,
+        queue_max_batches=settings.write_queue_max_batches,
+        flush_interval_ms=settings.write_flush_interval_ms,
+    )
+    failures: List[EmbeddingFailure] = []
+    await writer.start()
+
+    async def _process_batch(context: _AgentEmbeddingContext, request: EmbeddingBatch) -> None:
+        async def _network_attempt() -> List[List[float]]:
+            return await asyncio.wait_for(
+                context.embedder.embed_documents_batch(
+                    list(request.texts),
+                    agent_name=context.agent_name,
+                ),
+                timeout=settings.request_timeout_seconds,
+            )
+
+        try:
+            raw_embeddings = await scheduler.execute(
+                context.quota_group,
+                request.estimated_tokens,
+                _network_attempt,
+            )
+            embeddings = validate_embeddings(
+                raw_embeddings,
+                expected_count=len(request.texts),
+                expected_dimension=context.dimension,
+            )
+            await writer.submit(
+                EmbeddingWriteItem(
+                    agent_name=context.agent_name,
+                    collection_name=context.collection_name,
+                    provider=context.provider,
+                    model=context.model,
+                    quota_group=context.quota_group,
+                    vector_store=context.vector_store,
+                    texts=list(request.texts),
+                    embeddings=embeddings,
+                    metadatas=[dict(metadata) for metadata in request.metadatas],
+                    ids=list(request.ids),
+                )
+            )
+        except Exception as exc:
+            retryable = is_retryable_error(exc)
+            error_type = "rate_limit" if is_throttling_error(exc) else type(exc).__name__
+            attempts = settings.retry_policy.max_attempts if retryable else 1
+            for chunk_id in request.ids:
+                failures.append(
+                    EmbeddingFailure(
+                        agent=context.agent_name,
+                        collection=context.collection_name,
+                        chunk_id=chunk_id,
+                        provider=context.provider,
+                        model=context.model,
+                        quota_group=context.quota_group,
+                        attempts=attempts,
+                        error_type=error_type,
+                        retryable=retryable,
+                        message=str(exc),
+                    )
+                )
+            if not continue_on_error:
+                raise _FailFastStop() from exc
+
+    async def _run_agent(context: _AgentEmbeddingContext) -> None:
+        window_size = settings.quota_groups[context.quota_group].max_inflight
+        iterator = iter(context.batches)
+        pending: set[asyncio.Task[None]] = set()
+
+        def _fill_window() -> None:
+            while len(pending) < window_size:
+                try:
+                    request = next(iterator)
+                except StopIteration:
+                    return
+                pending.add(
+                    asyncio.create_task(
+                        _process_batch(context, request),
+                        name=f"embed-{context.agent_name}",
+                    )
+                )
+
+        try:
+            _fill_window()
+            while pending:
+                completed, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                completed_results = await asyncio.gather(
+                    *completed,
+                    return_exceptions=True,
+                )
+                for result in completed_results:
+                    if isinstance(result, BaseException):
+                        raise result
+                _fill_window()
+        finally:
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    producer_tasks = [
+        asyncio.create_task(_run_agent(context), name=f"producer-{context.agent_name}")
+        for context in contexts
+    ]
+    producer_error: Optional[BaseException] = None
+    try:
+        await asyncio.gather(*producer_tasks)
+    except BaseException as exc:
+        producer_error = exc
+        for task in producer_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*producer_tasks, return_exceptions=True)
+    finally:
+        try:
+            await writer.close()
+        finally:
+            close_tasks = []
+            for context in contexts:
+                close_fn = getattr(context.embedder, "aclose", None)
+                if callable(close_fn):
+                    close_tasks.append(close_fn())
+            if close_tasks:
+                await asyncio.gather(*close_tasks, return_exceptions=True)
+
+    failures.extend(writer.failures)
+    if producer_error is not None and not isinstance(producer_error, _FailFastStop):
+        raise producer_error
+
+    agent_results: Dict[str, Dict[str, object]] = {}
+    for context in contexts:
+        agent_failures = sum(1 for failure in failures if failure.agent == context.agent_name)
+        newly_added = writer.newly_added.get(context.agent_name, 0)
+        successful = context.already_present + newly_added
+        if agent_failures:
+            status = "partial" if successful else "error"
+        else:
+            status = "ok"
+        agent_results[context.agent_name] = {
+            "status": status,
+            "collection_name": context.collection_name,
+            "document_count": context.vector_store.get_collection_count(),
+            "embedding_model": context.model,
+            "embedding_provider": context.provider,
+            "already_present": context.already_present,
+            "newly_added": newly_added,
+            "failed": agent_failures,
+        }
+
+    return _EmbeddingPipelineOutcome(
+        agent_results=agent_results,
+        failures=failures,
+        scheduler_snapshot=scheduler.snapshot(),
+        peak_write_queue_depth=writer.peak_queue_depth,
+    )
+
+
 def build_vector_databases_batch(
     config_path: str = "./config/config.yaml",
     data_dir: str = "./data/raw",
@@ -140,10 +363,13 @@ def build_vector_databases_batch(
     agent_names: Optional[List[str]] = None,
     chunk_size: Optional[int] = None,
     chunk_overlap: Optional[int] = None,
-    embedding_batch_size: int = 10,
-    embedding_concurrency: int = 1,
+    embedding_batch_size: Optional[int] = None,
+    embedding_request_batch_size: Optional[int] = None,
+    embedding_concurrency: Optional[int] = None,
     max_workers: int = 4,
-    sleep_between_batches: float = 0.5,
+    sleep_between_batches: Optional[float] = None,
+    embedding_write_batch_size: Optional[int] = None,
+    embedding_global_max_inflight: Optional[int] = None,
     resume: bool = True,
     clear_existing: Optional[bool] = None,
     skip_if_exists: bool = False,
@@ -163,10 +389,13 @@ def build_vector_databases_batch(
         agent_names: 要构建的agent列表（None则使用config里的agent1~agent4顺序）
         chunk_size: 分块大小（默认使用config.rag.chunk_size；CLI可显式覆盖）
         chunk_overlap: 分块重叠（默认使用config.rag.chunk_overlap；CLI可显式覆盖）
-        embedding_batch_size: embedding批大小
-        embedding_concurrency: OpenAI-compatible embedding异步并发的batch数量（默认1=关闭；>1启用）
-        max_workers: 并发worker数量（默认4；设为1可退回串行）
-        sleep_between_batches: 每个agent在embedding batch之间的sleep（秒），用于简单限速（默认0.5）
+        embedding_batch_size: 兼容参数；覆盖所有agent的provider request batch大小
+        embedding_request_batch_size: 覆盖所有agent的provider request batch大小
+        embedding_concurrency: 兼容参数；覆盖所有quota group的并发上限
+        max_workers: 兼容参数；新async scheduler不再使用agent线程池
+        sleep_between_batches: 已弃用；新scheduler使用quota窗口和Retry-After
+        embedding_write_batch_size: Chroma writer批大小覆盖值
+        embedding_global_max_inflight: 进程级embedding在途请求覆盖值
         resume: 断点续跑（默认True）；为True时会跳过已存在的chunk并补齐缺失部分
         clear_existing: True=自动清空已有collection；False=不清空（若已有则按skip_if_exists策略处理）；None=交互式询问
         skip_if_exists: collection已有数据时，跳过该collection的构建（避免重复id导致Chroma报错）
@@ -222,7 +451,7 @@ def build_vector_databases_batch(
     logger.info(f"✓ persist_directory: {persist_directory}")
     logger.info(f"✓ base_collection_name: {base_collection_name}")
     logger.info(f"✓ chunk_size: {chunk_size}, chunk_overlap: {chunk_overlap}")
-    logger.info(f"✓ max_workers: {max_workers}")
+    logger.info(f"✓ legacy max_workers: {max_workers}")
     logger.info(f"✓ literature_types: {list(literature_type_configs)}")
 
     # Build all agent configs (used by MultiModelEmbedder to select per-agent embedding provider/model).
@@ -376,227 +605,116 @@ def build_vector_databases_batch(
         logger.info("No collections to build (all skipped or errored).")
         return results
 
-    chroma_write_lock = threading.Lock()
+    runtime_config = (config.config or {}).get("embedding_runtime", {}) or {}
+    settings = EmbeddingRuntimeSettings.from_config(
+        runtime_config,
+        agent_configs=all_agent_configs,
+        legacy_batch_size=(
+            embedding_request_batch_size
+            if embedding_request_batch_size is not None
+            else embedding_batch_size
+        ),
+        legacy_concurrency=embedding_concurrency,
+        write_batch_size=embedding_write_batch_size,
+        global_max_inflight=embedding_global_max_inflight,
+    )
+    if embedding_batch_size is not None:
+        logger.warning("--embedding-batch-size is deprecated; use per-agent embedding_request_batch_size")
+    if embedding_concurrency is not None:
+        logger.warning("--embedding-concurrency is deprecated; use embedding_runtime.quota_groups")
+    if sleep_between_batches not in (None, 0, 0.0):
+        logger.warning("sleep_between_batches is deprecated and ignored by the quota scheduler")
+    if max_workers != 4:
+        logger.warning("max_workers is deprecated and ignored by the async embedding scheduler")
 
-    def _build_one_agent(agent_name: str) -> Dict[str, object]:
+    logger.info(
+        f"Embedding runtime: global_max_inflight={settings.global_max_inflight}, "
+        f"write_batch_size={settings.write_batch_size}, quota_groups={list(settings.quota_groups)}"
+    )
+
+    contexts: List[_AgentEmbeddingContext] = []
+    for agent_name in build_plan:
         agent_cfg = all_agent_configs.get(agent_name, {}) or {}
-        embedding_model = agent_cfg.get("embedding_model")
-        embedding_provider = agent_cfg.get("embedding_provider")
-        collection_name = str(build_plan[agent_name]["collection_name"])
-
-        # Per-agent embedder (avoid shared client dicts across threads).
         embedder = MultiModelEmbedder(agent_cfg, agent_configs=all_agent_configs)
         vector_store = vector_stores[agent_name]
-
-        total = len(texts)
+        profile = embedder.agent_embedding_profiles.get(agent_name, {}) or {}
         model_name = embedder.get_model_for_agent(agent_name)
-        dim = embedder.get_embedding_dimension(model_name)
-        resolved_provider = (embedder.agent_embedding_profiles.get(agent_name, {}) or {}).get("embedding_provider", "")
+        dimension = embedder.get_embedding_dimension(model_name)
+        runtime_agent = settings.agents[agent_name]
 
+        if resume:
+            missing_indices, already_present = _get_missing_indices(
+                vector_store,
+                chunk_ids,
+                settings.existing_id_check_batch_size,
+            )
+        else:
+            missing_indices = list(range(len(chunk_ids)))
+            already_present = 0
+
+        missing_texts = [texts[index] for index in missing_indices]
+        missing_ids = [chunk_ids[index] for index in missing_indices]
+        missing_metadatas = [base_metadatas[index] for index in missing_indices]
+        request_batches = build_text_batches(
+            agent_name=agent_name,
+            texts=missing_texts,
+            ids=missing_ids,
+            metadatas=missing_metadatas,
+            max_items=runtime_agent.request_batch_size,
+            max_tokens=runtime_agent.max_batch_tokens,
+        )
         logger.info(
-            f"[{agent_name}] Start embedding: total_chunks={total}, model={embedding_model}, provider={embedding_provider}, dim={dim}"
+            f"[{agent_name}] Prepared embedding pipeline: missing={len(missing_ids)}, "
+            f"already_present={already_present}, request_batches={len(request_batches)}, "
+            f"batch_size={runtime_agent.request_batch_size}, quota_group={runtime_agent.quota_group}"
+        )
+        contexts.append(
+            _AgentEmbeddingContext(
+                agent_name=agent_name,
+                collection_name=str(build_plan[agent_name]["collection_name"]),
+                provider=str(profile.get("embedding_provider") or agent_cfg.get("embedding_provider") or ""),
+                model=model_name,
+                dimension=dimension,
+                quota_group=runtime_agent.quota_group,
+                embedder=embedder,
+                vector_store=vector_store,
+                batches=request_batches,
+                already_present=already_present,
+            )
         )
 
-        already_present = 0
-        newly_added = 0
-
-        async_enabled = (
-            str(resolved_provider or "").lower() in MultiModelEmbedder.OPENAI_COMPATIBLE_PROVIDERS
-            and int(embedding_concurrency) > 1
+    outcome = asyncio.run(
+        _run_embedding_pipeline(
+            contexts,
+            settings,
+            continue_on_error=continue_on_error,
         )
-        pending: List[Dict[str, object]] = []
-        loop: Optional[asyncio.AbstractEventLoop] = None
-        if async_enabled:
-            # Keep a single event loop per agent to avoid cross-loop issues with async HTTP clients.
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+    )
+    results.update(outcome.agent_results)
+    manifest_path: Optional[Path] = None
+    if outcome.failures:
+        manifest_path = Path(settings.failure_manifest_dir) / f"build_vector_db_batch_{timestamp}.jsonl"
+        write_failure_manifest(manifest_path, outcome.failures)
+        for agent_result in outcome.agent_results.values():
+            if int(agent_result.get("failed", 0)) > 0:
+                agent_result["failure_manifest"] = str(manifest_path)
 
-        async def _embed_many(text_batches: List[List[str]]) -> List[object]:
-            tasks = [embedder.embed_texts_openai_compatible_async(b, agent_name=agent_name) for b in text_batches]
-            return await asyncio.gather(*tasks, return_exceptions=True)
-
-        def _flush_pending() -> None:
-            nonlocal newly_added
-            if not pending:
-                return
-
-            text_batches = [p["batch_texts"] for p in pending]  # type: ignore[index]
-            if loop is None:
-                raise RuntimeError("Async embedding loop is not initialized")
-            results = loop.run_until_complete(_embed_many(text_batches))
-
-            for p, r in zip(pending, results):
-                batch_texts = p["batch_texts"]  # type: ignore[assignment]
-                batch_ids = p["batch_ids"]  # type: ignore[assignment]
-                batch_metas = p["batch_metas"]  # type: ignore[assignment]
-                bend = int(p["end"])  # type: ignore[arg-type]
-
-                if isinstance(r, Exception):
-                    logger.error(f"[{agent_name}] Async batch embedding failed (end={bend}): {str(r)}")
-                    batch_embeddings = [[0.0] * dim for _ in batch_texts]  # type: ignore[arg-type]
-                else:
-                    batch_embeddings = r  # type: ignore[assignment]
-
-                # Chroma persistent backend isn't guaranteed to be safe for concurrent writers.
-                # Serialize writes to avoid sqlite "database is locked" issues.
-                with chroma_write_lock:
-                    vector_store.add_documents(
-                        documents=batch_texts,  # type: ignore[arg-type]
-                        embeddings=batch_embeddings,  # type: ignore[arg-type]
-                        metadatas=[m.copy() for m in batch_metas],  # type: ignore[arg-type]
-                        ids=batch_ids,  # type: ignore[arg-type]
-                    )
-                newly_added += len(batch_ids)  # type: ignore[arg-type]
-
-                if sleep_between_batches and bend < total:
-                    time.sleep(float(sleep_between_batches))
-
-                if bend % max(1, int(embedding_batch_size) * 50) == 0 or bend == total:
-                    logger.info(f"[{agent_name}] Progress: {bend}/{total}")
-
-            pending.clear()
-
-        # Stream embeddings -> Chroma in small batches to keep memory bounded.
-        for start in range(0, total, int(embedding_batch_size)):
-            end = min(start + int(embedding_batch_size), total)
-            batch_texts = texts[start:end]
-            batch_ids = chunk_ids[start:end]
-            batch_metas = base_metadatas[start:end]
-
-            # Resume: skip ids that already exist (avoid duplicate-id errors and wasted embedding calls).
-            if resume:
-                with chroma_write_lock:
-                    existing_ids = vector_store.get_existing_ids(batch_ids)
-                if existing_ids:
-                    already_present += len(existing_ids)
-
-                missing_indices = [i for i, cid in enumerate(batch_ids) if cid not in existing_ids]
-                if not missing_indices:
-                    continue
-
-                batch_texts = [batch_texts[i] for i in missing_indices]
-                batch_ids = [batch_ids[i] for i in missing_indices]
-                batch_metas = [batch_metas[i] for i in missing_indices]
-
-            if async_enabled:
-                pending.append(
-                    {
-                        "batch_texts": batch_texts,
-                        "batch_ids": batch_ids,
-                        "batch_metas": batch_metas,
-                        "end": end,
-                    }
-                )
-                if len(pending) >= int(embedding_concurrency) or end == total:
-                    _flush_pending()
-                continue
-
-            batch_embeddings: List[List[float]] = []
-            for text in batch_texts:
-                try:
-                    batch_embeddings.append(embedder.embed_text(text, agent_name=agent_name))
-                except Exception as e:
-                    logger.error(f"[{agent_name}] Embedding failed (idx={start + len(batch_embeddings)}): {str(e)}")
-                    batch_embeddings.append([0.0] * dim)
-
-            # Chroma persistent backend isn't guaranteed to be safe for concurrent writers.
-            # Serialize writes to avoid sqlite "database is locked" issues.
-            with chroma_write_lock:
-                vector_store.add_documents(
-                    documents=batch_texts,
-                    embeddings=batch_embeddings,
-                    metadatas=[m.copy() for m in batch_metas],
-                    ids=batch_ids,
-                )
-            newly_added += len(batch_ids)
-
-            if sleep_between_batches and end < total:
-                time.sleep(float(sleep_between_batches))
-
-            if end % max(1, int(embedding_batch_size) * 50) == 0 or end == total:
-                logger.info(f"[{agent_name}] Progress: {end}/{total}")
-
-        # Best-effort flush in case loop exits with pending batches.
-        if pending:
-            _flush_pending()
-
-        if loop is not None:
-            try:
-                # Best-effort close async clients (API depends on openai version).
-                close_awaitables = []
-                for c in getattr(embedder, "async_openai_clients", {}).values():
-                    close_fn = getattr(c, "close", None)
-                    if callable(close_fn):
-                        try:
-                            maybe_awaitable = close_fn()
-                            if asyncio.iscoroutine(maybe_awaitable):
-                                close_awaitables.append(maybe_awaitable)
-                        except Exception:
-                            pass
-                if close_awaitables:
-                    loop.run_until_complete(asyncio.gather(*close_awaitables, return_exceptions=True))
-            finally:
-                asyncio.set_event_loop(None)
-                loop.close()
-
-        with chroma_write_lock:
-            final_count = vector_store.get_collection_count()
-
+    logger.info(
+        "Embedding scheduler summary",
+        extra={
+            "event": "embedding.scheduler.summary",
+            "quota_groups": outcome.scheduler_snapshot,
+            "peak_write_queue_depth": outcome.peak_write_queue_depth,
+            "failure_count": len(outcome.failures),
+            "failure_manifest": str(manifest_path) if manifest_path else None,
+        },
+    )
+    for agent_name, agent_result in outcome.agent_results.items():
         logger.info(
-            f"[{agent_name}] Done: collection={collection_name}, count={final_count}, "
-            f"already_present={already_present}, newly_added={newly_added}"
+            f"[{agent_name}] Done: status={agent_result['status']}, "
+            f"count={agent_result['document_count']}, already_present={agent_result['already_present']}, "
+            f"newly_added={agent_result['newly_added']}, failed={agent_result['failed']}"
         )
-        return {
-            "status": "ok",
-            "collection_name": collection_name,
-            "document_count": final_count,
-            "embedding_model": embedding_model,
-            "embedding_provider": embedding_provider,
-            "already_present": already_present,
-            "newly_added": newly_added,
-        }
-
-    # Run agent builds concurrently.
-    workers = max(1, min(int(max_workers), len(build_plan)))
-    logger.info(f"Starting concurrent build: workers={workers}, agents={list(build_plan.keys())}")
-
-    if workers == 1:
-        for agent_name in build_plan.keys():
-            try:
-                results[agent_name] = _build_one_agent(agent_name)
-            except Exception as e:
-                logger.error(f"✗ Failed to build collection for {agent_name}: {str(e)}", exc_info=True)
-                results[agent_name] = {
-                    "status": "error",
-                    "collection_name": str(build_plan[agent_name]["collection_name"]),
-                    "error": str(e),
-                    "embedding_model": all_agent_configs.get(agent_name, {}).get("embedding_model"),
-                    "embedding_provider": all_agent_configs.get(agent_name, {}).get("embedding_provider"),
-                }
-                if not continue_on_error:
-                    break
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_map = {executor.submit(_build_one_agent, a): a for a in build_plan.keys()}
-            for fut in as_completed(future_map):
-                agent_name = future_map[fut]
-                try:
-                    results[agent_name] = fut.result()
-                except Exception as e:
-                    logger.error(f"✗ Failed to build collection for {agent_name}: {str(e)}", exc_info=True)
-                    results[agent_name] = {
-                        "status": "error",
-                        "collection_name": str(build_plan[agent_name]["collection_name"]),
-                        "error": str(e),
-                        "embedding_model": all_agent_configs.get(agent_name, {}).get("embedding_model"),
-                        "embedding_provider": all_agent_configs.get(agent_name, {}).get("embedding_provider"),
-                    }
-                    if not continue_on_error:
-                        # Best-effort: cancel pending tasks.
-                        for other in future_map:
-                            if other is not fut:
-                                other.cancel()
-                        break
 
     logger.info("=" * 60)
     logger.info("Batch build complete")
@@ -636,13 +754,40 @@ def main() -> int:
         default=None,
         help="chunk overlap (default: config.rag.chunk_overlap or 50)",
     )
-    parser.add_argument("--embedding-batch-size", dest="embedding_batch_size", type=int, default=10, help="embed batch size")
+    parser.add_argument(
+        "--embedding-request-batch-size",
+        dest="embedding_request_batch_size",
+        type=int,
+        default=None,
+        help="override provider request batch size",
+    )
+    parser.add_argument(
+        "--embedding-batch-size",
+        dest="embedding_batch_size",
+        type=int,
+        default=None,
+        help="deprecated alias for --embedding-request-batch-size",
+    )
     parser.add_argument(
         "--embedding-concurrency",
         dest="embedding_concurrency",
         type=int,
-        default=1,
-        help="async OpenAI-compatible embedding concurrency (default: 1; set >1 to enable per-agent async batching)",
+        default=None,
+        help="deprecated override for every quota-group concurrency limit",
+    )
+    parser.add_argument(
+        "--embedding-write-batch-size",
+        dest="embedding_write_batch_size",
+        type=int,
+        default=None,
+        help="override Chroma writer batch size",
+    )
+    parser.add_argument(
+        "--embedding-global-max-inflight",
+        dest="embedding_global_max_inflight",
+        type=int,
+        default=None,
+        help="override process-wide embedding request concurrency",
     )
     resume_group = parser.add_mutually_exclusive_group()
     resume_group.add_argument("--resume", dest="resume", action="store_true", help="resume from existing collection data")
@@ -653,14 +798,14 @@ def main() -> int:
         dest="max_workers",
         type=int,
         default=4,
-        help="concurrent workers (default: 4; set 1 for sequential)",
+        help="deprecated; async scheduler replaces per-agent worker threads",
     )
     parser.add_argument(
         "--sleep-between-batches",
         dest="sleep_between_batches",
         type=float,
-        default=0.5,
-        help="sleep seconds between embedding batches per agent (default: 0.5; set 0 to disable)",
+        default=None,
+        help="deprecated; quota scheduler controls request pacing",
     )
     parser.add_argument(
         "--clear",
@@ -694,9 +839,12 @@ def main() -> int:
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
         embedding_batch_size=args.embedding_batch_size,
+        embedding_request_batch_size=args.embedding_request_batch_size,
         embedding_concurrency=args.embedding_concurrency,
         max_workers=args.max_workers,
         sleep_between_batches=args.sleep_between_batches,
+        embedding_write_batch_size=args.embedding_write_batch_size,
+        embedding_global_max_inflight=args.embedding_global_max_inflight,
         resume=bool(args.resume),
         clear_existing=clear_existing,
         skip_if_exists=bool(args.skip_if_exists),
