@@ -193,7 +193,10 @@ class EmbeddingQuotaSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(results, ["ok"] * 8)
         self.assertEqual(peak, 2)
-        self.assertEqual(scheduler.snapshot()["shared"]["peak_inflight"], 2)
+        snapshot = scheduler.snapshot()["shared"]
+        self.assertEqual(snapshot["peak_inflight"], 2)
+        self.assertEqual(snapshot["latency_sample_count"], 8)
+        self.assertGreater(snapshot["p95_request_latency_ms"], 0)
 
     async def test_retry_uses_one_attempt_per_slot_and_stops_on_permanent_error(self):
         scheduler = EmbeddingQuotaScheduler(

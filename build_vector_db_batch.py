@@ -11,9 +11,11 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import re
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -164,6 +166,36 @@ class _EmbeddingPipelineOutcome:
     failures: List[EmbeddingFailure]
     scheduler_snapshot: Dict[str, Dict[str, Any]]
     peak_write_queue_depth: int
+    wall_clock_seconds: float
+
+
+@dataclass
+class _AgentRequestMetrics:
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    latencies_seconds: List[float] = field(default_factory=list)
+    batch_sizes: List[int] = field(default_factory=list)
+
+    def record(self, started_at: float, finished_at: float, batch_size: int) -> None:
+        if self.started_at is None or started_at < self.started_at:
+            self.started_at = started_at
+        if self.finished_at is None or finished_at > self.finished_at:
+            self.finished_at = finished_at
+        self.latencies_seconds.append(max(0.0, finished_at - started_at))
+        self.batch_sizes.append(max(0, int(batch_size)))
+
+    def percentile_ms(self, percentile: float) -> float:
+        if not self.latencies_seconds:
+            return 0.0
+        ordered = sorted(self.latencies_seconds)
+        index = max(0, math.ceil(percentile * len(ordered)) - 1)
+        return round(ordered[min(index, len(ordered) - 1)] * 1000.0, 3)
+
+    @property
+    def duration_seconds(self) -> float:
+        if self.started_at is None or self.finished_at is None:
+            return 0.0
+        return max(0.0, self.finished_at - self.started_at)
 
 
 class _FailFastStop(RuntimeError):
@@ -189,6 +221,7 @@ async def _run_embedding_pipeline(
     settings: EmbeddingRuntimeSettings,
     continue_on_error: bool = True,
 ) -> _EmbeddingPipelineOutcome:
+    pipeline_started = time.monotonic()
     scheduler = EmbeddingQuotaScheduler(
         global_max_inflight=settings.global_max_inflight,
         quota_groups=settings.quota_groups,
@@ -200,9 +233,14 @@ async def _run_embedding_pipeline(
         flush_interval_ms=settings.write_flush_interval_ms,
     )
     failures: List[EmbeddingFailure] = []
+    request_metrics = {
+        context.agent_name: _AgentRequestMetrics()
+        for context in contexts
+    }
     await writer.start()
 
     async def _process_batch(context: _AgentEmbeddingContext, request: EmbeddingBatch) -> None:
+        request_started = time.monotonic()
         async def _network_attempt() -> List[List[float]]:
             return await asyncio.wait_for(
                 context.embedder.embed_documents_batch(
@@ -258,6 +296,12 @@ async def _run_embedding_pipeline(
                 )
             if not continue_on_error:
                 raise _FailFastStop() from exc
+        finally:
+            request_metrics[context.agent_name].record(
+                request_started,
+                time.monotonic(),
+                len(request.ids),
+            )
 
     async def _run_agent(context: _AgentEmbeddingContext) -> None:
         window_size = settings.quota_groups[context.quota_group].max_inflight
@@ -337,15 +381,49 @@ async def _run_embedding_pipeline(
             status = "partial" if successful else "error"
         else:
             status = "ok"
+        metrics = request_metrics[context.agent_name]
+        planned_chunks = sum(len(request.ids) for request in context.batches)
+        planned_requests = len(context.batches)
+        request_batch_limit = settings.agents[context.agent_name].request_batch_size
+        batch_fill_ratio = (
+            planned_chunks / (planned_requests * request_batch_limit)
+            if planned_requests and request_batch_limit
+            else 0.0
+        )
+        request_reduction_ratio = (
+            1.0 - (planned_requests / planned_chunks)
+            if planned_chunks
+            else 0.0
+        )
+        active_seconds = metrics.duration_seconds
         agent_results[context.agent_name] = {
             "status": status,
             "collection_name": context.collection_name,
             "document_count": context.vector_store.get_collection_count(),
             "embedding_model": context.model,
             "embedding_provider": context.provider,
+            "quota_group": context.quota_group,
+            "request_batch_size": request_batch_limit,
             "already_present": context.already_present,
             "newly_added": newly_added,
             "failed": agent_failures,
+            "planned_chunks": planned_chunks,
+            "logical_request_count": planned_requests,
+            "completed_request_count": len(metrics.latencies_seconds),
+            "average_request_batch_size": round(
+                planned_chunks / planned_requests if planned_requests else 0.0,
+                3,
+            ),
+            "request_batch_fill_ratio": round(batch_fill_ratio, 6),
+            "request_reduction_vs_scalar_ratio": round(request_reduction_ratio, 6),
+            "active_embedding_seconds": round(active_seconds, 3),
+            "embedding_chunks_per_second": round(
+                newly_added / active_seconds if active_seconds else 0.0,
+                3,
+            ),
+            "p50_logical_request_latency_ms": metrics.percentile_ms(0.50),
+            "p95_logical_request_latency_ms": metrics.percentile_ms(0.95),
+            "p99_logical_request_latency_ms": metrics.percentile_ms(0.99),
         }
 
     return _EmbeddingPipelineOutcome(
@@ -353,6 +431,7 @@ async def _run_embedding_pipeline(
         failures=failures,
         scheduler_snapshot=scheduler.snapshot(),
         peak_write_queue_depth=writer.peak_queue_depth,
+        wall_clock_seconds=round(time.monotonic() - pipeline_started, 3),
     )
 
 
@@ -370,6 +449,10 @@ def build_vector_databases_batch(
     sleep_between_batches: Optional[float] = None,
     embedding_write_batch_size: Optional[int] = None,
     embedding_global_max_inflight: Optional[int] = None,
+    max_chunks: Optional[int] = None,
+    persist_directory_override: Optional[str] = None,
+    base_collection_name_override: Optional[str] = None,
+    report_path: Optional[str] = None,
     resume: bool = True,
     clear_existing: Optional[bool] = None,
     skip_if_exists: bool = False,
@@ -404,7 +487,7 @@ def build_vector_databases_batch(
     Returns:
         Dict[str, Dict]: per-agent result summary.
     """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
     config = AgentConfig(config_path)
     setup_logging(config.config, run_id=f"build_vector_db_batch_{timestamp}")
@@ -443,8 +526,14 @@ def build_vector_databases_batch(
     if not agent_names:
         raise ValueError("No valid agent names found in config.llm")
 
-    base_collection_name = vector_config.get("collection_name", "chemical_reactions_recommendation")
-    persist_directory = vector_config.get("persist_directory", "./data/chroma_db")
+    base_collection_name = (
+        base_collection_name_override
+        or vector_config.get("collection_name", "chemical_reactions_recommendation")
+    )
+    persist_directory = (
+        persist_directory_override
+        or vector_config.get("persist_directory", "./data/chroma_db")
+    )
     distance_metric = vector_config.get("distance_metric", "cosine")
 
     logger.info(f"✓ Agents: {agent_names}")
@@ -491,6 +580,13 @@ def build_vector_databases_batch(
     if not chunked_documents:
         logger.error("\n✗ No chunks produced, cannot build vector database")
         return {}
+    if max_chunks is not None:
+        chunk_limit = int(max_chunks)
+        if chunk_limit < 1:
+            raise ValueError("max_chunks must be at least 1")
+        if len(chunked_documents) > chunk_limit:
+            chunked_documents = chunked_documents[:chunk_limit]
+            logger.info(f"Load-test chunk limit applied: {len(chunked_documents)}")
 
     texts = [doc.text for doc in chunked_documents]
     total_chunks = len(texts)
@@ -705,10 +801,37 @@ def build_vector_databases_batch(
             "event": "embedding.scheduler.summary",
             "quota_groups": outcome.scheduler_snapshot,
             "peak_write_queue_depth": outcome.peak_write_queue_depth,
+            "wall_clock_seconds": outcome.wall_clock_seconds,
             "failure_count": len(outcome.failures),
             "failure_manifest": str(manifest_path) if manifest_path else None,
         },
     )
+    if report_path:
+        report_target = Path(report_path)
+        report_target.parent.mkdir(parents=True, exist_ok=True)
+        report_payload = {
+            "run_id": f"build_vector_db_batch_{timestamp}",
+            "sample_chunks": total_chunks,
+            "agents": outcome.agent_results,
+            "runtime": {
+                "wall_clock_seconds": outcome.wall_clock_seconds,
+                "global_max_inflight": settings.global_max_inflight,
+                "write_batch_size": settings.write_batch_size,
+                "peak_write_queue_depth": outcome.peak_write_queue_depth,
+                "quota_groups": outcome.scheduler_snapshot,
+                "failure_count": len(outcome.failures),
+                "failure_manifest": str(manifest_path) if manifest_path else None,
+                "persist_directory": str(persist_directory),
+                "base_collection_name": str(base_collection_name),
+            },
+        }
+        temporary_report = report_target.with_suffix(report_target.suffix + ".tmp")
+        temporary_report.write_text(
+            json.dumps(report_payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        temporary_report.replace(report_target)
+        logger.info(f"Embedding load report written to {report_target}")
     for agent_name, agent_result in outcome.agent_results.items():
         logger.info(
             f"[{agent_name}] Done: status={agent_result['status']}, "
@@ -739,6 +862,12 @@ def main() -> int:
         dest="agents",
         default="agent1,agent2,agent3,agent4",
         help="comma/space separated agent list (default: agent1,agent2,agent3,agent4)",
+    )
+    parser.add_argument(
+        "--literature-types",
+        dest="literature_types",
+        default=None,
+        help="optional comma-separated literature types to load",
     )
     parser.add_argument(
         "--chunk-size",
@@ -789,6 +918,31 @@ def main() -> int:
         default=None,
         help="override process-wide embedding request concurrency",
     )
+    parser.add_argument(
+        "--max-chunks",
+        dest="max_chunks",
+        type=int,
+        default=None,
+        help="limit the shared input sample; intended for controlled load tests",
+    )
+    parser.add_argument(
+        "--persist-directory",
+        dest="persist_directory_override",
+        default=None,
+        help="override Chroma persistence directory",
+    )
+    parser.add_argument(
+        "--collection-name",
+        dest="base_collection_name_override",
+        default=None,
+        help="override base collection name",
+    )
+    parser.add_argument(
+        "--report-path",
+        dest="report_path",
+        default=None,
+        help="write a sanitized JSON load report",
+    )
     resume_group = parser.add_mutually_exclusive_group()
     resume_group.add_argument("--resume", dest="resume", action="store_true", help="resume from existing collection data")
     resume_group.add_argument("--no-resume", dest="resume", action="store_false", help="disable resume; require clear/skip")
@@ -828,13 +982,27 @@ def main() -> int:
     args = parser.parse_args()
 
     agent_names = _parse_agent_list(args.agents)
+    selected_literature_types = LITERATURE_TYPE_CONFIGS
+    if args.literature_types:
+        requested_types = [
+            name.strip()
+            for name in args.literature_types.split(",")
+            if name.strip()
+        ]
+        unknown_types = [name for name in requested_types if name not in LITERATURE_TYPE_CONFIGS]
+        if unknown_types:
+            parser.error(f"unknown literature types: {', '.join(unknown_types)}")
+        selected_literature_types = {
+            name: LITERATURE_TYPE_CONFIGS[name]
+            for name in requested_types
+        }
     # When user explicitly passes --clear, prefer non-interactive clearing.
     clear_existing: Optional[bool] = True if args.clear_existing else None
 
     build_vector_databases_batch(
         config_path=args.config_path,
         data_dir=args.data_dir,
-        literature_type_configs=LITERATURE_TYPE_CONFIGS,
+        literature_type_configs=selected_literature_types,
         agent_names=agent_names,
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
@@ -845,6 +1013,10 @@ def main() -> int:
         sleep_between_batches=args.sleep_between_batches,
         embedding_write_batch_size=args.embedding_write_batch_size,
         embedding_global_max_inflight=args.embedding_global_max_inflight,
+        max_chunks=args.max_chunks,
+        persist_directory_override=args.persist_directory_override,
+        base_collection_name_override=args.base_collection_name_override,
+        report_path=args.report_path,
         resume=bool(args.resume),
         clear_existing=clear_existing,
         skip_if_exists=bool(args.skip_if_exists),

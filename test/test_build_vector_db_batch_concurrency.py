@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -289,6 +290,8 @@ class BatchBuilderEntryPointTests(unittest.TestCase):
                 return None
 
         with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "load-report.json"
+            persist_directory = Path(directory) / "load-chroma"
             with (
                 patch.object(batch, "AgentConfig", return_value=FakeConfig()),
                 patch.object(batch, "TextProcessor", FakeProcessor),
@@ -303,15 +306,25 @@ class BatchBuilderEntryPointTests(unittest.TestCase):
                     },
                     agent_names=["agent1"],
                     clear_existing=True,
+                    max_chunks=3,
+                    persist_directory_override=str(persist_directory),
+                    base_collection_name_override="load_test",
+                    report_path=str(report_path),
                 )
 
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
         self.assertEqual(result["agent1"]["status"], "ok")
-        self.assertEqual(result["agent1"]["newly_added"], 4)
+        self.assertEqual(result["agent1"]["newly_added"], 3)
         self.assertEqual(
             embedders[0].calls,
-            [("agent1", ["chunk-0", "chunk-1"]), ("agent1", ["chunk-2", "chunk-3"])],
+            [("agent1", ["chunk-0", "chunk-1"]), ("agent1", ["chunk-2"])],
         )
-        self.assertEqual([len(call["ids"]) for call in stores[0].add_calls], [3, 1])
+        self.assertEqual([len(call["ids"]) for call in stores[0].add_calls], [3])
+        self.assertEqual(stores[0].collection_name, "load_test_agent1")
+        self.assertEqual(report["sample_chunks"], 3)
+        self.assertEqual(report["agents"]["agent1"]["logical_request_count"], 2)
+        self.assertEqual(report["runtime"]["persist_directory"], str(persist_directory))
 
 
 if __name__ == "__main__":

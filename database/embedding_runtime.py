@@ -423,6 +423,7 @@ class _QuotaState:
         self.retries = 0
         self.throttles = 0
         self.failures = 0
+        self.attempt_latencies: Deque[float] = deque(maxlen=10000)
 
     def _purge(self, now: float) -> None:
         boundary = now - self.policy.window_seconds
@@ -495,7 +496,20 @@ class _QuotaState:
                 self.success_streak = 0
             self.condition.notify_all()
 
+    def record_attempt_latency(self, seconds: float) -> None:
+        self.attempt_latencies.append(max(0.0, float(seconds)))
+
+    @staticmethod
+    def _percentile(values: Sequence[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        index = max(0, math.ceil(percentile * len(ordered)) - 1)
+        return ordered[min(index, len(ordered) - 1)]
+
     def snapshot(self) -> Dict[str, Any]:
+        latencies = list(self.attempt_latencies)
+        average_latency = sum(latencies) / len(latencies) if latencies else 0.0
         return {
             "inflight": self.inflight,
             "peak_inflight": self.peak_inflight,
@@ -506,6 +520,11 @@ class _QuotaState:
             "retries": self.retries,
             "throttles": self.throttles,
             "failures": self.failures,
+            "latency_sample_count": len(latencies),
+            "average_request_latency_ms": round(average_latency * 1000.0, 3),
+            "p50_request_latency_ms": round(self._percentile(latencies, 0.50) * 1000.0, 3),
+            "p95_request_latency_ms": round(self._percentile(latencies, 0.95) * 1000.0, 3),
+            "p99_request_latency_ms": round(self._percentile(latencies, 0.99) * 1000.0, 3),
         }
 
 
@@ -553,8 +572,10 @@ class EmbeddingQuotaScheduler:
                 await state.release(success=False, throttled=False)
                 raise
             try:
+                attempt_started = self.clock()
                 result = await operation()
             except BaseException as exc:
+                state.record_attempt_latency(self.clock() - attempt_started)
                 throttled = is_throttling_error(exc)
                 retryable = is_retryable_error(exc)
                 await state.release(success=False, throttled=throttled)
@@ -575,6 +596,7 @@ class EmbeddingQuotaScheduler:
                 await self.sleep(delay)
                 continue
             else:
+                state.record_attempt_latency(self.clock() - attempt_started)
                 await state.release(success=True, throttled=False)
                 self.global_semaphore.release()
                 return result
