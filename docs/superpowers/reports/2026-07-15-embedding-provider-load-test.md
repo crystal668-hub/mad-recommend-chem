@@ -53,6 +53,44 @@ gateway returns one vector per list input.
 All independent collections contained exactly 1,000 documents. No invalid or zero
 vector reached Chroma, and no failure manifest was produced for the successful runs.
 
+## Agent3 Concurrency Sweep
+
+Agent3 was tested again with the same first 1,000 O5H chunks, request batch 1, and an
+isolated Chroma collection for every run. Concurrency 16 and 24 were repeated to
+separate a one-run peak from reproducible throughput.
+
+| Concurrency | Throughput (chunks/s) | Network p95 | Network p99 | Retries | Result |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 4 | 2.243 | 2,480 ms | 4,710 ms | 0 | Baseline |
+| 6 | 3.344 | 2,908 ms | 4,720 ms | 0 | Pass |
+| 8 | 4.761 | 2,515 ms | 3,217 ms | 0 | Pass |
+| 12 | 5.682 | 4,303 ms | 13,337 ms | 0 | Tail latency increased |
+| 16 | 9.254 | 2,606 ms | 3,413 ms | 0 | Pass |
+| 16 repeat | 8.539 | 2,639 ms | 11,340 ms | 0 | Pass, reproducible throughput |
+| 20 | 8.009 | 5,963 ms | 12,040 ms | 0 | Throughput regression |
+| 24 | 10.954 | 4,095 ms | 7,456 ms | 0 | Highest single-run peak |
+| 24 repeat | 5.797 | 17,813 ms | 34,095 ms | 0 | Unstable, not promotable |
+| 28 | 9.262 | 7,421 ms | 21,455 ms | 0 | Overloaded tail latency |
+| 32 | 7.834 | 6,107 ms | 60,009 ms | 17 | Regressed with timeout retries |
+
+Every run ultimately persisted 1,000/1,000 chunks without invalid vectors or 429s.
+The endpoint expressed overload through latency and timeouts rather than HTTP 429.
+At concurrency 32, 17 retry attempts were required and throughput was 28% below the
+single-run concurrency-24 peak.
+
+The highest observed throughput was 10.954 chunks/s at concurrency 24, but its repeat
+fell to 5.797 chunks/s. Concurrency 16 is the highest stable tested setting: its two
+runs delivered 9.254 and 8.539 chunks/s with no retries, averaging 8.897 chunks/s.
+That is approximately four times the concurrency-4 baseline and reduces the linear
+agent3-only estimate for 500,000 chunks from about 61.9 hours to about 15.6 hours.
+
+For an agent3-only build, use `initial_inflight: 8`, `max_inflight: 16`, and a global
+cap of at least 16. A shared four-agent production run must not adopt group max 16
+until it passes a combined load test, because agent1 and agent4 use the same myrimate
+quota group. The scheduler should also reduce effective concurrency on sustained
+timeouts or retry-rate growth; its current AIMD decrease is driven primarily by
+explicit throttling signals.
+
 ## Combined Provider Run
 
 The final combination ran all four agents concurrently with 1,000 chunks each.
@@ -100,9 +138,9 @@ scheduler is not a strict fair queue across agents.
 
 1. Keep `google/gemini-embedding-2` at request batch 1 until myrimate list-input
    behavior changes.
-2. Keep myrimate max in-flight at 4. The combined run completed 2,000 attempts with
-   zero throttles, but the quota source is still an inferred shared endpoint rather
-   than a documented account limit.
+2. Promote agent3-only builds to initial/max in-flight 8/16 after operational review.
+   Keep the shared four-agent myrimate max at 4 until a combined max-16 run passes;
+   the quota source is still an inferred endpoint rather than a documented limit.
 3. Keep Voyage request batch 128 and in-flight initial/max 2/4. The request reduction
    target passed without retries or throttling.
 4. Add an agent-aware fair queue or round-robin admission policy inside each shared
