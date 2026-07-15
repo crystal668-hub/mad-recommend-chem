@@ -5,6 +5,7 @@ Function: Route text vectorization across supported embedding providers
 ===================================
 """
 
+import asyncio
 import os
 import time
 from typing import Dict, List, Optional
@@ -37,6 +38,7 @@ class MultiModelEmbedder:
         'aliyun',
     })
     OPENAI_COMPATIBLE_PROVIDERS = frozenset({'openrouter', 'zenmux'})
+    SUPPORTED_EMBEDDING_TRANSPORTS = frozenset({'openai_compatible', 'voyage_sdk'})
 
     def __init__(self, model_config: Dict, agent_configs: Dict = None):
         """
@@ -123,6 +125,12 @@ class MultiModelEmbedder:
             api_key = self._resolve_env_var(embedding_api_key)
             voyage_api_key = self._resolve_env_var(cfg.get('voyage_api_key'))
             embedding_provider = self._infer_provider_by_agent(agent_name, cfg)
+            default_transport = 'voyage_sdk' if embedding_provider == 'voyage' else 'openai_compatible'
+            embedding_transport = str(cfg.get('embedding_transport') or default_transport).strip().lower()
+            if embedding_transport not in self.SUPPORTED_EMBEDDING_TRANSPORTS:
+                raise ValueError(
+                    f"Unsupported embedding transport '{embedding_transport}' for {agent_name}"
+                )
 
             profiles[agent_name] = {
                 'embedding_model': embedding_model,
@@ -130,7 +138,12 @@ class MultiModelEmbedder:
                 'openai_base_url': openai_base_url,
                 'api_key': api_key,
                 'voyage_api_key': voyage_api_key,
-                'embedding_provider': embedding_provider
+                'embedding_provider': embedding_provider,
+                'embedding_transport': embedding_transport,
+                'embedding_quota_group': cfg.get('embedding_quota_group') or embedding_provider,
+                'embedding_request_batch_size': cfg.get('embedding_request_batch_size', 10),
+                'embedding_max_batch_items': cfg.get('embedding_max_batch_items'),
+                'embedding_max_batch_tokens': cfg.get('embedding_max_batch_tokens'),
             }
         return profiles
     
@@ -167,7 +180,7 @@ class MultiModelEmbedder:
             profile = self.agent_embedding_profiles.get(agent_name, {})
             voyage_api_key = profile.get('voyage_api_key')
             if voyage_api_key:
-                self.voyage_clients[agent_name] = voyageai.Client(api_key=voyage_api_key)
+                self.voyage_clients[agent_name] = voyageai.Client(api_key=voyage_api_key, max_retries=0)
                 logger.info(f"Created Voyage AI client for {agent_name}")
             else:
                 return None
@@ -176,12 +189,16 @@ class MultiModelEmbedder:
 
     def _get_openai_client(self, agent_name: str, api_key: str, base_url: str) -> OpenAI:
         if agent_name not in self.openai_clients:
-            self.openai_clients[agent_name] = OpenAI(api_key=api_key, base_url=base_url)
+            self.openai_clients[agent_name] = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
         return self.openai_clients[agent_name]
 
     def _get_async_openai_client(self, agent_name: str, api_key: str, base_url: str) -> AsyncOpenAI:
         if agent_name not in self.async_openai_clients:
-            self.async_openai_clients[agent_name] = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            self.async_openai_clients[agent_name] = AsyncOpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                max_retries=0,
+            )
         return self.async_openai_clients[agent_name]
         
     def _is_voyage_model(self, agent_name: str = None) -> bool:
@@ -227,7 +244,10 @@ class MultiModelEmbedder:
             'emb_url': self.base_url,
             'openai_base_url': self._normalize_openai_base_url(self.base_url),
             'api_key': self.api_key,
-            'embedding_provider': self.default_provider
+            'embedding_provider': self.default_provider,
+            'embedding_transport': (
+                'voyage_sdk' if self.default_provider == 'voyage' else 'openai_compatible'
+            ),
         }
 
     def embed_text(self, text: str, retry: int = 3, agent_name: str = None) -> List[float]:
@@ -242,11 +262,8 @@ class MultiModelEmbedder:
         Returns:
             List[float]: embedding vector
         """
-        # Some providers return errors or empty responses for blank inputs; short-circuit to a
-        # deterministic zero vector to keep pipelines robust.
         if text is None or not str(text).strip():
-            model = self.get_model_for_agent(agent_name) if agent_name else self.default_model
-            return [0.0] * self.get_embedding_dimension(model)
+            raise ValueError("blank embedding input")
 
         # Determine which agent to use
         use_agent = agent_name
@@ -266,8 +283,7 @@ class MultiModelEmbedder:
         input_type="query"; for other providers we fall back to `embed_text`.
         """
         if text is None or not str(text).strip():
-            model = self.get_model_for_agent(agent_name) if agent_name else self.default_model
-            return [0.0] * self.get_embedding_dimension(model)
+            raise ValueError("blank embedding query")
 
         use_agent = agent_name
 
@@ -413,74 +429,101 @@ class MultiModelEmbedder:
         
         raise Exception(f"Embedding failed for provider '{provider}' after {retry} attempts")
 
-    async def embed_texts_openai_compatible_async(
-        self, texts: List[str], retry: int = 3, agent_name: str = None
+    async def embed_documents_batch(
+        self,
+        texts: List[str],
+        agent_name: str,
     ) -> List[List[float]]:
-        """
-        Async batch embedding for an OpenAI-compatible provider.
+        """Execute one provider request for a document batch without application retries."""
+        if not texts:
+            return []
+        if any(text is None or not str(text).strip() for text in texts):
+            raise ValueError("blank embedding input in document batch")
 
-        Notes:
-        - Uses `input=[...]` to embed multiple texts in a single request.
-        - Blank inputs are mapped to deterministic zero vectors (provider-agnostic safety).
-        - On repeated failure, returns zero vectors for the whole batch to keep pipelines robust.
-        """
         profile = self._get_agent_profile(agent_name)
         provider = profile.get("embedding_provider", "openrouter")
-        if provider not in self.OPENAI_COMPATIBLE_PROVIDERS:
-            raise ValueError(f"Embedding provider '{provider}' is not OpenAI-compatible")
+        transport = profile.get("embedding_transport", "openai_compatible")
         model = profile.get("embedding_model", self.default_model)
+
+        if transport == "voyage_sdk":
+            voyage_client = self._get_voyage_client(agent_name)
+            if not voyage_client:
+                raise ValueError(
+                    f"Failed to create Voyage AI client for {agent_name}, please check API key configuration"
+                )
+            result = await asyncio.to_thread(
+                voyage_client.embed,
+                texts=list(texts),
+                model=model,
+                input_type="document",
+            )
+            embeddings = getattr(result, "embeddings", None)
+            if not embeddings:
+                raise RuntimeError("Voyage AI returned empty result")
+            return [list(vector) for vector in embeddings]
+
+        if transport != "openai_compatible":
+            raise ValueError(f"Unsupported embedding transport '{transport}'")
+
         base_url = profile.get("openai_base_url") or self._normalize_openai_base_url(profile.get("emb_url", self.base_url))
         api_key = profile.get("api_key")
         if not api_key:
             raise ValueError(f"Embedding API Key not configured for provider '{provider}'")
+        client = self._get_async_openai_client(agent_name or "default", api_key, base_url)
+        result = await client.embeddings.create(model=model, input=list(texts))
+        data = getattr(result, "data", None)
+        if not data:
+            raise RuntimeError(f"Embedding provider '{provider}' returned empty result")
 
-        dim = self.get_embedding_dimension(model)
-
-        # Preserve order and handle blank inputs locally.
-        out: List[Optional[List[float]]] = [None] * len(texts)
-        non_blank: List[str] = []
-        non_blank_indices: List[int] = []
-        for idx, t in enumerate(texts):
-            if t is None or not str(t).strip():
-                out[idx] = [0.0] * dim
-            else:
-                non_blank.append(t)
-                non_blank_indices.append(idx)
-
-        if not non_blank:
-            return [x if x is not None else [0.0] * dim for x in out]
-
-        # Retry loop mirrors the synchronous OpenAI-compatible path.
-        last_err: Optional[Exception] = None
-        for attempt in range(int(retry)):
+        ordered: List[Optional[List[float]]] = [None] * len(texts)
+        for position, item in enumerate(data):
+            raw_index = getattr(item, "index", position)
             try:
-                client = self._get_async_openai_client(agent_name or "default", api_key, base_url)
-                result = await client.embeddings.create(model=model, input=non_blank)
-                if not result or not getattr(result, "data", None):
-                    raise Exception(f"Embedding provider '{provider}' returned empty result")
+                index = int(raw_index)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"Embedding provider '{provider}' returned invalid index") from exc
+            if index < 0 or index >= len(ordered) or ordered[index] is not None:
+                raise RuntimeError(f"Embedding provider '{provider}' returned invalid index {index}")
+            ordered[index] = list(item.embedding)
+        if any(vector is None for vector in ordered):
+            raise RuntimeError(
+                f"Embedding provider '{provider}' returned {len(data)} embeddings for {len(texts)} inputs"
+            )
+        return [vector for vector in ordered if vector is not None]
 
-                # Result order should match input order.
-                if len(result.data) != len(non_blank):
-                    raise Exception(
-                        f"Embedding provider '{provider}' returned {len(result.data)} embeddings "
-                        f"for {len(non_blank)} inputs"
-                    )
+    async def embed_texts_openai_compatible_async(
+        self, texts: List[str], retry: int = 3, agent_name: str = None
+    ) -> List[List[float]]:
+        """Backward-compatible alias for one OpenAI-compatible batch attempt."""
+        del retry
+        return await self.embed_documents_batch(texts, agent_name=agent_name or "default")
 
-                for out_i, d in zip(non_blank_indices, result.data):
-                    out[out_i] = d.embedding
+    async def aclose(self) -> None:
+        """Close provider clients created by this embedder."""
+        async_closes = []
+        for client in self.async_openai_clients.values():
+            close_fn = getattr(client, "close", None)
+            if callable(close_fn):
+                try:
+                    result = close_fn()
+                    if asyncio.iscoroutine(result):
+                        async_closes.append(result)
+                except Exception:
+                    pass
+        if async_closes:
+            await asyncio.gather(*async_closes, return_exceptions=True)
 
-                return [x if x is not None else [0.0] * dim for x in out]
-            except Exception as e:
-                last_err = e
-                logger.error(f"[ERROR] Async batch embedding failed (attempt {attempt + 1}/{retry}): {str(e)}")
-                if attempt < int(retry) - 1:
-                    # Exponential backoff, but don't block the event loop.
-                    import asyncio  # local import to keep sync import graph minimal
-
-                    await asyncio.sleep(2 ** attempt)
-
-        logger.error(f"[ERROR] Async batch embedding failed, retried {retry} times: {str(last_err)}")
-        return [[0.0] * dim for _ in texts]
+        sync_clients = list(self.openai_clients.values()) + list(self.voyage_clients.values())
+        for client in sync_clients:
+            close_fn = getattr(client, "close", None)
+            if callable(close_fn):
+                try:
+                    await asyncio.to_thread(close_fn)
+                except Exception:
+                    pass
+        self.async_openai_clients.clear()
+        self.openai_clients.clear()
+        self.voyage_clients.clear()
     
     def embed_batch(self, texts: List[str], batch_size: int = 10, show_progress: bool = True, agent_name: str = None) -> List[List[float]]:
         """
@@ -501,31 +544,28 @@ class MultiModelEmbedder:
         else:
             model = self.default_model
         
-        embeddings = []
-        total_texts = len(texts)
-        
-        iterator = range(0, total_texts, batch_size)
-        if show_progress:
-            desc = f"Embedding progress [{model}]"
-            iterator = tqdm(iterator, desc=desc, total=(total_texts + batch_size - 1) // batch_size)
-        
-        for i in iterator:
-            batch = texts[i:i + batch_size]
-            
-            for text in batch:
-                try:
-                    embedding = self.embed_text(text, agent_name=agent_name)
-                    embeddings.append(embedding)
-                except Exception as e:
-                    logger.error(f"\n[ERROR] Skipping text (index {len(embeddings)}): {str(e)}")
-                    # Append zero vector when failure
-                    embeddings.append([0.0] * self.get_embedding_dimension(model))
-            
-            # Avoid API rate limiting
-            if i + batch_size < total_texts:
-                time.sleep(0.5)
-        
-        return embeddings
+        async def _embed_all() -> List[List[float]]:
+            embeddings: List[List[float]] = []
+            iterator = range(0, len(texts), max(1, int(batch_size)))
+            if show_progress:
+                desc = f"Embedding progress [{model}]"
+                iterator = tqdm(
+                    iterator,
+                    desc=desc,
+                    total=(len(texts) + batch_size - 1) // batch_size,
+                )
+            for i in iterator:
+                batch = texts[i:i + batch_size]
+                embeddings.extend(
+                    await self.embed_documents_batch(batch, agent_name=agent_name or "default")
+                )
+            return embeddings
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(_embed_all())
+        raise RuntimeError("embed_batch cannot run inside an active event loop; use embed_documents_batch")
     
     def get_embedding_dimension(self, model: str = None) -> int:
         """
