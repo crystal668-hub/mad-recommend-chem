@@ -127,6 +127,24 @@ def _context(agent, embedder, store, texts, batch_size=2):
     )
 
 
+class ChromaIdPreparationTests(unittest.TestCase):
+    def test_repeated_duplicate_ids_remain_unique(self):
+        texts = ["same chunk"] * 4
+        metadatas = [
+            {"doc_id": "10.1000/repeated", "chunk_id": 0, "reaction_type": "HER"}
+            for _ in texts
+        ]
+
+        ids, prepared = batch._prepare_chroma_ids_and_metadatas(texts, metadatas)
+
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(ids[0], "10.1000/repeated#chunk:0")
+        self.assertTrue(ids[1].startswith("10.1000/repeated#chunk:0#dup:"))
+        self.assertEqual(ids[2], ids[1] + ":2")
+        self.assertEqual(ids[3], ids[1] + ":3")
+        self.assertEqual([metadata["chunk_id"] for metadata in prepared], ids)
+
+
 class MissingIdTests(unittest.TestCase):
     def test_existing_ids_are_checked_in_large_batches(self):
         ids = [f"id-{index}" for index in range(2501)]

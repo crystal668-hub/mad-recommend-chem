@@ -136,7 +136,12 @@ def _prepare_chroma_ids_and_metadatas(
             }
             salt = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
             digest2 = hashlib.sha256(((text or "") + "|" + salt).encode("utf-8")).hexdigest()[:16]
-            chunk_uid = f"{chunk_uid}#dup:{digest2}"
+            base_duplicate_uid = f"{chunk_uid}#dup:{digest2}"
+            chunk_uid = base_duplicate_uid
+            duplicate_index = 2
+            while chunk_uid in seen:
+                chunk_uid = f"{base_duplicate_uid}:{duplicate_index}"
+                duplicate_index += 1
 
         meta["chunk_id"] = chunk_uid
         ids.append(chunk_uid)
