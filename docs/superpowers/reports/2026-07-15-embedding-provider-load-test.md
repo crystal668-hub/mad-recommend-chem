@@ -11,6 +11,10 @@
   write batch 100, queue capacity 8
 - Provider retries: disabled in SDKs; application retry policy only
 
+A later shared-provider concurrency sweep used the first 300 O5H chunks per agent
+for agent1, agent3, and agent4. This smaller sample was approved to limit provider
+traffic while testing the shared myrimate ceiling.
+
 The approved sample was reduced from 5,000 to 1,000 chunks per agent. All four
 independent runs and the four-agent combined gate completed. An initial agent1 HTTP
 401 was traced to a stale `OPENAI_API_KEY` inherited by the test runner taking
@@ -85,15 +89,59 @@ That is approximately four times the concurrency-4 baseline and reduces the line
 agent3-only estimate for 500,000 chunks from about 61.9 hours to about 15.6 hours.
 
 For an agent3-only build, use `initial_inflight: 8`, `max_inflight: 16`, and a global
-cap of at least 16. A shared four-agent production run must not adopt group max 16
-until it passes a combined load test, because agent1 and agent4 use the same myrimate
-quota group. The scheduler should also reduce effective concurrency on sustained
-timeouts or retry-rate growth; its current AIMD decrease is driven primarily by
-explicit throttling signals.
+cap of at least 16. Agent1 and agent4 use the same myrimate quota group, so a higher
+shared ceiling requires the combined evidence recorded below. The scheduler should
+also reduce effective concurrency on sustained timeouts or retry-rate growth; its
+current AIMD decrease is driven primarily by explicit throttling signals.
 
-## Combined Provider Run
+## Combined Agent1/3/4 Concurrency Sweep
 
-The final combination ran all four agents concurrently with 1,000 chunks each.
+Agent1, agent3, and agent4 were then tested together because all three resolve to the
+same myrimate endpoint quota group. Every run used the same first 300 O5H chunks per
+agent, isolated Chroma collections, agent1 request batch 32, and singleton requests
+for agent3 and agent4. Each run therefore issued 610 network requests and attempted
+900 vector writes.
+
+| Shared concurrency | Wall clock | Group p95 | Group p99 | Retries / throttles | Write queue peak | agent1 | agent3 | agent4 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 120.831 s | 3,342 ms | 21,179 ms | 0 / 0 | 2/8 | 7.275 chunks/s | 2.507 chunks/s | 4.141 chunks/s |
+| 16 | 60.141 s | 3,072 ms | 14,633 ms | 0 / 0 | 3/8 | 18.715 chunks/s | 5.073 chunks/s | 9.573 chunks/s |
+| 24 | 46.175 s | 3,625 ms | 16,000 ms | 0 / 0 | 4/8 | 16.729 chunks/s | 6.641 chunks/s | 11.243 chunks/s |
+| 24 repeat | 48.558 s | 6,770 ms | 15,379 ms | 0 / 0 | 8/8 | 16.112 chunks/s | 6.308 chunks/s | 11.465 chunks/s |
+| 28 | 47.873 s | 7,502 ms | 13,176 ms | 0 / 0 | 6/8 | 16.801 chunks/s | 6.401 chunks/s | 12.761 chunks/s |
+
+Shared concurrency 24 is the highest stable tested combination. Its two runs
+completed in 46.175 and 48.558 seconds with zero failures, retries, or throttles.
+The repeat preserved wall-clock throughput even though p95 varied from 3.625 to
+6.770 seconds. Post-run Chroma validation found exactly 300 unique IDs in each of
+the three repeat collections.
+
+Concurrency 28 is not promotable: wall time regressed relative to the first
+concurrency-24 run while p95 more than doubled. This is the same latency-first
+overload pattern seen in the agent3-only sweep. Concurrency 32 was deliberately not
+tested because 28 had already crossed the useful-throughput knee, and the earlier
+agent3-only concurrency-32 run required 17 retries with a p99 near 60 seconds.
+
+For the shared myrimate group, use `initial_inflight: 16` and `max_inflight: 24`.
+Use a process `global_max_inflight` of at least 24 for agent1/3/4 alone, or at least
+28 when Voyage is also allowed its independent four requests. The initial value of
+16 lets the limiter ramp toward the tested ceiling instead of beginning at the
+tail-latency knee. Preserve agent1 batch 32 and agent3/agent4 batch 1. The repeat
+briefly filled the 8-slot write queue, so production telemetry should retain queue
+depth and enqueue-wait monitoring; the stable wall time and complete writes do not
+justify a writer change from this sample alone. Fall back to shared concurrency 16
+if p95 remains above 10 seconds or timeout retries appear across consecutive windows.
+
+Across the two concurrency-24 runs, the three agents completed 900 embedding and
+write operations in an average 47.367 seconds, or 18.999 aggregate vector writes per
+second. If 500,000 source chunks must be written by all three agents (1.5 million
+vectors), the linear embedding-plus-write estimate is about 21.9 hours. Chunking and
+startup add overhead not represented by this sample, so this is a capacity estimate,
+not an end-to-end service-level guarantee.
+
+## Initial Four-Agent Combined Run
+
+The initial combination ran all four agents concurrently with 1,000 chunks each.
 
 | Metric | Voyage quota group | Shared myrimate quota group |
 | --- | ---: | ---: |
@@ -139,8 +187,8 @@ scheduler is not a strict fair queue across agents.
 1. Keep `google/gemini-embedding-2` at request batch 1 until myrimate list-input
    behavior changes.
 2. Promote agent3-only builds to initial/max in-flight 8/16 after operational review.
-   Keep the shared four-agent myrimate max at 4 until a combined max-16 run passes;
-   the quota source is still an inferred endpoint rather than a documented limit.
+   For combined agent1/3/4 builds, use shared myrimate initial/max in-flight 16/24;
+   the ceiling is empirical because the provider has not documented a quota value.
 3. Keep Voyage request batch 128 and in-flight initial/max 2/4. The request reduction
    target passed without retries or throttling.
 4. Add an agent-aware fair queue or round-robin admission policy inside each shared
