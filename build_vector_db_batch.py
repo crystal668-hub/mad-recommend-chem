@@ -20,13 +20,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 # Ensure repo root is importable when running this script from arbitrary cwd.
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
+
+from utils.environment import load_project_environment
+
+load_project_environment(project_root / ".env")
 
 from agents.agent_config import AgentConfig
 from database.embedder import MultiModelEmbedder

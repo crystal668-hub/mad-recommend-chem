@@ -28,6 +28,10 @@ QWEN_API_KEY=...
 VOYAGE_API_KEY=...
 ```
 
+Production entry points load the repository `.env` strictly: keys declared in that
+file replace same-named inherited process variables. Environment variables not
+declared in `.env` are left unchanged.
+
 Notes:
 - Agent 1/2/3 default to OpenRouter endpoints (`base_url: https://openrouter.ai/api/v1`).
 - Agent 4 chats via OpenRouter (`model: qwen/qwen3-max-thinking`, `base_url: https://openrouter.ai/api/v1`).

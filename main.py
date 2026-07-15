@@ -20,9 +20,9 @@ from typing import Any, List, Optional, Dict
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-from dotenv import load_dotenv
+from utils.environment import load_project_environment
 
-load_dotenv()
+load_project_environment()
 
 from utils import (
     load_config,
