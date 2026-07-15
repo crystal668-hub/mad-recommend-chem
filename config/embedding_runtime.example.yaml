@@ -1,9 +1,10 @@
 # Merge these sections into the ignored local config/config.yaml when explicit
-# overrides are needed. The code uses the same conservative defaults when this
-# section is absent.
+# overrides are needed. The code uses these load-tested defaults when this section
+# is absent, while retaining conservative 2/4 limits for unknown endpoints.
 
 embedding_runtime:
-  global_max_inflight: 8
+  # myrimate 24 + the independent Voyage allowance 4.
+  global_max_inflight: 28
   request_timeout_seconds: 60
   write_batch_size: 100
   write_queue_max_batches: 8
@@ -19,8 +20,8 @@ embedding_runtime:
 
   quota_groups:
     myrimate:
-      initial_inflight: 2
-      max_inflight: 4
+      initial_inflight: 16
+      max_inflight: 24
       requests_per_minute: null
       tokens_per_minute: null
       cooldown_seconds: 30

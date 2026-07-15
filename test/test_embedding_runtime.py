@@ -45,7 +45,7 @@ class EmbeddingRuntimeSettingsTests(unittest.TestCase):
                 },
             )
 
-    def test_safe_defaults_group_shared_endpoints_and_select_provider_batches(self):
+    def test_load_tested_defaults_group_shared_endpoints_and_select_provider_batches(self):
         shared_url = "https://agent-team-api.myrimate.cn/v1"
         settings = EmbeddingRuntimeSettings.from_config(
             {},
@@ -69,8 +69,27 @@ class EmbeddingRuntimeSettingsTests(unittest.TestCase):
         self.assertEqual(settings.request_batch_size_for("agent2"), 128)
         self.assertEqual(settings.request_batch_size_for("agent3"), 1)
         self.assertEqual(settings.request_batch_size_for("agent4"), 1)
-        self.assertEqual(settings.quota_groups[shared_group].initial_inflight, 2)
-        self.assertEqual(settings.quota_groups[shared_group].max_inflight, 4)
+        self.assertEqual(settings.global_max_inflight, 28)
+        self.assertEqual(settings.quota_groups[shared_group].initial_inflight, 16)
+        self.assertEqual(settings.quota_groups[shared_group].max_inflight, 24)
+        voyage_group = settings.agents["agent2"].quota_group
+        self.assertEqual(settings.quota_groups[voyage_group].initial_inflight, 2)
+        self.assertEqual(settings.quota_groups[voyage_group].max_inflight, 4)
+
+    def test_unknown_endpoint_keeps_conservative_default_concurrency(self):
+        settings = EmbeddingRuntimeSettings.from_config(
+            {},
+            agent_configs={
+                "agent": {
+                    "embedding_provider": "openrouter",
+                    "emb_url": "https://unverified.example/v1",
+                }
+            },
+        )
+
+        quota_group = settings.agents["agent"].quota_group
+        self.assertEqual(settings.quota_groups[quota_group].initial_inflight, 2)
+        self.assertEqual(settings.quota_groups[quota_group].max_inflight, 4)
 
 
 class EmbeddingBatchTests(unittest.TestCase):

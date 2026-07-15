@@ -22,6 +22,13 @@ from urllib.parse import urlparse
 T = TypeVar("T")
 
 
+DEFAULT_GLOBAL_MAX_INFLIGHT = 28
+MYRIMATE_QUOTA_GROUPS = {
+    "myrimate",
+    "endpoint:agent-team-api.myrimate.cn",
+}
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
     max_attempts: int = 6
@@ -79,7 +86,7 @@ class AgentEmbeddingRuntime:
 
 @dataclass
 class EmbeddingRuntimeSettings:
-    global_max_inflight: int = 8
+    global_max_inflight: int = DEFAULT_GLOBAL_MAX_INFLIGHT
     request_timeout_seconds: float = 60.0
     write_batch_size: int = 100
     write_queue_max_batches: int = 8
@@ -149,6 +156,11 @@ class EmbeddingRuntimeSettings:
                         requests_per_minute=2000,
                         tokens_per_minute=3000000,
                     ).normalized()
+                elif quota_group.lower() in MYRIMATE_QUOTA_GROUPS:
+                    groups[quota_group] = QuotaPolicy(
+                        initial_inflight=16,
+                        max_inflight=24,
+                    ).normalized()
                 else:
                     groups[quota_group] = QuotaPolicy(
                         initial_inflight=2,
@@ -207,7 +219,7 @@ class EmbeddingRuntimeSettings:
                 for name, policy in groups.items()
             }
 
-        configured_global = cfg.get("global_max_inflight", 8)
+        configured_global = cfg.get("global_max_inflight", DEFAULT_GLOBAL_MAX_INFLIGHT)
         configured_write = cfg.get("write_batch_size", 100)
         return cls(
             global_max_inflight=max(1, int(global_max_inflight or configured_global)),
