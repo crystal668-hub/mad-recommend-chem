@@ -319,10 +319,14 @@ Agent 层实现了多种兜底，保证协调器收到可解析输出。
 
 ### 5.9 请求限流
 
-所有 LLM 和 embedding 外部请求通过 `utils.request_limiter.get_global_limiter()` 共享一个进程级 `BoundedSemaphore`，默认最大并发为 6。目的：
+在线 LLM 和 RAG query embedding 请求通过 `utils.request_limiter.get_global_limiter()`
+共享一个进程级 `BoundedSemaphore`，默认最大并发为 6。离线
+`build_vector_db_batch.py` 使用独立的 `EmbeddingQuotaScheduler`，按共享 endpoint/account
+quota group 同时限制 global in-flight、group in-flight、RPM 和 TPM。
 
 - 降低并行反应和多 Agent 检索时的 API burst。
 - 减少 429、空 embedding、连接不稳定等问题。
+- 离线构建只使用一层集中 retry，遵循 `Retry-After`，并在 429 时自动降低有效并发。
 
 ## 6. Debate 协调器详解
 
@@ -697,6 +701,10 @@ Markdown 与 PDF 同名但扩展名为 `.md`；匹配时去除扩展名并忽略
 - 文档只加载和分块一次。
 - 为每个 agent 分别计算 embedding。
 - 每个 agent 写入独立 Chroma collection。
+- 支持 provider 原生 request batch；并发为 1 时也不会退回逐文本调用。
+- 共享 endpoint 的 agent 通过同一个 quota group 限流。
+- 只有通过数量、维度和数值校验的向量才能进入有界 write queue。
+- 单一 Chroma writer 按独立 write batch 合并写入；失败 ID 保持 missing 供 resume 补齐。
 - collection 命名为 `<base_collection_name>_<agent_name>`。
 - 当前配置中 base collection 是 `literature_02`，因此默认 collection 包括：
   - `literature_02_agent1`

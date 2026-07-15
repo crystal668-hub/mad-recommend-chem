@@ -1,0 +1,63 @@
+# Merge these sections into the ignored local config/config.yaml when explicit
+# overrides are needed. The code uses the same conservative defaults when this
+# section is absent.
+
+embedding_runtime:
+  global_max_inflight: 8
+  request_timeout_seconds: 60
+  write_batch_size: 100
+  write_queue_max_batches: 8
+  write_flush_interval_ms: 500
+  existing_id_check_batch_size: 1000
+  failure_manifest_dir: "./outputs/embedding_failures"
+
+  retry:
+    max_attempts: 6
+    base_delay_seconds: 1
+    max_delay_seconds: 60
+    honor_retry_after: true
+
+  quota_groups:
+    myrimate:
+      initial_inflight: 2
+      max_inflight: 4
+      requests_per_minute: null
+      tokens_per_minute: null
+      cooldown_seconds: 30
+
+    voyage_org:
+      initial_inflight: 2
+      max_inflight: 4
+      requests_per_minute: 2000
+      tokens_per_minute: 3000000
+      cooldown_seconds: 30
+
+# Add the matching fields inside each existing llm.agentN mapping. Agents that
+# share a gateway must share embedding_quota_group even when provider names differ.
+llm:
+  agent1:
+    embedding_transport: "openai_compatible"
+    embedding_quota_group: "myrimate"
+    embedding_request_batch_size: 32
+    embedding_max_batch_items: 2048
+    embedding_max_batch_tokens: 300000
+
+  agent2:
+    embedding_transport: "voyage_sdk"
+    embedding_quota_group: "voyage_org"
+    embedding_request_batch_size: 128
+    embedding_max_batch_items: 128
+
+  agent3:
+    embedding_transport: "openai_compatible"
+    embedding_quota_group: "myrimate"
+    embedding_request_batch_size: 32
+    embedding_max_batch_items: 2048
+    embedding_max_batch_tokens: 300000
+
+  agent4:
+    embedding_transport: "openai_compatible"
+    embedding_quota_group: "myrimate"
+    # Keep this at 1 until the custom gateway confirms list-input support.
+    embedding_request_batch_size: 1
+    embedding_max_batch_items: 1

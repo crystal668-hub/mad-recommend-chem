@@ -68,9 +68,17 @@ Collections are stored in `vector_store.persist_directory` (default `./data/chro
 `<vector_store.collection_name>_<agent_name>` (e.g., `electrochemistry_literature_agent1`).
 
 Useful options:
-- `--max-workers 1` (sequential build)
-- `--embedding-batch-size 10`
-- `--sleep-between-batches 0.5`
+- `--embedding-request-batch-size 32` (override every provider profile)
+- `--embedding-write-batch-size 100`
+- `--embedding-global-max-inflight 8`
+
+Offline embedding builds use native provider batches, shared endpoint/account quota
+groups, centralized retries, strict vector validation, and a bounded single-writer
+Chroma pipeline. Failed chunks are not stored as zero vectors; they remain missing for
+`--resume` and are reported in `outputs/embedding_failures/*.jsonl`. The legacy
+`--embedding-batch-size`, `--embedding-concurrency`, `--max-workers`, and
+`--sleep-between-batches` controls remain accepted as deprecated compatibility options.
+See `config/embedding_runtime.example.yaml` for explicit quota overrides.
 
 Legacy (single-agent) script:
 
@@ -135,6 +143,7 @@ Outputs:
 ## Configuration
 All runtime configuration lives in `config/config.yaml`:
 - `llm.*`: per-agent provider/model + embedding settings
+- `embedding_runtime.*`: offline batch limits, quota groups, retries, and Chroma writer settings
 - `vector_store.*`: Chroma persistence + base collection name
 - `rag.*`: chunking + retrieval parameters
 - `debate.*`: debate protocol parameters
